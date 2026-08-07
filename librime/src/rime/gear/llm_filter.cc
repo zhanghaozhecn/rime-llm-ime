@@ -53,6 +53,8 @@ static int g_min_code_len = 4;
 static int g_min_tokens = 1;
 static int g_max_ctx_tokens = 10;  // tok=10: 93.4% acc, 10->17 gains only +1.1pp
 static int g_n_threads = 7;        // saturated at 7 on all tested machines
+static int g_min_free_mem_mb = 2560;  // skip model load when free RAM below this
+                                       // (0.8B Q4 needs ~2GB: freeze beats no rerank)
 static int g_n_ctx = 128;          // KV: 11 seqs x (ctx 10 + cand 2) = 132, 64 overflows
 static int g_n_seq_max = 12;       // template seq 0 + up to 11 worker seqs
 static int g_max_candidates = 5;   // candidates participating in scoring
@@ -158,6 +160,17 @@ static void event_log(const std::string &input, const std::string &before,
 static void load_model_async() {
   if (g_loaded.load() || g_loading.load())
     return;
+  // low-memory guard: LLM needs ~2GB (model + KV + compute buffers); on
+  // small machines loading can swap the system to a freeze — skip instead
+  MEMORYSTATUSEX ms;
+  ms.dwLength = sizeof(ms);
+  if (GlobalMemoryStatusEx(&ms) &&
+      ms.ullAvailPhys < (DWORD64)g_min_free_mem_mb * 1024 * 1024) {
+    log_msg("WARN: free RAM %llu MB < %d MB, LLM rerank disabled",
+            (unsigned long long)(ms.ullAvailPhys / (1024 * 1024)),
+            g_min_free_mem_mb);
+    return;
+  }
   g_loading.store(true);
 
   std::thread([]() {
@@ -643,16 +656,19 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
       g_max_candidates = v;
     if (config->GetInt("llm_rerank/cpu_cores", &v))
       g_n_threads = v;
+    if (config->GetInt("llm_rerank/min_free_mem_mb", &v))
+      g_min_free_mem_mb = v;
     // cap threads at hardware cores: low-core machines shouldn't
     // oversubscribe (slowdown + extra per-thread memory)
     unsigned hw = std::thread::hardware_concurrency();
     if (hw > 0 && (unsigned)g_n_threads > hw)
       g_n_threads = (int)hw;
     log_msg("config: backend=%s min_code_len=%d min_tokens=%d "
-            "max_tokens=%d max_candidates=%d cpu_cores=%d model=%s",
+            "max_tokens=%d max_candidates=%d cpu_cores=%d "
+            "min_free_mem_mb=%d model=%s",
             g_backend.c_str(), g_min_code_len, g_min_tokens,
             g_max_ctx_tokens, g_max_candidates, g_n_threads,
-            g_model_path.c_str());
+            g_min_free_mem_mb, g_model_path.c_str());
   }
   // hook engine commit sink: pre-decode the upcoming context after commit
   commit_conn_ = engine_->sink().connect(

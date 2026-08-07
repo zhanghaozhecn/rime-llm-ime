@@ -54,9 +54,12 @@ llm_rerank:
   min_tokens: 1         # 上文 token 数小于此值时不推理
   max_tokens: 10        # 上文 token 上限
   max_candidates: 5     # 参与打分的候选数上限
-  cpu_cores: 7          # 推理线程数
+  cpu_cores: 7          # 推理线程数（自动不超过物理核数）
+  min_free_mem_mb: 2560 # 可用内存低于此值时不加载模型（防小内存机器系统卡死）
   model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
 ```
+
+> 内存需求：0.8B Q4 模型加载后 WeaselServer 占用约 2GB。**内存 ≤4GB 的机器建议 `backend: off`**（输入法照常使用，仅无 LLM 重排），或调小 `min_free_mem_mb` 谨慎尝试。
 
 ## 构建（开发者）
 
