@@ -27,7 +27,7 @@ rime-llm-ime/
 │   └── librime/       # 仅补丁头文件（rime_api.h），完整版用顶层 librime/
 ├── pdsp.schema.yaml   # 拼读双拼方案 LLM 版（含 llm_rerank 配置节示例）
 ├── scripts/           # 构建脚本（Windows）
-├── bin/               # 预编译产物（rime.dll / weaselx64.dll / WeaselServer.exe / WeaselDeployer.exe）
+├── bin/               # 预编译产物（rime.dll / weaselx64.dll / WeaselServer.exe / WeaselDeployer.exe / opencc.dll / vcomp140.dll）
 └── sync.py            # 本机维护脚本（编译源 → 项目目录 → GitHub 树）
 ```
 
@@ -36,7 +36,10 @@ rime-llm-ime/
 前置：已安装小狼毫 0.17.x（x64）。
 
 1. 下载 GGUF 模型（本机验证使用 `Qwen3.5-0.8B-Q4_K_M.gguf`，任意小模型均可，建议 ≤2B Q4）
-2. 将 `bin/` 下 4 个文件复制到小狼毫安装目录，覆盖同名文件（如 `C:\Program Files\Rime\weasel-0.17.4`）
+2. 将 `bin/` 下 **6 个文件**全部复制到小狼毫安装目录，覆盖同名文件（如 `C:\Program Files\Rime\weasel-0.17.4`）：
+   - `rime.dll` / `weaselx64.dll` / `WeaselServer.exe` / `WeaselDeployer.exe` — 本方案产物
+   - `opencc.dll` — rime.dll 的动态依赖（librime 官方构建链动态链接 opencc）
+   - `vcomp140.dll` — VC OpenMP 运行时（无 VS 运行库的机器必需）
 3. 将 `pdsp.schema.yaml` 复制到 RIME 用户目录（`%APPDATA%\Rime\`），按需修改 `llm_rerank` 配置节（至少改 `model_path`）
 4. 托盘右键 → **重新部署**；若替换过 `weaselx64.dll`/`WeaselServer.exe` 需注销重登或重启
 
@@ -100,7 +103,7 @@ msbuild weasel.sln /p:Configuration=Release /p:Platform=x64
 
 ### 替换安装文件
 
-产物：`librime/build/src/Release/rime.dll`、`weasel/output/Release/weaselx64.dll`、`WeaselServer.exe`、`WeaselDeployer.exe`。替换小狼毫安装目录同名文件后，注销重登（TSF 注册表缓存）或重启系统。
+产物：`librime/build/src/Release/rime.dll`、`weasel/output/Release/weaselx64.dll`、`WeaselServer.exe`、`WeaselDeployer.exe`，另需 `librime install/bin/opencc.dll`（rime.dll 的动态依赖）和 `vcomp140.dll`（VC OpenMP 运行时）。替换小狼毫安装目录同名文件后，注销重登（TSF 注册表缓存）或重启系统。
 
 ## 日志
 
