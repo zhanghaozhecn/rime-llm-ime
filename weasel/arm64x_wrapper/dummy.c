@@ -1,1 +1,0 @@
-// This file is left blank on purpose to invoke the ARM64EC compiler and build ARM64EC thunks.
