@@ -468,7 +468,7 @@ static void prepare(const std::vector<llama_token> &ctx_ids, int seq) {
             g_prep_seq.load(), ctx_len);
     return;
   }
-  log_msg("prepare: start ctx_tok=%d seq=%d", ctx_len, seq);
+  auto t0 = std::chrono::high_resolution_clock::now();
   int vs = llama_n_vocab(g_vocab);
   auto *mem = llama_get_memory(g_ctx);
 
@@ -504,7 +504,9 @@ static void prepare(const std::vector<llama_token> &ctx_ids, int seq) {
   g_prep_gen = g_seq0_gen;
   g_prep_ctx = ctx_ids;
   g_prep_ready = true;
-  log_msg("prepare: done ctx_tok=%d seq=%d", ctx_len, seq);
+  auto t1 = std::chrono::high_resolution_clock::now();
+  double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+  log_msg("prepare: seq=%d ctx_tok=%d %.0fms", seq, ctx_len, ms);
 }
 
 // ============================================================
@@ -556,10 +558,10 @@ void LlmRerankTranslation::Collect() {
   if (candidates_.size() >= 2 && g_loaded.load()) {
     // rerank with LLM (ctx_ computed by LlmFilter::Apply: TSF context
     // text, or commit history fallback when TSF is unavailable)
-    // DEBUG: raw context before normalization (may contain newlines)
-    log_msg("ctx raw: [%s]", ctx_.c_str());
     std::string ctx = normalize_ctx(ctx_);
-    log_msg("ctx norm: [%s]", ctx.c_str());
+    if (ctx != ctx_)  // newline/whitespace differences worth showing
+      log_msg("ctx raw: [%s]", ctx_.c_str());
+    log_msg("ctx: [%s]", ctx.c_str());
     std::vector<llama_token> ctx_ids = tokenize(ctx.c_str());
     if ((int)ctx_ids.size() >= g_min_tokens) {
       if ((int)ctx_ids.size() > g_max_ctx_tokens)
@@ -603,7 +605,6 @@ void LlmRerankTranslation::Collect() {
             after += ",";
           after += c->text();
         }
-        log_msg("reranked %zu cands", candidates_.size());
         event_log(sanitize_field(input_), sanitize_field(before), ctx,
                   sanitize_field(after), ev_ms, src_);
       }
@@ -642,6 +643,11 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
       g_max_candidates = v;
     if (config->GetInt("llm_rerank/cpu_cores", &v))
       g_n_threads = v;
+    // cap threads at hardware cores: low-core machines shouldn't
+    // oversubscribe (slowdown + extra per-thread memory)
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw > 0 && (unsigned)g_n_threads > hw)
+      g_n_threads = (int)hw;
     log_msg("config: backend=%s min_code_len=%d min_tokens=%d "
             "max_tokens=%d max_candidates=%d cpu_cores=%d model=%s",
             g_backend.c_str(), g_min_code_len, g_min_tokens,
