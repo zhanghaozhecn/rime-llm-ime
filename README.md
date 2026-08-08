@@ -27,7 +27,6 @@ rime-llm-ime/
 │   ├── WeaselIPC/     # SET_CONTEXT_TEXT / RESET_CONTEXT IPC
 │   └── librime/       # 仅补丁头文件（rime_api.h），完整版用顶层 librime/
 ├── pdsp.schema.yaml   # 拼读双拼方案 LLM 版（含 llm_rerank 配置节示例）
-├── scripts/           # 构建脚本（Windows）
 ├── bin/               # 预编译产物（rime.dll / weaselx64.dll / WeaselServer.exe / WeaselDeployer.exe / opencc.dll / vcomp140.dll）+ deploy_llm.bat 一键部署脚本
 └── sync.py            # 本机维护脚本（编译源 → 项目目录 → GitHub 树）
 ```
