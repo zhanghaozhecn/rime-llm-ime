@@ -98,6 +98,12 @@ endif()
 
 if(BUILD_SHARED_LIBS)
   add_library(rime ${rime_src})
+  # llm_filter.cc holds UTF-8 Chinese literals (bench workload); cl reads
+  # the source as GBK by default which can swallow closing quotes on
+  # odd-length UTF-8 sequences (C3688) - force /utf-8 for MSVC.
+  if(MSVC)
+    target_compile_options(rime PRIVATE /utf-8)
+  endif()
   target_link_libraries(rime ${rime_deps})
   set_target_properties(rime PROPERTIES
     DEFINE_SYMBOL "RIME_EXPORTS"
