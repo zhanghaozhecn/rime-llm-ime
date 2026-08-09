@@ -59,225 +59,6 @@ static void log_msg(const char *fmt, ...);  // defined below (fwd decl)
 static std::vector<llama_token> tokenize(const char *text);  // fwd decl
 static double cross_entropy(float *logits, int vs, int target_id);  // fwd decl
 
-// ── load-adaptive threads (simplified two-tier) ─────────────────────
-// llama_set_n_threads() takes effect on the next decode with no context
-// rebuild, so we can adapt at runtime:
-//   high tier: g_max_threads - decided ONCE at startup by a quick scan
-//     (reuses the loaded context, sweeps {4,6,..,16} via set_n_threads,
-//     ~3s in the model-load thread). Picks the SMALLEST thread count
-//     whose throughput reaches 95% of the measured optimum, so the
-//     common case uses fewer threads for nearly the same speed.
-//   low tier: 4 - fixed floor. Heavy system load (busy>85%) switches
-//     straight to 4; back to the high tier when busy<60%.
-//   sampler: background thread, 2.5s cadence, GetSystemTimes delta.
-//   10s change throttle prevents thrashing.
-static bool      g_auto_adapt = true;
-static double    g_cpu_busy = 0.0;
-static int       g_cur_threads = 0;
-static int       g_max_threads = 0;  // 95% tier, set by thread_scan()
-static long long g_last_adapt_ms = 0;
-
-static void sampler_loop() {
-  for (;;) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-    FILETIME idle0, kern0, user0, idle1, kern1, user1;
-    if (!GetSystemTimes(&idle0, &kern0, &user0))
-      continue;
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    if (!GetSystemTimes(&idle1, &kern1, &user1))
-      continue;
-    auto sub = [](ULONGLONG a, ULONGLONG b) { return a > b ? a - b : 0ULL; };
-    ULONGLONG idl = sub((((ULONGLONG)idle1.dwHighDateTime) << 32) | idle1.dwLowDateTime,
-                        (((ULONGLONG)idle0.dwHighDateTime) << 32) | idle0.dwLowDateTime);
-    ULONGLONG ker = sub((((ULONGLONG)kern1.dwHighDateTime) << 32) | kern1.dwLowDateTime,
-                        (((ULONGLONG)kern0.dwHighDateTime) << 32) | kern0.dwLowDateTime);
-    ULONGLONG usr = sub((((ULONGLONG)user1.dwHighDateTime) << 32) | user1.dwLowDateTime,
-                        (((ULONGLONG)user0.dwHighDateTime) << 32) | user0.dwLowDateTime);
-    ULONGLONG total = ker + usr;
-    if (total > 0)
-      g_cpu_busy = (double)(total - idl) / (double)total;
-  }
-}
-
-// Score-batch-shaped micro-benchmark (same as bench_threads.exe).
-// S1 (ctx decode) is pre-computed by prepare() in production, so it is
-// NOT timed: only S2+S3 (the real per-keystroke cost) enters the scan.
-static void scan_ctx_once(llama_context *ctx,
-                          const std::vector<llama_token> &ctx_ids) {
-  int ctx_len = (int)ctx_ids.size();
-  llama_memory_clear(llama_get_memory(ctx), false);
-  llama_batch b1 = llama_batch_init(ctx_len, 0, 1);
-  for (int j = 0; j < ctx_len; j++) {
-    b1.token[j] = ctx_ids[j];
-    b1.pos[j] = j;
-    b1.n_seq_id[j] = 1;
-    b1.seq_id[j][0] = 0;
-  }
-  b1.logits[ctx_len - 1] = 1;
-  b1.n_tokens = ctx_len;
-  llama_decode(ctx, b1);
-  llama_batch_free(b1);
-}
-
-static void scan_cand_once(llama_context *ctx,
-                           const std::vector<std::vector<llama_token>> &cands,
-                           int ctx_len, int vs) {
-  int n = (int)cands.size();
-  for (int s = 0; s < n; s++)
-    llama_memory_seq_cp(llama_get_memory(ctx), 0, s + 1, 0, -1);
-  llama_batch b2 = llama_batch_init(n, 0, n);
-  for (int s = 0; s < n; s++) {
-    b2.token[s] = cands[s][0];
-    b2.pos[s] = ctx_len;
-    b2.n_seq_id[s] = 1;
-    b2.seq_id[s][0] = s + 1;
-    b2.logits[s] = 1;
-  }
-  b2.n_tokens = n;
-  if (llama_decode(ctx, b2) == 0) {
-    for (int s = 0; s < n; s++) {
-      float *l = llama_get_logits_ith(ctx, s);
-      if (l)
-        cross_entropy(l, vs, cands[s][1]);
-    }
-  }
-  llama_batch_free(b2);
-  // S3: 3-token candidates continue decoding
-  std::vector<int> idx3;
-  for (int s = 0; s < n; s++)
-    if ((int)cands[s].size() >= 3)
-      idx3.push_back(s);
-  if (!idx3.empty()) {
-    llama_batch b3 = llama_batch_init((int)idx3.size(), 0, (int)idx3.size());
-    for (size_t k = 0; k < idx3.size(); k++) {
-      int s = idx3[k];
-      b3.token[k] = cands[s][1];
-      b3.pos[k] = ctx_len + 1;
-      b3.n_seq_id[k] = 1;
-      b3.seq_id[k][0] = s + 1;
-      b3.logits[k] = 1;
-    }
-    b3.n_tokens = (int)idx3.size();
-    if (llama_decode(ctx, b3) == 0) {
-      for (size_t k = 0; k < idx3.size(); k++) {
-        float *l = llama_get_logits_ith(ctx, (int)k);
-        if (l)
-          cross_entropy(l, vs, cands[idx3[k]][2]);
-      }
-    }
-    llama_batch_free(b3);
-  }
-}
-
-// Run once right after model load (inside the load thread, before
-// g_loaded). Sweeps {4,6,...,16} via set_n_threads on the live context
-// and sets g_max_threads to the smallest count reaching 95% of the
-// measured optimum. Falls back to the configured g_n_threads.
-static void thread_scan(llama_context *ctx) {
-  g_max_threads = g_n_threads;  // config fallback
-  log_msg("scan: start ctx=%p", (void *)ctx);
-  if (!ctx)
-    return;
-  SYSTEM_INFO si;
-  GetSystemInfo(&si);
-  int cores = (int)si.dwNumberOfProcessors;
-  log_msg("scan: cores=%d", cores);
-  std::vector<int> sweep;
-  for (int t = 4; t <= cores && t <= 16; t += 2)
-    sweep.push_back(t);
-  if (sweep.empty())
-    return;
-  const char *ctx_text = "今天天气不错我们去公园散步聊聊天然后回家吃晚饭";
-  std::vector<llama_token> ctx_ids = tokenize(ctx_text);
-  if ((int)ctx_ids.size() > 10)
-    ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - 10);
-  // heaviest real typing case: 3 x 2-token + 2 x 3-token candidates
-  // (S3 decode). Common words are single tokens; select from the pool
-  // and verify counts (2/3) at runtime.
-  const char *cand_pool[] = {
-      "错事", "侧式", "测速", "仄声", "佚名", "怅惘", "缱绻", "龌龊",
-      "邂逅", "蹉跎", "饕餮", "犄角", "旮旯", "囫囵", "氤氲", "黢黑",
-      "计算机", "图书馆", "摄像头", "咖啡机", "高跟鞋", "潜台词", "老字号",
-      "双刃剑", "里程碑", "橄榄枝", "绊脚石", "遮羞布", "紧箍咒", "试金石"};
-  std::vector<std::vector<llama_token>> cands;
-  int got2 = 0, got3 = 0;
-  for (auto *w : cand_pool) {
-    auto ids = tokenize(w);
-    if (ids.size() == 2 && got2 < 3) {
-      cands.push_back(ids);
-      got2++;
-    } else if (ids.size() == 3 && got3 < 2) {
-      cands.push_back(ids);
-      got3++;
-    }
-  }
-  if (cands.size() < 5)
-    return;  // pool failed; keep the config fallback
-  int vs = llama_n_vocab(g_vocab);
-  LARGE_INTEGER freq;
-  QueryPerformanceFrequency(&freq);
-  double best_ms = 1e18;
-  int best_t = sweep[0];
-  std::vector<double> ms_of(sweep.size());
-  int ctx_len = (int)ctx_ids.size();
-  for (size_t i = 0; i < sweep.size(); i++) {
-    llama_set_n_threads(ctx, sweep[i], sweep[i]);
-    scan_ctx_once(ctx, ctx_ids);  // S1 not timed (prepare absorbs it)
-    scan_cand_once(ctx, cands, ctx_len, vs);  // warmup (graph build)
-    // averaged trials (same metric as bench_threads.exe): 5 runs, mean
-    double sum = 0;
-    for (int k = 0; k < 5; k++) {
-      LARGE_INTEGER t0, t1;
-      scan_ctx_once(ctx, ctx_ids);  // S1: outside the timed window
-      QueryPerformanceCounter(&t0);
-      scan_cand_once(ctx, cands, ctx_len, vs);  // S2+S3: timed
-      QueryPerformanceCounter(&t1);
-      double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
-      sum += ms;
-    }
-    double avg = sum / 5.0;
-    ms_of[i] = avg;
-    if (avg < best_ms) {
-      best_ms = avg;
-      best_t = sweep[i];
-    }
-  }
-  // smallest thread count reaching >= 90% of the optimum
-  // (first satisfying sweep entry; must be <= the optimum)
-  int max_t = sweep[0];
-  for (size_t i = 0; i < sweep.size(); i++) {
-    if (ms_of[i] <= best_ms / 0.90) {
-      max_t = sweep[i];
-      break;
-    }
-  }
-  g_max_threads = max_t;
-  llama_set_n_threads(ctx, g_max_threads, g_max_threads);
-  log_msg("scan: opt thr=%d (%.0fms) 90%%tier thr=%d", best_t, best_ms,
-          g_max_threads);
-}
-
-static void adapt_threads(llama_context *ctx) {
-  if (!g_auto_adapt || !ctx)
-    return;
-  long long now = (long long)GetTickCount64();
-  if (now - g_last_adapt_ms < 10000)
-    return;  // throttle: at most one change per 10s
-  double busy = g_cpu_busy;
-  int high = g_max_threads > 0 ? g_max_threads : g_n_threads;
-  int cur = g_cur_threads;
-  int target = cur;
-  if (busy > 0.85 && cur != 4)
-    target = 4;                 // heavy system load: drop to the floor
-  else if (busy < 0.60 && cur != high)
-    target = high;              // system idle: back to the 95% tier
-  if (target != cur) {
-    llama_set_n_threads(ctx, target, target);
-    g_cur_threads = target;
-    g_last_adapt_ms = now;
-    log_msg("adapt: cpu=%.0f%% threads %d->%d", busy * 100.0, cur, target);
-  }
-}
 static int g_min_free_mem_mb = 2560;  // skip model load when free RAM below this
                                        // (0.8B Q4 needs ~2GB: freeze beats no rerank)
 static int g_n_ctx = 128;          // KV: 11 seqs x (ctx 10 + cand 2) = 132, 64 overflows
@@ -473,15 +254,10 @@ static void load_model_async() {
       }
     }
 
-    if (g_auto_adapt)
-      thread_scan(g_ctx);  // ~3s: decides the 95% high tier
-    g_cur_threads = g_max_threads > 0 ? g_max_threads : g_n_threads;
     g_loaded.store(true);
     g_loading.store(false);
-    if (g_auto_adapt)
-      std::thread(sampler_loop).detach();
-    log_msg("model ready (n_ctx=%d threads=%d auto_adapt=%d)",
-            g_n_ctx, g_cur_threads, g_auto_adapt ? 1 : 0);
+    log_msg("model ready (n_ctx=%d threads=%d)",
+            g_n_ctx, g_n_threads);
   }).detach();
 }
 
@@ -574,8 +350,6 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
   auto t1 = std::chrono::high_resolution_clock::now();
   double wait_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-  // load-adaptive thread count (cheap cached check, 10s throttle)
-  adapt_threads(g_ctx);
 
   int ctx_len = (int)ctx_ids.size();
   int vs = llama_n_vocab(g_vocab);
@@ -974,9 +748,6 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
       g_max_candidates = v;
     if (config->GetInt("llm_rerank/cpu_cores", &v))
       g_n_threads = v;
-    bool b = true;
-    if (config->GetBool("llm_rerank/auto_adapt", &b))
-      g_auto_adapt = b;
     if (config->GetInt("llm_rerank/min_free_mem_mb", &v))
       g_min_free_mem_mb = v;
     // cap threads at hardware cores: low-core machines shouldn't

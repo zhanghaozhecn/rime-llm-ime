@@ -71,12 +71,11 @@ llm_rerank:
   max_tokens: 10        # 上文 token 上限
   max_candidates: 5     # 参与打分的候选数上限
   cpu_cores: 6          # 默认线程数（bench_threads.exe 实测后自行修改）
-  auto_adapt: true      # 运行时按系统 CPU 负载动态调整线程数（>85% 切到 4 让路，<60% 恢复默认；10s 节流）
   min_free_mem_mb: 2560 # 可用内存低于此值时不加载模型（防小内存机器系统卡死）
   model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
 ```
 
-> **最优线程数（一键）**：运行 `bin/bench_threads.exe --apply` 即可在本机实测各线程数的推理耗时，**自动写入** RIME 用户目录 schema 的 `cpu_cores`（无需手动编辑），提示重新部署即可。扫描 1..逻辑核数约半分钟。配合 `auto_adapt: true`（默认开启），运行时还会根据系统负载动态让出/恢复线程，兼顾打字流畅与其他应用。
+> **最优线程数（一键）**：运行 `bin/bench_threads.exe --apply` 即可在本机实测各线程数的推理耗时，**自动写入** RIME 用户目录 schema 的 `cpu_cores`（无需手动编辑），提示重新部署即可。扫描 1..逻辑核数约半分钟。
 
 ### 线程数优化（可选，普通用户）
 
@@ -102,7 +101,7 @@ llm_rerank:
    - **手动**：把 `suggested default` 的数字填入方案 schema 的 `llm_rerank.cpu_cores`
 4. 托盘右键 → 重新部署 → 生效
 
-`auto_adapt`（默认开启）在运行时会再次兜底：系统负载 >85% 自动切到 4 线程让路，<60% 恢复。不跑本工具也可以直接用默认值 6。
+不跑本工具也可以直接用默认值 6（线程数固定，无运行时动态调整）。
 
 > 内存需求：0.8B Q4 模型加载后 WeaselServer 占用约 2GB。**内存 ≤4GB 的机器建议 `backend: off`**（输入法照常使用，仅无 LLM 重排），或调小 `min_free_mem_mb` 谨慎尝试。
 
