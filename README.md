@@ -70,12 +70,13 @@ llm_rerank:
   min_tokens: 1         # 上文 token 数小于此值时不推理
   max_tokens: 10        # 上文 token 上限
   max_candidates: 5     # 参与打分的候选数上限
-  cpu_cores: 7          # 推理线程数（自动不超过物理核数）
+  cpu_cores: 6          # 默认线程数（bench_threads.exe 实测后自行修改）
+  auto_adapt: true      # 运行时按系统 CPU 负载动态调整线程数（>85% 切到 4 让路，<60% 恢复默认；10s 节流）
   min_free_mem_mb: 2560 # 可用内存低于此值时不加载模型（防小内存机器系统卡死）
   model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
 ```
 
-> **最优线程数**：运行 `bin/bench_threads.exe`（可带模型路径参数）即可在本机实测各线程数的推理耗时，输出建议值（如 `cpu_cores: 11`）。扫描 1..逻辑核数，耗时约半分钟。
+> **最优线程数（一键）**：运行 `bin/bench_threads.exe --apply` 即可在本机实测各线程数的推理耗时，**自动写入** RIME 用户目录 schema 的 `cpu_cores`（无需手动编辑），提示重新部署即可。扫描 1..逻辑核数约半分钟。配合 `auto_adapt: true`（默认开启），运行时还会根据系统负载动态让出/恢复线程，兼顾打字流畅与其他应用。
 
 > 内存需求：0.8B Q4 模型加载后 WeaselServer 占用约 2GB。**内存 ≤4GB 的机器建议 `backend: off`**（输入法照常使用，仅无 LLM 重排），或调小 `min_free_mem_mb` 谨慎尝试。
 
