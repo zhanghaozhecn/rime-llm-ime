@@ -70,38 +70,34 @@ llm_rerank:
   min_tokens: 1         # 上文 token 数小于此值时不推理
   max_tokens: 10        # 上文 token 上限
   max_candidates: 5     # 参与打分的候选数上限
-  cpu_cores: 6          # 默认线程数（bench_threads.exe 实测后自行修改）
+  cpu_cores: 4          # 默认线程数（=GGML 默认，适用旧设备；bench_threads.exe 实测后自行修改）
   min_free_mem_mb: 2560 # 可用内存低于此值时不加载模型（防小内存机器系统卡死）
   model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
 ```
 
-> **最优线程数（一键）**：运行 `bin/bench_threads.exe --apply` 即可在本机实测各线程数的推理耗时，**自动写入** RIME 用户目录 schema 的 `cpu_cores`（无需手动编辑），提示重新部署即可。扫描 1..逻辑核数约半分钟。
+> **各线程数延迟实测**：运行 `bin/bench_threads.exe` 即可在本机实测 1~10（或最大核数）各线程数的推理耗时，打印延迟表（中位数 + mid50 区间），自行选择后填入 schema 的 `cpu_cores`，提示重新部署即可。每档采样 99 次，约 2.5 分钟。结果同时写入 exe 同目录 `bench_threads_result.txt`（覆盖）。
 
-### 线程数优化（可选，普通用户）
+### 线程数实测（可选，普通用户）
 
-`bin/bench_threads.exe` 在**本机实测**推理性能，给出针对这台设备的线程数建议：
+`bin/bench_threads.exe` 在**本机实测**各线程数的推理延迟：
 
 ```
-双击/命令行运行 bin/bench_threads.exe [--apply] [模型路径]
+双击/命令行运行 bin/bench_threads.exe [模型路径]
 ```
 
-1. **建议在系统空闲时运行**（有编译/下载/游戏在跑会压平曲线、建议值失真）
-2. 约 1 分钟后输出：
+1. **建议在系统空闲时运行**（有编译/下载/游戏在跑会压平曲线、延迟失真）
+2. 约 2.5 分钟后输出各线程数延迟表（每档采样 99 次，中位数 + mid50 区间）：
    ```
-   optimal thread count: 12 (54 ms/pass)
-   suggested default (90%): 6 (57 ms/pass)
-   config suggestion:
-     llm_rerank:
-       cpu_cores: 6
+   == bench_threads: per-thread latency ==
+   ...
+     thr= 5: median  69.2 ms/pass (mid50  67.7- 71.6)
+     thr= 6: median  65.6 ms/pass (mid50  64.2- 67.1)
+     ...
    ```
-   - `optimal`：该设备理论最快的线程数（全速档）
-   - `suggested default`：达到最优 90% 性能的**最小**线程数（推荐日常使用，省线程、留余量）
-3. 两种方式采纳建议：
-   - **自动**：加 `--apply` 参数运行，工具直接改写 RIME 用户目录里含 `llm_rerank` 节的 schema（`cpu_cores` 行）
-   - **手动**：把 `suggested default` 的数字填入方案 schema 的 `llm_rerank.cpu_cores`
-4. 托盘右键 → 重新部署 → 生效
+   工具**不做推荐**——自行权衡"延迟 vs 线程占用"，把选定的数字填入方案 schema 的 `llm_rerank.cpu_cores`（通常选曲线拐点附近的最小线程数即可；`mid50` 区间窄 = 该档稳定）
+3. 托盘右键 → 重新部署 → 生效
 
-不跑本工具也可以直接用默认值 6（线程数固定，无运行时动态调整）。
+不跑本工具也可以直接用默认值 4（=GGML 默认，适用旧设备；线程数固定，无运行时动态调整）。
 
 > 内存需求：0.8B Q4 模型加载后 WeaselServer 占用约 2GB。**内存 ≤4GB 的机器建议 `backend: off`**（输入法照常使用，仅无 LLM 重排），或调小 `min_free_mem_mb` 谨慎尝试。
 

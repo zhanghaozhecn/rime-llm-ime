@@ -53,7 +53,7 @@ static std::string g_backend = "off";
 static int g_min_code_len = 4;
 static int g_min_tokens = 1;
 static int g_max_ctx_tokens = 10;  // tok=10: 93.4% acc, 10->17 gains only +1.1pp
-static int g_n_threads = 5;        // default; user may override via cpu_cores
+static int g_n_threads = 4;        // default = GGML_DEFAULT_N_THREADS; override via cpu_cores
 
 static void log_msg(const char *fmt, ...);  // defined below (fwd decl)
 static std::vector<llama_token> tokenize(const char *text);  // fwd decl

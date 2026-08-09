@@ -62,7 +62,7 @@ llm_rerank:
   min_tokens: 1         # 上文 token 数小于此值时不推理（0 = 空上文也推理）
   max_tokens: 10        # 上文 token 上限，超出时从末尾截断
   max_candidates: 5     # 参与打分的候选数上限（其余按原序接尾）
-  cpu_cores: 7          # 推理线程数（实测多台机器均在 7 饱和）
+  cpu_cores: 4          # 推理线程数（默认=GGML 默认；bench_threads.exe 实测后可自行调整）
   model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf  # GGUF 模型路径
 
 speller:
