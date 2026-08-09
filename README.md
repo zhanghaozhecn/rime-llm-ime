@@ -27,7 +27,7 @@ rime-llm-ime/
 │   ├── WeaselIPC/     # SET_CONTEXT_TEXT / RESET_CONTEXT IPC
 │   └── librime/       # 仅补丁头文件（rime_api.h），完整版用顶层 librime/
 ├── pdsp.schema.yaml   # 拼读双拼方案 LLM 版（含 llm_rerank 配置节示例）
-├── bin/               # 预编译产物（rime.dll / weaselx64.dll / WeaselServer.exe / WeaselDeployer.exe / opencc.dll / vcomp140.dll）+ deploy_llm.bat 一键部署脚本
+├── bin/               # 预编译产物（rime.dll / weaselx64.dll / WeaselServer.exe / WeaselDeployer.exe / opencc.dll / vcomp140.dll）+ deploy_llm.bat 一键部署脚本 + bench_threads.exe 线程数测定工具
 └── sync.py            # 本机维护脚本（编译源 → 项目目录 → GitHub 树）
 ```
 
@@ -74,6 +74,8 @@ llm_rerank:
   min_free_mem_mb: 2560 # 可用内存低于此值时不加载模型（防小内存机器系统卡死）
   model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
 ```
+
+> **最优线程数**：运行 `bin/bench_threads.exe`（可带模型路径参数）即可在本机实测各线程数的推理耗时，输出建议值（如 `cpu_cores: 11`）。扫描 1..逻辑核数，耗时约半分钟。
 
 > 内存需求：0.8B Q4 模型加载后 WeaselServer 占用约 2GB。**内存 ≤4GB 的机器建议 `backend: off`**（输入法照常使用，仅无 LLM 重排），或调小 `min_free_mem_mb` 谨慎尝试。
 
