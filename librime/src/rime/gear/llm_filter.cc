@@ -123,6 +123,25 @@ static void log_msg(const char *fmt, ...) {
 // ============================================================
 static long g_event_cnt = 0;
 
+// Escape control chars for log lines: ctx may contain newlines (multi-line
+// caret text) which would otherwise break line-based log viewing in
+// Notepad. \n/\r/\t -> literal "\\n" etc.
+static std::string escape_ctx(const std::string &s) {
+  std::string t;
+  t.reserve(s.size());
+  for (char c : s) {
+    if (c == '\n')
+      t += "\\n";
+    else if (c == '\r')
+      t += "\\r";
+    else if (c == '\t')
+      t += "\\t";
+    else
+      t += c;
+  }
+  return t;
+}
+
 static std::string sanitize_field(const std::string &s) {
   std::string t = s;
   for (auto &c : t) {
@@ -287,6 +306,25 @@ static double cross_entropy(float *logits, int vs, int target_id) {
   return -((double)(logits[target_id] - m) - log(se));
 }
 
+// Normalizer (max, logsumexp) for a logits vector, computed once and reused
+// across multiple CE targets. Step 1 scores all candidates against the same
+// ctx logits, so the O(vocab) scan was repeated per candidate (5x waste,
+// ~5ms of the CE1 stage); with a shared normalizer it becomes O(vocab) once
+// + O(1) per target.
+static void logits_normalizer(float *logits, int vs, float &m, double &lse) {
+  m = -1e30f;
+  for (int k = 0; k < vs; k++)
+    if (logits[k] > m)
+      m = logits[k];
+  double se = 0;
+  for (int k = 0; k < vs; k++)
+    se += exp((double)(logits[k] - m));
+  lse = log(se);
+}
+static double ce_target(float *logits, int target_id, float m, double lse) {
+  return -((double)(logits[target_id] - m) - lse);
+}
+
 // ============================================================
 // core scoring:
 //   Step 1: decode ctx -> save logits -> CE of cand[0] from it
@@ -368,10 +406,18 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
   }
 
   // Step 1 CE: P(cand[0] | ctx) for all candidates
+  // all candidates share the same ctx logits -> one normalizer scan
+  auto ts_ce1_0 = std::chrono::high_resolution_clock::now();
   std::vector<double> ce_sum(n_cands, 0.0);
+  float m0;
+  double lse0;
+  logits_normalizer(ctx_logits.data(), vs, m0, lse0);
   for (int i = 0; i < n_cands; i++) {
-    ce_sum[i] = cross_entropy(ctx_logits.data(), vs, cands[i][0]);
+    ce_sum[i] = ce_target(ctx_logits.data(), cands[i][0], m0, lse0);
   }
+  auto ts_ce1_1 = std::chrono::high_resolution_clock::now();
+  double ms_ce1 =
+      std::chrono::duration<double, std::milli>(ts_ce1_1 - ts_ce1_0).count();
 
   // Step 2: KV copy ctx -> worker seqs, decode cand[0], CE of cand[1]
   double ms2a = 0, ms2b = 0;
@@ -414,7 +460,9 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
   }
 
   // Step 3: decode cand[1] on same seqs, CE of cand[2]
+  double ms3 = 0;
   if (K > 0) {
+    auto ts3_0 = std::chrono::high_resolution_clock::now();
     llama_batch b3 = llama_batch_init(K, 0, K);
     for (int s = 0; s < K; s++) {
       int ci = idx3[s];
@@ -441,8 +489,12 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
       log_msg("WARN: step3 decode failed");
     }
     llama_batch_free(b3);
+    auto ts3_1 = std::chrono::high_resolution_clock::now();
+    ms3 = std::chrono::duration<double, std::milli>(ts3_1 - ts3_0).count();
   }
 
+  // final scoring: CE sum + long-candidate tail extrapolation
+  auto ts_sc_0 = std::chrono::high_resolution_clock::now();
   for (int i = 0; i < n_cands; i++) {
     double score = ce_sum[i] > -1e9 ? -ce_sum[i] : -1e10;
     if (score > -1e9 && (int)cands[i].size() > 3) {
@@ -462,11 +514,15 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
 
   auto t2 = std::chrono::high_resolution_clock::now();
   double total_ms = std::chrono::duration<double, std::milli>(t2 - t0).count();
+  double ms_score =
+      std::chrono::duration<double, std::milli>(t2 - ts_sc_0).count();
   // one score line per inference (prep hit check)
-  log_msg("score: wait=%.0fms S1=%.0fms KV=%.0fms S2=%.0fms total=%.0fms "
-          "prep=%d ctx_tok=%d cand=%d",
-          wait_ms, ms1, ms2a, ms2b, total_ms, use_prep ? 1 : 0, ctx_len,
-          n_cands);
+  // timing: wait=S1(lock) S1=ctx decode(0 on prep hit) CE1=P(cand0|ctx)
+  //         KV=KV copy S2=decode cand0 S3=decode cand1 score=sum+extrap
+  log_msg("score: wait=%.0fms S1=%.0fms CE1=%.0fms KV=%.0fms S2=%.0fms "
+          "S3=%.0fms score=%.0fms total=%.0fms prep=%d ctx_tok=%d cand=%d",
+          wait_ms, ms1, ms_ce1, ms2a, ms2b, ms3, ms_score, total_ms,
+          use_prep ? 1 : 0, ctx_len, n_cands);
 }
 
 // ============================================================
@@ -591,8 +647,8 @@ void LlmRerankTranslation::Collect() {
     // text, or commit history fallback when TSF is unavailable)
     std::string ctx = normalize_ctx(ctx_);
     if (ctx != ctx_)  // newline/whitespace differences worth showing
-      log_msg("ctx raw: [%s]", ctx_.c_str());
-    log_msg("ctx: [%s]", ctx.c_str());
+      log_msg("ctx raw: [%s]", escape_ctx(ctx_).c_str());
+    log_msg("ctx: [%s]", escape_ctx(ctx).c_str());
     std::vector<llama_token> ctx_ids = tokenize(ctx.c_str());
     if ((int)ctx_ids.size() >= g_min_tokens) {
       if ((int)ctx_ids.size() > g_max_ctx_tokens)
