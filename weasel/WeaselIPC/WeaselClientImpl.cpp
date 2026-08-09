@@ -123,12 +123,25 @@ void ClientImpl::SendContextText(const std::string& utf8_text) {
   }
 }
 
-void ClientImpl::SendContextReset() {
+void ClientImpl::SendContextReset(const char* reason) {
   // 编辑键 (退格/删除/导航/回车) 或窗口切换后调用:
   // 上屏历史不再代表光标前上文, librime 侧清空并递增 reset 代次,
   // llm_filter 的 commit-history fallback 从头积累。
+  // reason 经 body 传递 (宽字符流), librime 日志记录触发场景。
   try {
     PipeMessage req{WEASEL_IPC_RESET_CONTEXT, 0, 0};
+    if (reason && *reason) {
+      // 管道 body 流为 wbufferstream (宽字符), 需转 wstring 写入
+      int wlen = MultiByteToWideChar(CP_UTF8, 0, reason, -1, NULL, 0) - 1;
+      if (wlen > 0) {
+        std::wstring wtext(wlen, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, reason, -1, &wtext[0], wlen);
+        channel.ClearBufferStream();
+        channel.Write(wtext);
+        req = PipeMessage{WEASEL_IPC_RESET_CONTEXT, 0,
+                          (DWORD)(wtext.size() * sizeof(wchar_t))};
+      }
+    }
     channel.Transact(req);
   } catch (...) {
   }
@@ -283,8 +296,8 @@ void Client::SetContextText(const std::string& utf8_text) {
   m_pImpl->SendContextText(utf8_text);
 }
 
-void Client::ResetContext() {
-  m_pImpl->SendContextReset();
+void Client::ResetContext(const char* reason) {
+  m_pImpl->SendContextReset(reason);
 }
 
 void Client::FocusIn() {

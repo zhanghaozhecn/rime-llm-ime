@@ -139,7 +139,8 @@ class Client {
   // 发送光标前上文文本 (UTF-8, 管道 body 传递)
   void SetContextText(const std::string& utf8_text);
   // 编辑键/窗口切换: 重置上屏历史兜底 (librime 侧清空 + 递增 reset 代次)
-  void ResetContext();
+  // reason: 触发场景 (editkey:backspace 等, 管道 body 传递, 仅日志用)
+  void ResetContext(const char* reason = "");
   // 输入窗口获得焦点
   void FocusIn();
   // 输入窗口失去焦点

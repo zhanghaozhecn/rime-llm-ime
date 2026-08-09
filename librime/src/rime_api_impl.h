@@ -1045,14 +1045,16 @@ static Bool RimeContextTextValid() {
   std::lock_guard<std::mutex> lock(g_context_text_mutex);
   return g_context_text_valid ? True : False;
 }
-static void RimeResetContextText() {
+static void RimeResetContextText(const char* reason) {
   std::lock_guard<std::mutex> lock(g_context_text_mutex);
   g_context_text.clear();
   g_context_text_valid = false;  // 重置后需新窗口/新采集重新置位
   ++g_context_reset_gen;
-  // 诊断: 记录 reset 触发 (谁清空了 TSF 上下文, ESC 场景排查)
+  // 诊断: 记录 reset 触发 + 原因 (谁清空了 TSF 上下文, ESC 场景排查)
   FILE *f = fopen("C:/Users/Administrator/AppData/Roaming/Rime/rime_llm_filter_log.txt", "a");
-  if (f) { fprintf(f, "RESET: context cleared (gen=%d)\n", g_context_reset_gen); fclose(f); }
+  if (f) { fprintf(f, "RESET: context cleared (gen=%d reason=%s)\n",
+                   g_context_reset_gen, reason ? reason : "unknown");
+           fclose(f); }
 }
 static int RimeContextResetGeneration() {
   std::lock_guard<std::mutex> lock(g_context_text_mutex);

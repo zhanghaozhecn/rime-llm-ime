@@ -186,7 +186,7 @@ STDMETHODIMP WeaselTSF::OnSetThreadFocus() {
   // fallback (session-level history no longer represents the caret
   // context), then asynchronously refresh the caret context text so the
   // LLM context is bounded to the new window.
-  m_client.ResetContext();
+  m_client.ResetContext("window:focus");
   _OnContextReset();  // 清去抖标记, 下次采集强制重发
   com_ptr<ITfDocumentMgr> pDocMgrFocus;
   if (_pThreadMgr && _pThreadMgr->GetFocus(&pDocMgrFocus) == S_OK &&

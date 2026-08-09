@@ -502,12 +502,13 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
       // Without compensation the truncation lets long words skip their
       // (negative) tail CEs, favoring them over 3-token words. Extrapolate
       // the missing tail CEs by the average CE - no extra decode needed.
-      // lambda tuned on corpus (eval_long_cand, 721 long-cand samples):
-      //   lam=1.0 over-penalizes (long-down 35), lam=0.5 balances
-      //   (long-up 17 / long-down 19) and reaches 94.45% first-choice
-      //   agreement with full scoring (vs 90.29% truncated).
+      // lambda tuned on corpus (eval_long_cand, 187 long-cand samples,
+      // 7-point scan 0.3-0.7): real tail CE / head CE measured at
+      // mean 0.58 (len=4) / 0.62 (len=5+), so 0.6 sits on the plateau
+      // (0.5-0.7 all ~94% first-choice agreement) with balanced
+      // direction (up 5 / down 5 at 0.6 vs 6/4 at 0.5).
       double avg_ce = ce_sum[i] / 3.0;
-      score = -ce_sum[i] - avg_ce * ((int)cands[i].size() - 3) * 0.5;
+      score = -ce_sum[i] - avg_ce * ((int)cands[i].size() - 3) * 0.6;
     }
     scores_out[i] = score;
   }
@@ -802,9 +803,14 @@ static void request_prepare(const std::string &raw_ctx) {
 static void on_context_changed(const char *text) {
   if (!g_loaded.load() || g_loading.load())
     return;
-  // 节流: 文档连续更新时 (CEF 类应用滚动/歌词/动画) 回调可每秒数十次,
-  // 每次都会 spawn 线程 + llama decode; 300ms 窗口内只做第一次
-  // (后续更新由下一次回调或 OnCommit 轮询兜底)
+  // Throttle: continuous doc updates (CEF scroll/lyrics/animation) can
+  // fire this callback dozens of times per second; only the first within
+  // the window runs (later updates are covered by the next callback or
+  // the OnCommit poll). 100ms vs 300ms: a prep miss costs a full S1
+  // (30-50ms) on the next word - measured 15/1395 score lines had
+  // prep=0 under fast typing with the 300ms window. request_prepare
+  // dedups identical ctx anyway, so the window only guards thread
+  // spawn overhead; 100ms suffices.
   static std::atomic<long long> s_last_prep_ms{0};
   long long now =
 #ifdef _WIN32
@@ -812,7 +818,7 @@ static void on_context_changed(const char *text) {
 #else
       0;  // non-Windows: no throttling (unused path)
 #endif
-  if (now > 0 && now - s_last_prep_ms.load() < 300)
+  if (now > 0 && now - s_last_prep_ms.load() < 100)
     return;
   s_last_prep_ms.store(now);
   request_prepare(text ? text : "");
@@ -862,8 +868,8 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
     if (tsf_valid) {
       std::string old_ctx = GetContextTextGlobal();
       cur_ctx = old_ctx;
-      for (int i = 0; i < 30; i++) {  // up to ~1.5s
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      for (int i = 0; i < 30; i++) {  // up to ~600ms
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
         cur_ctx = GetContextTextGlobal();
         if (cur_ctx != old_ctx)
           break;

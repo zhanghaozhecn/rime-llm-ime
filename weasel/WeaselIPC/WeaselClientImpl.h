@@ -19,7 +19,7 @@ class ClientImpl {
   bool Echo();
   bool ProcessKeyEvent(KeyEvent const& keyEvent);
   void SendContextText(const std::string& utf8_text);
-  void SendContextReset();
+  void SendContextReset(const char* reason = "");
   bool CommitComposition();
   bool ClearComposition();
   bool SelectCandidateOnCurrentPage(size_t index);

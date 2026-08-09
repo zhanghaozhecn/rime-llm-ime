@@ -515,8 +515,10 @@ typedef struct RIME_FLAVORED(rime_api_t) {
   //! 调用方应回退到上屏历史 commit_history)
   Bool (*context_text_valid)(void);
   //! 编辑键 (退格/删除/导航/回车) 或窗口切换后调用: 清空光标前文本缓存,
-  //! 并递增 reset 代次——llm_filter 的 commit-history 兜底由此从头积累
-  void (*reset_context_text)(void);
+  //! 并递增 reset 代次——llm_filter 的 commit-history 兜底由此从头积累。
+  //! reason 为触发场景字符串 (editkey:backspace / editkey:navigation /
+  //! window:focus 等, 客户端 TSF 传入), 仅用于日志诊断
+  void (*reset_context_text)(const char* reason);
   //! 当前 reset 代次 (llm_filter 消费: 代次变化 = 旧上屏历史作废)
   int (*context_reset_generation)(void);
   //! 注册光标前文本更新回调 (set_context_text 每次送达时触发,

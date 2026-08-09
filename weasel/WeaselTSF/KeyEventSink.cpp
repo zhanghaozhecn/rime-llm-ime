@@ -122,18 +122,43 @@ void WeaselTSF::_HandleEditKeyReset(WPARAM wParam) {
   // composition 非空时退格等是删编码, 光标位置未变, 不重置
   if (_status.composing)
     return;
+  // 防重: TSF 的 TestKeyDown/KeyDown/TestKeyUp/KeyUp 四个回调都会进入
+  // 本函数, 同一物理按键会重复 ResetContext (reset 代次翻倍, 且可能
+  // 清掉刚采集送达的 ctx); 500ms 内相同按键合并为一次。
+  // 窗口需覆盖一次按键全周期 (Down->Up 保持时间可达 200ms+, 实测
+  // 100ms 窗口下 KeyUp 落窗外导致每按 2 次 reset): reset 幂等,
+  // 快速连按/长按 auto-repeat 合并无害。
+  {
+    static DWORD s_last_tick = 0;
+    static WPARAM s_last_key = 0;
+    DWORD now = GetTickCount();
+    if (wParam == s_last_key && now - s_last_tick < 500)
+      return;
+    s_last_tick = now;
+    s_last_key = wParam;
+  }
+  const char* reason = nullptr;
   switch (wParam) {
     case VK_BACK:     // BackSpace
+      reason = "editkey:backspace";
+      break;
     case VK_DELETE:   // Delete
+      reason = "editkey:delete";
+      break;
     case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
     case VK_HOME: case VK_END:
     case VK_PRIOR: case VK_NEXT:  // Page_Up / Page_Down
+      reason = "editkey:navigation";
+      break;
     case VK_RETURN:  // Enter (换行)
-      m_client.ResetContext();
-      _OnContextReset();  // 清去抖标记, 下次采集强制重发
+      reason = "editkey:enter";
       break;
     default:
       break;
+  }
+  if (reason) {
+    m_client.ResetContext(reason);  // 触发场景随 IPC 传递, 日志记录
+    _OnContextReset();              // 清去抖标记, 下次采集强制重发
   }
 }
 

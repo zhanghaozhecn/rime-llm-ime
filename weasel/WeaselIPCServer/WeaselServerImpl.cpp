@@ -373,10 +373,24 @@ DWORD ServerImpl::OnResetContext(WEASEL_IPC_COMMAND uMsg,
                                  DWORD wParam,
                                  DWORD lParam) {
   // 编辑键/窗口切换: 清空光标前文本缓存 + 递增 reset 代次,
-  // llm_filter 的 commit-history fallback 由此从头积累
+  // llm_filter 的 commit-history fallback 由此从头积累。
+  // body: 宽字符 reason (触发场景, 仅日志诊断用), 转 UTF-8 传入
+  std::string reason;
+  if (lParam > 0 && lParam <= 128) {
+    wchar_t* wbuf = reinterpret_cast<wchar_t*>(channel->SendBuffer());
+    if (wbuf) {
+      std::wstring wtext(wbuf, lParam / sizeof(wchar_t));
+      int ulen = WideCharToMultiByte(CP_UTF8, 0, wtext.c_str(),
+                                     (int)wtext.size(), NULL, 0, NULL, NULL);
+      reason.resize(ulen > 0 ? ulen : 0);
+      if (ulen > 0)
+        WideCharToMultiByte(CP_UTF8, 0, wtext.c_str(), (int)wtext.size(),
+                            &reason[0], ulen, NULL, NULL);
+    }
+  }
   RimeApi* api = rime_get_api();
   if (api && api->reset_context_text)
-    api->reset_context_text();
+    api->reset_context_text(reason.empty() ? "unknown" : reason.c_str());
   return 0;
 }
 
@@ -482,8 +496,11 @@ void PipeServer::_ProcessPipeThread(HANDLE pipe, ServerHandler const& handler) {
             throw e;
         }
         memcpy(&msg, big, sizeof(msg) < (size_t)got ? sizeof(msg) : (size_t)got);
-        // 消息后可跟 body (SET_CONTEXT_TEXT: lParam = body 长度 UTF-8 字节)
-        if (msg.Msg == WEASEL_IPC_SET_CONTEXT_TEXT && msg.lParam > 0) {
+        // 消息后可跟 body (SET_CONTEXT_TEXT: UTF-8 上文; RESET_CONTEXT:
+        // 宽字符 reason, 仅日志用)
+        if (msg.lParam > 0 &&
+            (msg.Msg == WEASEL_IPC_SET_CONTEXT_TEXT ||
+             msg.Msg == WEASEL_IPC_RESET_CONTEXT)) {
           size_t body_len = (size_t)msg.lParam < (size_t)4096 ? (size_t)msg.lParam
                                                               : (size_t)4096;
           if (got >= sizeof(msg) + body_len)
