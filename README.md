@@ -78,6 +78,32 @@ llm_rerank:
 
 > **最优线程数（一键）**：运行 `bin/bench_threads.exe --apply` 即可在本机实测各线程数的推理耗时，**自动写入** RIME 用户目录 schema 的 `cpu_cores`（无需手动编辑），提示重新部署即可。扫描 1..逻辑核数约半分钟。配合 `auto_adapt: true`（默认开启），运行时还会根据系统负载动态让出/恢复线程，兼顾打字流畅与其他应用。
 
+### 线程数优化（可选，普通用户）
+
+`bin/bench_threads.exe` 在**本机实测**推理性能，给出针对这台设备的线程数建议：
+
+```
+双击/命令行运行 bin/bench_threads.exe [--apply] [模型路径]
+```
+
+1. **建议在系统空闲时运行**（有编译/下载/游戏在跑会压平曲线、建议值失真）
+2. 约 1 分钟后输出：
+   ```
+   optimal thread count: 12 (54 ms/pass)
+   suggested default (90%): 6 (57 ms/pass)
+   config suggestion:
+     llm_rerank:
+       cpu_cores: 6
+   ```
+   - `optimal`：该设备理论最快的线程数（全速档）
+   - `suggested default`：达到最优 90% 性能的**最小**线程数（推荐日常使用，省线程、留余量）
+3. 两种方式采纳建议：
+   - **自动**：加 `--apply` 参数运行，工具直接改写 RIME 用户目录里含 `llm_rerank` 节的 schema（`cpu_cores` 行）
+   - **手动**：把 `suggested default` 的数字填入方案 schema 的 `llm_rerank.cpu_cores`
+4. 托盘右键 → 重新部署 → 生效
+
+`auto_adapt`（默认开启）在运行时会再次兜底：系统负载 >85% 自动切到 4 线程让路，<60% 恢复。不跑本工具也可以直接用默认值 6。
+
 > 内存需求：0.8B Q4 模型加载后 WeaselServer 占用约 2GB。**内存 ≤4GB 的机器建议 `backend: off`**（输入法照常使用，仅无 LLM 重排），或调小 `min_free_mem_mb` 谨慎尝试。
 
 ## 构建（开发者）
