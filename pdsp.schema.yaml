@@ -28,7 +28,7 @@ engine:
     - ascii_composer
     - recognizer
     - lua_processor@*llm_processor
-    - lua_processor@*key_extra_processor
+    - lua_processor@*word_to_char_processor
     - key_binder
     - lua_processor@*pin_fix_processor
     - speller
