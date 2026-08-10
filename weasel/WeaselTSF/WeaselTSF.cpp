@@ -326,18 +326,28 @@ class CGetTextBeforeCaretEditSession : public CEditSession {
         pTextRange->ShiftEndToRange(ec, selection.range, TF_ANCHOR_END);
     if (FAILED(hrShift))
       return E_FAIL;
-    // 向前扩展 kMaxCtxChars: range = [caret-64, caret]。
-    // 注意: 不能从光标处空 range 起 ShiftStart 负值 (实测返回 0 字符);
-    // 从 [doc_start, caret] 起移动, 失败时保持原 range (短文档仍正确)
-    LONG shifted = 0;
-    pTextRange->ShiftStart(ec, -kMaxCtxChars, &shifted, NULL);
-    WCHAR buf[64];
-    ULONG got = 0;
-    HRESULT hrText = pTextRange->GetText(ec, 0, buf, kMaxCtxChars, &got);
-    if (FAILED(hrText)) {
-      return E_FAIL;
+    // 取 [doc_start, caret] 全文后截尾部 kMaxCtxChars (光标前最近字符)。
+    // 不依赖 ShiftStart 负移: 实测负移返回 0 不移动 range 起点,
+    // 失败分支 (保持原 range) 会取到文档开头而非光标前 -> 长文档上文错位。
+    // 分块 GetText 需 TF_TF_MOVESTART 推进 range 起点; 取完时 got < 块大小。
+    const ULONG kChunk = 256;
+    std::wstring text;
+    WCHAR chunk[kChunk];
+    for (;;) {
+      ULONG got = 0;
+      HRESULT hrText =
+          pTextRange->GetText(ec, TF_TF_MOVESTART, chunk, kChunk, &got);
+      if (FAILED(hrText)) {
+        return E_FAIL;
+      }
+      if (got == 0)
+        break;
+      text.append(chunk, got);
+      if (got < kChunk)
+        break;
     }
-    std::wstring text(buf, got);
+    if ((int)text.size() > kMaxCtxChars)
+      text = text.substr(text.size() - kMaxCtxChars);
     _pTextService->_OnContextTextReady(text);
     return S_OK;
   }
