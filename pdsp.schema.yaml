@@ -29,7 +29,6 @@ engine:
     - recognizer
     - lua_processor@*llm_processor
     - lua_processor@*key_extra_processor
-    - lua_processor@*word_length_split_processor
     - key_binder
     - lua_processor@*pin_fix_processor
     - speller
@@ -50,7 +49,6 @@ engine:
     - uniquifier
     - llm_filter          # 原生 LLM 重排（rime-llm-ime 项目，C++ 编译进 rime.dll）
     - lua_filter@*hint_filter
-    - lua_filter@*word_length_split_filter
     - lua_filter@*pin_fix_filter
     - lua_filter@*no_match_placeholder
     #- simplifier
