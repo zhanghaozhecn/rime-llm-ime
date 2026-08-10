@@ -2,6 +2,7 @@
 
 #include <WeaselIPCData.h>
 #include <thread>
+#include <vector>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include "WeaselTSF.h"
@@ -327,22 +328,26 @@ class CGetTextBeforeCaretEditSession : public CEditSession {
     if (FAILED(hrShift))
       return E_FAIL;
     // 取 [doc_start, caret] 全文后截尾部 kMaxCtxChars (光标前最近字符)。
-    // 不依赖 ShiftStart 负移: 实测负移返回 0 不移动 range 起点,
-    // 失败分支 (保持原 range) 会取到文档开头而非光标前 -> 长文档上文错位。
-    // 分块 GetText 需 TF_TF_MOVESTART 推进 range 起点; 取完时 got < 块大小。
-    const ULONG kChunk = 256;
+    // 为何不直接用 ShiftStart(-64) 负移 (微软官方标准做法): 实测负移
+    // 返回 0 不移动 — (a) transitory context (Chrome/Firefox/记事本等
+    // 非 TSF-aware 应用) 不 honored 锚点移动; (b) 起点已在 doc_start 时
+    // 向左移被文档边界 clamp。GetText(NULL) 查询长度未文档化, 不可依赖。
+    // 大块 GetText (TF_TF_MOVESTART 推进起点): 短文档一次取完 (got < 块
+    // 大小即到底), 超长文档才追加下一块 — 调用次数不随文档长度线性增长,
+    // 瓶颈仅为不可避免的单次 O(n) 拷贝 (TSF 无"从尾部取 N 字符"API)。
+    const ULONG kChunk = 8192;
     std::wstring text;
-    WCHAR chunk[kChunk];
+    std::vector<WCHAR> chunk(kChunk);
     for (;;) {
       ULONG got = 0;
-      HRESULT hrText =
-          pTextRange->GetText(ec, TF_TF_MOVESTART, chunk, kChunk, &got);
+      HRESULT hrText = pTextRange->GetText(ec, TF_TF_MOVESTART, chunk.data(),
+                                           kChunk, &got);
       if (FAILED(hrText)) {
         return E_FAIL;
       }
       if (got == 0)
         break;
-      text.append(chunk, got);
+      text.append(chunk.data(), got);
       if (got < kChunk)
         break;
     }
