@@ -92,8 +92,8 @@ STDAPI WeaselTSF::OnTestKeyDown(ITfContext* pContext,
     *pfEaten = TRUE;
     return S_OK;
   }
-  _HandleEditKeyReset(wParam);
-  _RequestContextText(pContext);
+  // 2026-08-11: 移除 _HandleEditKeyReset/_RequestContextText — WPS 中
+  // 按键回调内调用失败会致 TSF 停用 text service (英文直出); 回归官方按键链路
   _ProcessKeyEvent(wParam, lParam, pfEaten);
   _UpdateComposition(pContext);
   if (*pfEaten)
@@ -110,8 +110,7 @@ STDAPI WeaselTSF::OnKeyDown(ITfContext* pContext,
     _fTestKeyDownPending = FALSE;
     *pfEaten = TRUE;
   } else {
-    _HandleEditKeyReset(wParam);
-    _RequestContextText(pContext);
+    // 2026-08-11: 同上, 移除按键回调内新增调用
     _ProcessKeyEvent(wParam, lParam, pfEaten);
     _UpdateComposition(pContext);
   }
@@ -174,8 +173,7 @@ STDAPI WeaselTSF::OnTestKeyUp(ITfContext* pContext,
   // Some apps (chat windows etc.) deliver keys via KeyUp only:
   // refresh the caret context here too, or the cached context text
   // stays stale after switching windows.
-  _HandleEditKeyReset(wParam);
-  _RequestContextText(pContext);
+  // 2026-08-11: 同上, 移除按键回调内新增调用
   _ProcessKeyEvent(wParam, lParam, pfEaten);
   _UpdateComposition(pContext);
   if (*pfEaten)
@@ -192,8 +190,7 @@ STDAPI WeaselTSF::OnKeyUp(ITfContext* pContext,
     _fTestKeyUpPending = FALSE;
     *pfEaten = TRUE;
   } else {
-    _HandleEditKeyReset(wParam);
-    _RequestContextText(pContext);
+    // 2026-08-11: 同上, 移除按键回调内新增调用
     _ProcessKeyEvent(wParam, lParam, pfEaten);
     if (!_async_edit)
       _UpdateComposition(pContext);
