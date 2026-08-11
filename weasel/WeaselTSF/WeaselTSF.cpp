@@ -183,20 +183,9 @@ STDMETHODIMP WeaselTSF::OnSetThreadFocus() {
     if (ok)
       _UpdateLanguageBar(_status);
   }
-  // Window switched (thread focus gained): reset the commit-history
-  // fallback (session-level history no longer represents the caret
-  // context), then asynchronously refresh the caret context text so the
-  // LLM context is bounded to the new window.
-  m_client.ResetContext("window:focus");
-  _OnContextReset();  // 清去抖标记, 下次采集强制重发
-  com_ptr<ITfDocumentMgr> pDocMgrFocus;
-  if (_pThreadMgr && _pThreadMgr->GetFocus(&pDocMgrFocus) == S_OK &&
-      pDocMgrFocus) {
-    com_ptr<ITfContext> pContext;
-    if (pDocMgrFocus->GetTop(&pContext) == S_OK && pContext) {
-      _RequestContextText(pContext);
-    }
-  }
+  // 2026-08-11 二分: 移除 ResetContext/_RequestContextText — WPS 中
+  // OnSetThreadFocus 频繁触发, 同步 IPC/EditSession 请求可能致 text service
+  // 停用 (英文直出)。上下文采集主路径暂时停用, 待定位后以异步方式恢复。
   return S_OK;
 }
 STDMETHODIMP WeaselTSF::OnKillThreadFocus() {
