@@ -335,10 +335,16 @@ class CGetTextBeforeCaretEditSession : public CEditSession {
     // 大块 GetText (TF_TF_MOVESTART 推进起点): 短文档一次取完 (got < 块
     // 大小即到底), 超长文档才追加下一块 — 调用次数不随文档长度线性增长,
     // 瓶颈仅为不可避免的单次 O(n) 拷贝 (TSF 无"从尾部取 N 字符"API)。
+    // 防死循环: Office/WPS 等完整 TSF 实现可能不 honored TF_TF_MOVESTART
+    // (与 ShiftStart 负移同类问题, 2026-08-11 实测发现: Office/WPS 直接英文
+    // 上屏 = EditSession 永不返回 → TSF 线程挂起 → 输入法失效)。
+    // 若起点不推进, got 恒 = 块大小, 无限循环; 加迭代上限 128 (≤1MB 文本,
+    // 截尾 64 字符绰绰有余), 超限放弃本轮采集 (上下文缺失不影响打字)。
     const ULONG kChunk = 8192;
+    const int kMaxIter = 128;
     std::wstring text;
     std::vector<WCHAR> chunk(kChunk);
-    for (;;) {
+    for (int iter = 0; iter < kMaxIter; ++iter) {
       ULONG got = 0;
       HRESULT hrText = pTextRange->GetText(ec, TF_TF_MOVESTART, chunk.data(),
                                            kChunk, &got);
