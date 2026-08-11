@@ -4,7 +4,6 @@
 #include <thread>
 #include <vector>
 #include <shellapi.h>
-#include <tlhelp32.h>
 #include "WeaselTSF.h"
 #include "CandidateList.h"
 #include "LanguageBar.h"
@@ -183,9 +182,6 @@ STDMETHODIMP WeaselTSF::OnSetThreadFocus() {
     if (ok)
       _UpdateLanguageBar(_status);
   }
-  // 2026-08-11 二分: 移除 ResetContext/_RequestContextText — WPS 中
-  // OnSetThreadFocus 频繁触发, 同步 IPC/EditSession 请求可能致 text service
-  // 停用 (英文直出)。上下文采集主路径暂时停用, 待定位后以异步方式恢复。
   return S_OK;
 }
 STDMETHODIMP WeaselTSF::OnKillThreadFocus() {
@@ -246,24 +242,7 @@ bool WeaselTSF::_EnsureServerConnected() {
     retry++;
     if (retry >= 6) {
       HANDLE hMutex = CreateMutex(NULL, TRUE, L"WeaselDeployerExclusiveMutex");
-      const auto count_server_process = []() -> int {
-        int count = 0;
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap == INVALID_HANDLE_VALUE)
-          return 0;
-        PROCESSENTRY32 pe;
-        pe.dwSize = sizeof(pe);
-        if (Process32First(snap, &pe)) {
-          do {
-            if (_wcsicmp(pe.szExeFile, L"WeaselServer.exe") == 0)
-              count++;
-          } while (Process32Next(snap, &pe));
-        }
-        CloseHandle(snap);
-        return count;
-      };
-      if (!m_client.Echo() && GetLastError() != ERROR_ALREADY_EXISTS &&
-          !count_server_process()) {
+      if (!m_client.Echo() && GetLastError() != ERROR_ALREADY_EXISTS) {
         std::wstring dir = _GetRootDir();
         std::thread th([dir, this]() {
           ShellExecuteW(NULL, L"open", (dir + L"\\start_service.bat").c_str(),
@@ -285,7 +264,11 @@ bool WeaselTSF::_EnsureServerConnected() {
   }
 }
 
-// 光标前文本获取: 文档锁内 GetSelection → 文档起点→光标 range → GetText
+// ============================================================
+// rime-llm-ime: 光标前上文采集
+// 文档锁内 GetSelection -> 文档起点->光标 range -> GetText, 异步发送
+// 给 server (SET_CONTEXT_TEXT IPC) 存入 librime, llm_filter 重排用。
+// ============================================================
 class CGetTextBeforeCaretEditSession : public CEditSession {
  public:
   CGetTextBeforeCaretEditSession(com_ptr<WeaselTSF> pTextService,
@@ -311,24 +294,21 @@ class CGetTextBeforeCaretEditSession : public CEditSession {
     HRESULT hrClone = pStart->Clone(&pTextRange);
     if (FAILED(hrClone))
       return E_FAIL;
-    // 文档起点 → 光标 (selection.range 是光标处的空 range)
+    // 文档起点 → 光标 (selection.range 是光标处的空 range)。
+    // 注意: 不排除 composition —— WPS 的 composition 从文档开头延续
+    // (连续输入时覆盖全文), composition 起点方案实测 ctx 恒空; 无条件
+    // 读 [doc_start, caret] 是 WPS 唯一可用的采集方式 (编码残留由
+    // librime 端 normalize_ctx 后处理 + 提交后采集的正确文本覆盖)。
     HRESULT hrShift =
         pTextRange->ShiftEndToRange(ec, selection.range, TF_ANCHOR_END);
     if (FAILED(hrShift))
       return E_FAIL;
     // 取 [doc_start, caret] 全文后截尾部 kMaxCtxChars (光标前最近字符)。
-    // 为何不直接用 ShiftStart(-64) 负移 (微软官方标准做法): 实测负移
-    // 返回 0 不移动 — (a) transitory context (Chrome/Firefox/记事本等
-    // 非 TSF-aware 应用) 不 honored 锚点移动; (b) 起点已在 doc_start 时
-    // 向左移被文档边界 clamp。GetText(NULL) 查询长度未文档化, 不可依赖。
     // 大块 GetText (TF_TF_MOVESTART 推进起点): 短文档一次取完 (got < 块
-    // 大小即到底), 超长文档才追加下一块 — 调用次数不随文档长度线性增长,
-    // 瓶颈仅为不可避免的单次 O(n) 拷贝 (TSF 无"从尾部取 N 字符"API)。
-    // 防死循环: Office/WPS 等完整 TSF 实现可能不 honored TF_TF_MOVESTART
-    // (与 ShiftStart 负移同类问题, 2026-08-11 实测发现: Office/WPS 直接英文
-    // 上屏 = EditSession 永不返回 → TSF 线程挂起 → 输入法失效)。
-    // 若起点不推进, got 恒 = 块大小, 无限循环; 加迭代上限 128 (≤1MB 文本,
-    // 截尾 64 字符绰绰有余), 超限放弃本轮采集 (上下文缺失不影响打字)。
+    // 大小即到底), 超长文档才追加下一块。
+    // 防死循环: 部分应用可能不 honored TF_TF_MOVESTART, 若起点不推进,
+    // got 恒 = 块大小, 无限循环; 加迭代上限 128 (≤1MB 文本, 截尾 64
+    // 字符绰绰有余), 超限放弃本轮采集 (上下文缺失不影响打字)。
     const ULONG kChunk = 8192;
     const int kMaxIter = 128;
     std::wstring text;
@@ -353,9 +333,26 @@ class CGetTextBeforeCaretEditSession : public CEditSession {
   }
 };
 
+bool WeaselTSF::_IsTSFCtxReliable() const {
+  // WPS 系应用: Kso 定制 Qt 的 TSF 实现不完整 (composition 从文档开头
+  // 延续/GetText 读到编码残留/提交采集失败), 实测采集结果脏且不稳定;
+  // 禁用 TSF 上文采集 -> librime context_text_valid=false -> 自动退化
+  // 到上屏历史 (commit history, 干净可靠)。
+  WCHAR exe[MAX_PATH] = {0};
+  GetModuleFileNameW(NULL, exe, MAX_PATH);
+  _wcslwr_s(exe);
+  if (wcsstr(exe, L"wps.exe") || wcsstr(exe, L"wpscloudsvr.exe") ||
+      wcsstr(exe, L"wpscenter.exe") || wcsstr(exe, L"wpspdf.exe") ||
+      wcsstr(exe, L"wpsupdate.exe"))
+    return false;
+  return true;
+}
+
 void WeaselTSF::_RequestContextText(ITfContext* pContext) {
   if (!pContext)
     return;
+  if (!_IsTSFCtxReliable())
+    return;  // WPS 系: 不采集, librime 退化历史上文
   com_ptr<CGetTextBeforeCaretEditSession> pEditSession(
       new CGetTextBeforeCaretEditSession(this, pContext));
   HRESULT hr = E_FAIL;
@@ -364,25 +361,13 @@ void WeaselTSF::_RequestContextText(ITfContext* pContext) {
                                TF_ES_READ | TF_ES_ASYNCDONTCARE, &hr);
 }
 
-void WeaselTSF::_OnContextReset() {
-  // Server 端上下文已清空 (RimeResetContextText): 清掉"已发送"标记,
-  // 下次采集即使文本相同也会重发, 否则去抖跳过 -> Server 上下文永远空
-  std::lock_guard<std::mutex> lock(m_ctx_debounce_mutex);
-  m_ctx_last_sent.clear();
-}
-
 void WeaselTSF::_OnContextTextReady(const std::wstring& text) {
-  m_textBeforeCaret = text;
   // 发送移出 TSF 文档锁 (EditSession 回调必须快速返回, 禁同步阻塞 IPC):
-  // 独立线程执行管道 Transact (PipeChannel 线程安全, thread_local 管道句柄)。
+  // 独立线程执行管道 Transact (ClientImpl::channel_mutex 串行化管道访问)。
   // 去抖: TSF 文档更新可极频繁 (CEF 类应用启动/滚动/歌词, 每次文档
   // 变化都触发采集), 每次直接发 SetContextText 会形成 IPC + Server 端
   // prepare 风暴, 拖慢其他应用启动 (QQ 音乐等打不开)。100ms 内合并为
   // 最新文本, 相同文本不重发, 发送期间的新更新循环补发。
-  // (100ms 权衡: 300ms 时快速打字 [~100ms/键, 4 码 350ms] 下一词重排
-  // 早于上文送达 -> ctx 空不重排 -> 词库顺序顶上屏错词 [试剂->事迹];
-  // Server 端 on_context_changed 另有 300ms 节流 + ctx dedup 防 decode
-  // 风暴, 客户端 100ms 只增轻量 IPC, QQ 音乐启动延迟不受影响)
   std::string utf8 = _Utf8FromWide(text);
   bool spawn = false;
   {

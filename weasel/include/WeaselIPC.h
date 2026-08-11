@@ -32,6 +32,8 @@ enum WEASEL_IPC_COMMAND {
   WEASEL_IPC_SELECT_CANDIDATE_ON_CURRENT_PAGE,
   WEASEL_IPC_HIGHLIGHT_CANDIDATE_ON_CURRENT_PAGE,
   WEASEL_IPC_CHANGE_PAGE,
+  // rime-llm-ime: 光标前上文文本传输 (TSF 采集 -> librime), 尾部追加
+  // 保持与官方 0.17.4 客户端/服务端的消息编号前缀兼容
   WEASEL_IPC_SET_CONTEXT_TEXT,
   WEASEL_IPC_RESET_CONTEXT,
   WEASEL_IPC_LAST_COMMAND
@@ -136,9 +138,9 @@ class Client {
   bool ChangePage(bool backward);
   // 更新输入位置
   void UpdateInputPosition(RECT const& rc);
-  // 发送光标前上文文本 (UTF-8, 管道 body 传递)
+  // rime-llm-ime: 发送光标前上文文本 (UTF-8, 管道 body 传递)
   void SetContextText(const std::string& utf8_text);
-  // 编辑键/窗口切换: 重置上屏历史兜底 (librime 侧清空 + 递增 reset 代次)
+  // rime-llm-ime: 编辑键/窗口切换: 重置上屏历史兜底 (librime 侧清空 + 递增 reset 代次)
   // reason: 触发场景 (editkey:backspace 等, 管道 body 传递, 仅日志用)
   void ResetContext(const char* reason = "");
   // 输入窗口获得焦点
@@ -160,7 +162,7 @@ class Server {
   virtual ~Server();
 
   // 初始化服务
-  HWND Start();
+  int Start();
   // 结束服务
   int Stop();
   // 消息循环

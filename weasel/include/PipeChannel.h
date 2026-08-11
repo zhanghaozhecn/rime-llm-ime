@@ -4,7 +4,6 @@
 #include <windows.h>
 #include <boost/interprocess/streams/bufferstream.hpp>
 #include <boost/thread.hpp>
-#include <boost/thread/tss.hpp>
 
 namespace weasel {
 
@@ -12,16 +11,8 @@ class PipeChannelBase {
  public:
   using Stream = boost::interprocess::wbufferstream;
 
-  struct ChannelContext {
-    std::unique_ptr<char[]> buffer;
-    std::unique_ptr<Stream> write_stream;
-    bool has_body;
-
-    ChannelContext(size_t bs)
-        : buffer(std::make_unique<char[]>(bs)), has_body(false) {}
-  };
-
   PipeChannelBase(std::wstring&& pn_cmd, size_t bs, SECURITY_ATTRIBUTES* s);
+  PipeChannelBase(PipeChannelBase&& r);
   ~PipeChannelBase();
 
  protected:
@@ -33,34 +24,21 @@ class PipeChannelBase {
   void _Reconnect();
   /* Try to connect for one time */
   HANDLE _TryConnect();
-  size_t _WritePipe(HANDLE p, size_t s, char* b, bool flush = true);
+  size_t _WritePipe(HANDLE p, size_t s, char* b);
   void _FinalizePipe(HANDLE& p);
   void _Receive(HANDLE pipe, LPVOID msg, size_t rec_len);
   /* Try to get a connection from client */
   HANDLE _ConnectServerPipe(std::wstring& pn);
   inline bool _Invalid(HANDLE p) const { return p == INVALID_HANDLE_VALUE; }
 
-  HANDLE* _GetPipeHandle() const {
-    if (!hpipe_ptr.get()) {
-      hpipe_ptr.reset(new HANDLE(INVALID_HANDLE_VALUE));
-    }
-    return hpipe_ptr.get();
-  }
-
-  ChannelContext* _GetContext() const {
-    if (!context.get()) {
-      context.reset(new ChannelContext(buff_size));
-    }
-    return context.get();
-  }
-
  protected:
   std::wstring pname;
-  // Thread-local pipe handle for isolation
-  mutable boost::thread_specific_ptr<HANDLE> hpipe_ptr;
+  HANDLE hpipe;
+
+  bool has_body;
   const size_t buff_size;
-  // Thread-local context for buffer and state
-  mutable boost::thread_specific_ptr<ChannelContext> context;
+  std::unique_ptr<char[]> buffer;
+  std::unique_ptr<Stream> write_stream;
 
  private:
   /* Security attributes */
@@ -93,20 +71,14 @@ class PipeChannel : public PipeChannelBase {
   /* Common pipe operations */
 
   bool Connect() { return _Ensure(); }
-  bool Connected() const {
-    HANDLE* phandle = _GetPipeHandle();
-    return !_Invalid(*phandle);
-  }
-  void Disconnect() {
-    HANDLE* phandle = _GetPipeHandle();
-    _FinalizePipe(*phandle);
-  }
+  bool Connected() const { return !_Invalid(hpipe); }
+  void Disconnect() { _FinalizePipe(hpipe); }
 
   /* Write data to buffer */
 
   template <typename _TyWrite>
   void Write(_TyWrite cnt) {
-    _GetContext()->has_body = true;
+    has_body = true;
     _BufferWriteStream() << cnt;
   }
 
@@ -119,22 +91,21 @@ class PipeChannel : public PipeChannelBase {
 
   _TyRes Transact(Msg& msg) {
     _Ensure();
-    HANDLE* phandle = _GetPipeHandle();
-    _Send(*phandle, msg);
+    _Send(hpipe, msg);
     return _ReceiveResponse();
   }
 
   void ClearBufferStream() {
-    auto ctx = _GetContext();
-    ctx->has_body = false;
-    if (ctx->write_stream != nullptr) {
-      ctx->write_stream.reset(nullptr);
+    has_body = false;
+    if (write_stream != nullptr) {
+      delete write_stream.release();
+      write_stream.reset(nullptr);
     }
   }
 
-  char* SendBuffer() const { return _GetContext()->buffer.get() + _MsgSize; }
+  char* SendBuffer() const { return buffer.get() + _MsgSize; }
 
-  char* ReceiveBuffer() const { return _GetContext()->buffer.get() + _ResSize; }
+  char* ReceiveBuffer() const { return buffer.get() + _ResSize; }
 
   template <typename _TyHandler>
   bool HandleResponseData(_TyHandler const& handler) {
@@ -143,53 +114,41 @@ class PipeChannel : public PipeChannelBase {
     }
 
     // Use whole buffer to receive data in client
-    return handler((LPWSTR)_GetContext()->buffer.get(),
+    return handler((LPWSTR)buffer.get(),
                    (UINT)(buff_size * sizeof(char) / sizeof(wchar_t)));
   }
 
  protected:
-  void _Send(HANDLE pipe, Msg& msg, bool flush = true) {
-    auto ctx = _GetContext();
-    char* pbuff = ctx->buffer.get();
+  void _Send(HANDLE pipe, Msg& msg) {
+    char* pbuff = buffer.get();
     DWORD lwritten = 0;
 
     *reinterpret_cast<Msg*>(pbuff) = msg;
-    size_t body_bytes = 0;
-    if (ctx->has_body && ctx->write_stream) {
-      std::streampos pos = ctx->write_stream->tellp();
-      if (pos != std::streampos(-1)) {
-        body_bytes = static_cast<size_t>(pos) * sizeof(wchar_t);
-      }
-    }
-    size_t data_sz = ctx->has_body ? (_MsgSize + body_bytes) : _MsgSize;
-    if (data_sz > buff_size)
-      data_sz = buff_size;
+    size_t data_sz = has_body ? buff_size : _MsgSize;
 
     try {
-      _WritePipe(pipe, data_sz, pbuff, flush);
+      _WritePipe(pipe, data_sz, pbuff);
     } catch (...) {
       _Reconnect();
-      _WritePipe(pipe, data_sz, pbuff, flush);
+      _WritePipe(pipe, data_sz, pbuff);
     }
     ClearBufferStream();
   }
 
   _TyRes _ReceiveResponse() {
-    HANDLE* phandle = _GetPipeHandle();
     _TyRes result;
-    _Receive(*phandle, &result, sizeof(result));
+    _Receive(hpipe, &result, sizeof(result));
     return result;
   }
 
   Stream& _BufferWriteStream() {
-    auto ctx = _GetContext();
-    if (ctx->write_stream == nullptr) {
-      char* pbuff = (char*)ctx->buffer.get() + _MsgSize;
+    if (write_stream == nullptr) {
+      char* pbuff = (char*)buffer.get() + _MsgSize;
       memset(pbuff, 0, buff_size - _MsgSize);
-      ctx->write_stream =
+      write_stream =
           std::make_unique<Stream>((wchar_t*)pbuff, _SendBufferSizeW());
     }
-    return *ctx->write_stream;
+    return *write_stream;
   }
 
  private:

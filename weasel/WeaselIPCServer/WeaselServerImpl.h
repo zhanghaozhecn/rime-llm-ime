@@ -70,14 +70,16 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
                                           DWORD wParam,
                                           DWORD lParam);
   DWORD OnChangePage(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+  // rime-llm-ime: 光标前上文文本 (SET_CONTEXT_TEXT body) 存入 librime 缓存
   DWORD OnSetContextText(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+  // rime-llm-ime: 编辑键/窗口切换 (RESET_CONTEXT body=reason) 重置 librime 上下文
   DWORD OnResetContext(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
 
  public:
   ServerImpl();
   ~ServerImpl();
 
-  HWND Start();
+  int Start();
   int Stop();
   int Run();
 

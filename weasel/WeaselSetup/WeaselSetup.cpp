@@ -41,7 +41,7 @@ int WINAPI _tWinMain(HINSTANCE hInstance,
 
   return nRet;
 }
-int install(bool hant, bool silent);
+int install(bool hant, bool silent, bool old_ime_support);
 int uninstall(bool silent);
 bool has_installed();
 
@@ -57,6 +57,7 @@ static std::wstring install_dir() {
 static int CustomInstall(bool installing) {
   bool hant = false;
   bool silent = false;
+  bool old_ime_support = false;
   std::wstring user_dir;
 
   const WCHAR KEY[] = L"Software\\Rime\\Weasel";
@@ -93,11 +94,12 @@ static int CustomInstall(bool installing) {
     } else {
       hant = dlg.hant;
       user_dir = dlg.user_dir;
+      old_ime_support = dlg.old_ime_support;
       _has_installed = dlg.installed;
     }
   }
   if (!_has_installed)
-    if (0 != install(hant, silent))
+    if (0 != install(hant, silent, old_ime_support))
       return 1;
 
   if (user_dir.empty()) {
@@ -148,6 +150,7 @@ LPCTSTR GetParamByPrefix(LPCTSTR lpCmdLine, LPCTSTR prefix) {
 
 static int Run(LPTSTR lpCmdLine) {
   constexpr bool silent = true;
+  constexpr bool old_ime_support = false;
   // parameter /? or /help to show commandline args
   if (!wcscmp(L"/?", lpCmdLine) || !wcscmp(L"/help", lpCmdLine)) {
     WCHAR msg[1024] = {0};
@@ -233,10 +236,10 @@ static int Run(LPTSTR lpCmdLine) {
 
   bool hans = !wcscmp(L"/s", lpCmdLine);
   if (hans)
-    return install(false, silent);
+    return install(false, silent, old_ime_support);
   bool hant = !wcscmp(L"/t", lpCmdLine);
   if (hant)
-    return install(true, silent);
+    return install(true, silent, old_ime_support);
   bool installing = !wcscmp(L"/i", lpCmdLine);
   return CustomInstall(installing);
 }

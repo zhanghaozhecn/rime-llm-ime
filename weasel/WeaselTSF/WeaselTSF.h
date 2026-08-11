@@ -172,24 +172,6 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   BOOL _InitKeyEventSink();
   void _UninitKeyEventSink();
   void _ProcessKeyEvent(WPARAM wParam, LPARAM lParam, BOOL* pfEaten);
-  // 按键时获取光标前文本 (TSF 文档锁内) 并发送给 server (供 LLM 上文)
-  friend class CGetTextBeforeCaretEditSession;
-  void _RequestContextText(ITfContext* pContext);
-  void _OnContextTextReady(const std::wstring& text);
-  // 上文采集去抖 (CEF 类应用文档更新极频繁, 限流 SetContextText 避免
-  // IPC + Server 端 prepare 风暴): 300ms 内合并为最新文本, 相同不重发
-  std::mutex m_ctx_debounce_mutex;
-  std::string m_ctx_pending;        // 待发送的最新文本 (UTF-8)
-  std::string m_ctx_last_sent;      // 已发送的文本
-  bool m_ctx_flush_running = false;  // 合并发送线程是否在跑
-  // ResetContext (编辑键/切窗) 后调用: 清空已发送标记, 强制下次采集重发
-  // (否则 Server 端上下文被清空后, 相同文本因去抖被跳过永不重发 -> 无推理)
-  void _OnContextReset();
-  // 编辑键 (退格/删除/导航/回车, composition 空时): 光标位置变化,
-  // 上屏历史不再代表光标前上文 -> 通知 librime 重置 commit-history 兜底
-  void _HandleEditKeyReset(WPARAM wParam);
-  std::string _Utf8FromWide(const std::wstring& wstr) const;
-  std::wstring m_textBeforeCaret;
 
   BOOL _InitPreservedKey();
   void _UninitPreservedKey();
@@ -210,6 +192,22 @@ class WeaselTSF : public ITfTextInputProcessorEx,
 
   void _Reconnect();
   std::wstring _GetRootDir();
+
+  // rime-llm-ime: 光标前上文采集 (文档锁内 GetText -> server -> librime)
+  friend class CGetTextBeforeCaretEditSession;
+  friend class CEndCompositionEditSession;  // 提交后主动刷新采集
+  // WPS 系应用 (Kso 定制 Qt 的 TSF 实现不完整) 禁用 TSF 上文采集,
+  // librime 自动退化到上屏历史 (commit history)
+  bool _IsTSFCtxReliable() const;
+  void _RequestContextText(ITfContext* pContext);
+  void _OnContextTextReady(const std::wstring& text);
+  // 上文采集去抖 (CEF 类应用文档更新极频繁, 限流 SetContextText 避免
+  // IPC + Server 端 prepare 风暴): 100ms 内合并为最新文本, 相同不重发
+  std::mutex m_ctx_debounce_mutex;
+  std::string m_ctx_pending;        // 待发送的最新文本 (UTF-8)
+  std::string m_ctx_last_sent;      // 已发送的文本
+  bool m_ctx_flush_running = false;  // 合并发送线程是否在跑
+  std::string _Utf8FromWide(const std::wstring& wstr) const;
 
   bool isImmersive() const {
     return (_activateFlags & TF_TMF_IMMERSIVEMODE) != 0;

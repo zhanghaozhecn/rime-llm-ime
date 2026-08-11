@@ -285,8 +285,6 @@ struct UIStyle {
   int hilited_label_text_color;
   int hilited_comment_text_color;
   int hilited_mark_color;
-  // LLM 重排 AI 首选标记色 (comment 含 "AI·" 时使用, rime-llm-ime)
-  int ai_comment_text_color;
   int prevpage_color;
   int nextpage_color;
   // per client
@@ -359,7 +357,6 @@ struct UIStyle {
         hilited_label_text_color(0),
         hilited_comment_text_color(0),
         hilited_mark_color(0),
-        ai_comment_text_color(0),
         prevpage_color(0),
         nextpage_color(0),
         baseline(0),
@@ -422,7 +419,6 @@ struct UIStyle {
         hilited_label_text_color != st.hilited_label_text_color ||
         hilited_comment_text_color != st.hilited_comment_text_color ||
         hilited_mark_color != st.hilited_mark_color ||
-        ai_comment_text_color != st.ai_comment_text_color ||
         prevpage_color != st.prevpage_color ||
         nextpage_color != st.nextpage_color);
   }
@@ -498,7 +494,6 @@ void serialize(Archive& ar, weasel::UIStyle& s, const unsigned int version) {
   ar & s.hilited_label_text_color;
   ar & s.hilited_comment_text_color;
   ar & s.hilited_mark_color;
-  ar & s.ai_comment_text_color;
   ar & s.prevpage_color;
   ar & s.nextpage_color;
   // per client

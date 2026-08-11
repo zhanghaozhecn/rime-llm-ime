@@ -1,4 +1,4 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 #include "WeaselClientImpl.h"
 #include <StringAlgorithm.hpp>
 
@@ -41,73 +41,14 @@ void ClientImpl::_InitializeClientInfo() {
   is_ime = ends_with(path, L".ime");
 }
 
-bool ClientImpl::Connect(ServerLauncher const& launcher) {
-  return channel.Connect();
-}
-
-void ClientImpl::Disconnect() {
-  if (_Active())
-    EndSession();
-  channel.Disconnect();
-}
-
-void ClientImpl::ShutdownServer() {
-  _SendMessage(WEASEL_IPC_SHUTDOWN_SERVER, 0, 0);
-}
-
-bool ClientImpl::ProcessKeyEvent(KeyEvent const& keyEvent) {
-  if (!_Active())
-    return false;
-
-  LRESULT ret =
-      _SendMessage(WEASEL_IPC_PROCESS_KEY_EVENT, keyEvent, session_id);
-  return ret != 0;
-}
-
-bool ClientImpl::CommitComposition() {
-  if (!_Active())
-    return false;
-
-  LRESULT ret = _SendMessage(WEASEL_IPC_COMMIT_COMPOSITION, 0, session_id);
-  return ret != 0;
-}
-
-bool ClientImpl::ClearComposition() {
-  if (!_Active())
-    return false;
-
-  LRESULT ret = _SendMessage(WEASEL_IPC_CLEAR_COMPOSITION, 0, session_id);
-  return ret != 0;
-}
-
-bool ClientImpl::SelectCandidateOnCurrentPage(size_t index) {
-  if (!_Active())
-    return false;
-  LRESULT ret = _SendMessage(WEASEL_IPC_SELECT_CANDIDATE_ON_CURRENT_PAGE, index,
-                             session_id);
-  return ret != 0;
-}
-
-bool ClientImpl::HighlightCandidateOnCurrentPage(size_t index) {
-  if (!_Active())
-    return false;
-  LRESULT ret = _SendMessage(WEASEL_IPC_HIGHLIGHT_CANDIDATE_ON_CURRENT_PAGE,
-                             index, session_id);
-  return ret != 0;
-}
-
-bool ClientImpl::ChangePage(bool backward) {
-  if (!_Active())
-    return false;
-  LRESULT ret = _SendMessage(WEASEL_IPC_CHANGE_PAGE, backward, session_id);
-  return ret != 0;
-}
-
+// rime-llm-ime: 发送光标前上文文本 (UTF-8 -> 管道 body 宽字符流)
 void ClientImpl::SendContextText(const std::string& utf8_text) {
-  // 注意: 本方法可能从 TSF 回调的独立发送线程调用, 该线程的
-  // thread_local 管道句柄未连接 (_Active() 检查会误判 false 而静默跳过),
-  // 因此不检查 _Active(); Transact 内部 _Ensure() 会按需建立连接。
+  // 注意: 本方法可能从 TSF 回调的独立发送线程调用, 该线程可能尚未
+  // StartSession (_Active() 检查会误判 false 而静默跳过), 因此不检查
+  // _Active(); Transact 内部 _Ensure() 会按需建立连接。channel_mutex
+  // 保证与主按键线程的管道访问互斥 (0.17.4 PipeChannel 非线程安全)。
   try {
+    std::lock_guard<std::mutex> lock(channel_mutex);
     // 管道 body 流为 wbufferstream (宽字符), 需转 wstring 写入
     int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8_text.c_str(),
                                    (int)utf8_text.size(), NULL, 0);
@@ -123,31 +64,103 @@ void ClientImpl::SendContextText(const std::string& utf8_text) {
   }
 }
 
+// rime-llm-ime: 编辑键/窗口切换: 通知 librime 重置上下文 (清空 + 递增代次)
 void ClientImpl::SendContextReset(const char* reason) {
-  // 编辑键 (退格/删除/导航/回车) 或窗口切换后调用:
-  // 上屏历史不再代表光标前上文, librime 侧清空并递增 reset 代次,
-  // llm_filter 的 commit-history fallback 从头积累。
-  // reason 经 body 传递 (宽字符流), librime 日志记录触发场景。
   try {
-    PipeMessage req{WEASEL_IPC_RESET_CONTEXT, 0, 0};
+    std::lock_guard<std::mutex> lock(channel_mutex);
+    channel.ClearBufferStream();
     if (reason && *reason) {
-      // 管道 body 流为 wbufferstream (宽字符), 需转 wstring 写入
-      int wlen = MultiByteToWideChar(CP_UTF8, 0, reason, -1, NULL, 0) - 1;
-      if (wlen > 0) {
-        std::wstring wtext(wlen, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, reason, -1, &wtext[0], wlen);
-        channel.ClearBufferStream();
-        channel.Write(wtext);
-        req = PipeMessage{WEASEL_IPC_RESET_CONTEXT, 0,
-                          (DWORD)(wtext.size() * sizeof(wchar_t))};
-      }
+      int wlen = MultiByteToWideChar(CP_UTF8, 0, reason, (int)strlen(reason),
+                                     NULL, 0);
+      std::wstring wtext(wlen, L'\0');
+      MultiByteToWideChar(CP_UTF8, 0, reason, (int)strlen(reason), &wtext[0],
+                          wlen);
+      channel.Write(wtext);
+      PipeMessage req{WEASEL_IPC_RESET_CONTEXT, 0,
+                      (DWORD)(wtext.size() * sizeof(wchar_t))};
+      channel.Transact(req);
+    } else {
+      PipeMessage req{WEASEL_IPC_RESET_CONTEXT, 0, 0};
+      channel.Transact(req);
     }
-    channel.Transact(req);
   } catch (...) {
   }
 }
 
+bool ClientImpl::Connect(ServerLauncher const& launcher) {
+  std::lock_guard<std::mutex> lock(channel_mutex);
+  return channel.Connect();
+}
+
+void ClientImpl::Disconnect() {
+  std::lock_guard<std::mutex> lock(channel_mutex);
+  if (_Active())
+    _SendMessage(WEASEL_IPC_END_SESSION, 0, session_id);  // 不调 EndSession 避免锁重入
+  session_id = 0;
+  channel.Disconnect();
+}
+
+void ClientImpl::ShutdownServer() {
+  std::lock_guard<std::mutex> lock(channel_mutex);
+  _SendMessage(WEASEL_IPC_SHUTDOWN_SERVER, 0, 0);
+}
+
+bool ClientImpl::ProcessKeyEvent(KeyEvent const& keyEvent) {
+  std::lock_guard<std::mutex> lock(channel_mutex);
+  if (!_Active())
+    return false;
+
+  LRESULT ret =
+      _SendMessage(WEASEL_IPC_PROCESS_KEY_EVENT, keyEvent, session_id);
+  return ret != 0;
+}
+
+bool ClientImpl::CommitComposition() {
+  std::lock_guard<std::mutex> lock(channel_mutex);
+  if (!_Active())
+    return false;
+
+  LRESULT ret = _SendMessage(WEASEL_IPC_COMMIT_COMPOSITION, 0, session_id);
+  return ret != 0;
+}
+
+bool ClientImpl::ClearComposition() {
+  std::lock_guard<std::mutex> lock(channel_mutex);
+  if (!_Active())
+    return false;
+
+  LRESULT ret = _SendMessage(WEASEL_IPC_CLEAR_COMPOSITION, 0, session_id);
+  return ret != 0;
+}
+
+bool ClientImpl::SelectCandidateOnCurrentPage(size_t index) {
+  std::lock_guard<std::mutex> lock(channel_mutex);
+  if (!_Active())
+    return false;
+  LRESULT ret = _SendMessage(WEASEL_IPC_SELECT_CANDIDATE_ON_CURRENT_PAGE, index,
+                             session_id);
+  return ret != 0;
+}
+
+bool ClientImpl::HighlightCandidateOnCurrentPage(size_t index) {
+  std::lock_guard<std::mutex> lock(channel_mutex);
+  if (!_Active())
+    return false;
+  LRESULT ret = _SendMessage(WEASEL_IPC_HIGHLIGHT_CANDIDATE_ON_CURRENT_PAGE,
+                             index, session_id);
+  return ret != 0;
+}
+
+bool ClientImpl::ChangePage(bool backward) {
+  std::lock_guard<std::mutex> lock(channel_mutex);
+  if (!_Active())
+    return false;
+  LRESULT ret = _SendMessage(WEASEL_IPC_CHANGE_PAGE, backward, session_id);
+  return ret != 0;
+}
+
 void ClientImpl::UpdateInputPosition(RECT const& rc) {
+  std::lock_guard<std::mutex> lock(channel_mutex);
   if (!_Active())
     return;
   /*
@@ -174,19 +187,23 @@ void ClientImpl::UpdateInputPosition(RECT const& rc) {
 }
 
 void ClientImpl::FocusIn() {
+  std::lock_guard<std::mutex> lock(channel_mutex);
   DWORD client_caps = 0; /* TODO */
   _SendMessage(WEASEL_IPC_FOCUS_IN, client_caps, session_id);
 }
 
 void ClientImpl::FocusOut() {
+  std::lock_guard<std::mutex> lock(channel_mutex);
   _SendMessage(WEASEL_IPC_FOCUS_OUT, 0, session_id);
 }
 
 void ClientImpl::TrayCommand(UINT menuId) {
+  std::lock_guard<std::mutex> lock(channel_mutex);
   _SendMessage(WEASEL_IPC_TRAY_COMMAND, menuId, session_id);
 }
 
 void ClientImpl::StartSession() {
+  std::lock_guard<std::mutex> lock(channel_mutex);
   if (_Active() && Echo())
     return;
 
@@ -196,21 +213,25 @@ void ClientImpl::StartSession() {
 }
 
 void ClientImpl::EndSession() {
+  std::lock_guard<std::mutex> lock(channel_mutex);
   _SendMessage(WEASEL_IPC_END_SESSION, 0, session_id);
   session_id = 0;
 }
 
 void ClientImpl::StartMaintenance() {
+  std::lock_guard<std::mutex> lock(channel_mutex);
   _SendMessage(WEASEL_IPC_START_MAINTENANCE, 0, 0);
   session_id = 0;
 }
 
 void ClientImpl::EndMaintenance() {
+  std::lock_guard<std::mutex> lock(channel_mutex);
   _SendMessage(WEASEL_IPC_END_MAINTENANCE, 0, 0);
   session_id = 0;
 }
 
 bool ClientImpl::Echo() {
+  std::lock_guard<std::mutex> lock(channel_mutex);
   if (!_Active())
     return false;
 
@@ -222,7 +243,7 @@ bool ClientImpl::GetResponseData(ResponseHandler const& handler) {
   if (!handler) {
     return false;
   }
-
+  std::lock_guard<std::mutex> lock(channel_mutex);
   return channel.HandleResponseData(handler);
 }
 

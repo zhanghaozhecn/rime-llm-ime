@@ -1,9 +1,14 @@
 @echo off
 REM ============================================
 REM  rime-llm-ime one-click deploy script
+REM  0.17.4-base build (2026-08-12):
+REM    weaselx64.dll  18f39c97  TSF: 0.17.4 + LLM ctx + WPS blacklist
+REM    WeaselServer   3c922981  server: 0.17.4 + SET_CONTEXT_TEXT/RESET_CONTEXT IPC
+REM    rime.dll       97c6343d  librime + llm_filter
+REM  Behavior: WPS=commit history rerank (AI-hist), others=TSF ctx (AI-TSF)
 REM  Place this file in bin\ and double-click it
 REM  Auto-elevates to admin, copies LLM files
-REM  Restart the system after running
+REM  Reboot + tray redeploy after running (see notes below)
 REM ============================================
 
 REM auto-elevate to admin
@@ -47,6 +52,10 @@ echo [4/4] Starting WeaselServer...
 start "" "%DEST%\WeaselServer.exe"
 
 echo.
-echo ==== Deploy complete! Please reboot to activate the System32 component ====
-echo Verify after reboot: first candidate shows gold AI-TSF / AI-hist mark
+echo ==== Deploy complete! ====
+echo 1. Reboot to activate the System32 TSF component
+echo 2. Tray icon - Redeploy (rebuilds dict build with LLM librime - REQUIRED,
+echo    official redeploy overwrites it with official format and 1-code chars
+echo    come up empty)
+echo 3. Verify: WPS = AI-hist mark, others = AI-TSF mark
 pause

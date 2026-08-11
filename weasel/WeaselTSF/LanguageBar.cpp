@@ -49,6 +49,12 @@ static bool open(const std::wstring& path) {
                                   SW_SHOWNORMAL) > 32;
 }
 
+static bool explore(const std::wstring& path) {
+  std::wstring quoted_path = L"\"" + path + L"\"";
+  return (uintptr_t)ShellExecuteW(NULL, L"explore", quoted_path.c_str(), NULL,
+                                  NULL, SW_SHOWNORMAL) > 32;
+}
+
 CLangBarItemButton::CLangBarItemButton(com_ptr<WeaselTSF> pTextService,
                                        REFGUID guid,
                                        weasel::UIStyle& style)
@@ -306,7 +312,7 @@ void WeaselTSF::_HandleLangBarMenuSelect(UINT wID) {
           });
           th.detach();
         } else
-          open(dir);
+          explore(dir);
       }
       break;
     case ID_WEASELTRAY_USERCONFIG:
@@ -318,13 +324,13 @@ void WeaselTSF::_HandleLangBarMenuSelect(UINT wID) {
         dir = std::wstring(_path);
       }
       if (!dir.empty() && fs::exists(dir))
-        open(dir);
+        explore(dir);
       else
         MessageBoxW(NULL, (L"Not found: " + dir).c_str(), L"RimeUserDir",
                     MB_ICONERROR | MB_OK);
       break;
     case ID_WEASELTRAY_LOGDIR:
-      open(WeaselLogPath().wstring());
+      explore(WeaselLogPath().wstring());
       break;
     case ID_WEASELTRAY_WIKI:
       open(L"https://rime.im/docs/");

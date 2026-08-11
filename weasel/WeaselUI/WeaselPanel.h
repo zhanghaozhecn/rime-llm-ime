@@ -81,7 +81,6 @@ class WeaselPanel
   void _InitFontRes(bool forced = false);
   void _CaptureRect(CRect& rect);
   bool m_mouse_entry = false;
-  CPoint m_lastMousePos = {-1, -1};
   void _CreateLayout();
   void _ResizeWindow();
   void _RepositionWindow(const bool& adj = false);
@@ -110,7 +109,6 @@ class WeaselPanel
   weasel::Status& m_status;
   weasel::UIStyle& m_style;
   weasel::UIStyle& m_ostyle;
-  const bool& m_in_server;
 
   CRect m_inputPos;
   int m_offsetys[MAX_CANDIDATES_COUNT];  // offset y for candidates when
@@ -136,7 +134,6 @@ class WeaselPanel
 
   CRect rcw;
   BYTE m_candidateCount;
-  BYTE m_lastCandidateCount;
 
   bool hide_candidates;
   bool m_sticky;

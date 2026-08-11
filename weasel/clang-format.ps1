@@ -3,7 +3,7 @@ param (
     [switch]$i
 )
 
-$WEASEL_SOURCE_PATH = @("RimeWithWeasel", "WeaselDeployer",
+$WEASEL_SOURCE_PATH = @("RimeWithWeasel", "WeaselDeployer", "WeaselIME",
   "WeaselIPC", "WeaselIPCServer", "WeaselServer", "WeaselSetup",
   "WeaselTSF", "WeaselUI", "include", "test")
 $excludePatterns = Get-Content .exclude_pattern.txt

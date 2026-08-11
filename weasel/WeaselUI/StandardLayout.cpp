@@ -139,8 +139,6 @@ bool weasel::StandardLayout::_IsHighlightOverCandidateWindow(CRect& rc,
   Gdiplus::Region hlRegion(&hlPath);
   Gdiplus::Region* tmpRegion = hlRegion.Clone();
 
-  if (!tmpRegion)
-    return false;
   tmpRegion->Xor(&bgRegion);
   tmpRegion->Exclude(&bgRegion);
 

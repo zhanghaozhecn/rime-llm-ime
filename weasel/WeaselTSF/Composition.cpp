@@ -106,19 +106,21 @@ STDAPI CEndCompositionEditSession::DoEditSession(TfEditCookie ec) {
   /* Clear the dummy text we set before, if any. */
   if (_pComposition == nullptr)
     return S_OK;
-  // Avoid null pointer dereference
-  if (!_pTextService || !_pContext)
-    return S_OK;
 
   _pTextService->_ClearCompositionDisplayAttributes(ec, _pContext);
 
-  com_ptr<ITfRange> pCompositionRange;
+  ITfRange* pCompositionRange;
   if (_clear && _pComposition->GetRange(&pCompositionRange) == S_OK)
     pCompositionRange->SetText(ec, 0, L"", 0);
 
   _pComposition->EndComposition(ec);
-  if (_pTextService)  // if _pTextService released, skip _FinalizeComposition
-    _pTextService->_FinalizeComposition();
+  _pTextService->_FinalizeComposition();
+  // rime-llm-ime: 候选上屏/提交后文档已更新, 主动刷新光标前上文采集。
+  // WPS 中候选上屏不触发 TextEditSink 的 OnEndEdit 文本变化事件, 只靠
+  // OnEndEdit 采集会拿到旧上下文 (上一词推理错误); 在提交 EditSession
+  // 内嵌套请求异步只读采集 (TSF 允许 EditSession 回调内异步请求新会话,
+  // 文档锁在 EndComposition 后已释放, 采集到的即为提交后的最新文本)。
+  _pTextService->_RequestContextText(_pContext);
   return S_OK;
 }
 
