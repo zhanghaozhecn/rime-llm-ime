@@ -10,11 +10,12 @@
 | 特性 | 说明 |
 |------|------|
 | 原生 filter 组件 | `llm_filter`（gear/llm_filter.{h,cc}）编译进 rime.dll，无外部进程、无 lua 依赖 |
-| TSF 光标上文 | 原生采集光标前 ~64 字符，隔断规则：切换窗口、换行、编辑键（BackSpace/Delete/方向键/Home/End/Enter）后上文重置 |
+| TSF 光标上文 | 原生采集光标前 ~64 字符（TextEditSink 文档变化 + 提交时主动采集，0.17.4 基底） |
+| WPS 兼容 | WPS 系应用（Kso 定制 Qt 的 TSF 实现不完整）自动禁用 TSF 采集，退化到上屏历史（`AI·历史`），打字稳定 |
 | prepare 预解码 | commit 后异步预解码上文（KV cache 复用），score 命中跳过重复解码（prep=1，2ms vs ~50ms） |
 | 长候选外推 | 4+ token 候选按尾部 CE 外推（λ=0.5，语料模拟调参），不增加 decode 次数，3-token 词不受长词挤压 |
 | 性能日志 | `rime_llm_filter_log.txt` 每推理一行：wait/S1/KV/S2/total/prep/ctx_tok/cand |
-| AI 首选标记 | 重排后首选候选 comment 显示 `AI·TSF`（光标前上文）/ `AI·历史`（上屏历史回退），**强调色**渲染（`style/ai_comment_text_color`，默认金色） |
+| AI 首选标记 | 重排后首选候选 comment 显示 `AI·TSF`（光标前上文）/ `AI·历史`（上屏历史回退，WPS 等场景） |
 
 ## 目录结构
 
@@ -22,10 +23,11 @@
 rime-llm-ime/
 ├── librime/           # 修改后的完整 librime 源码（上游 1.17.0 @ 1d0df6e）
 │   └── src/rime/gear/llm_filter.{h,cc}   # LLM filter 组件（新增）
-├── weasel/            # 修改后的完整 weasel 源码（上游 0.17.4）
-│   ├── WeaselTSF/     # TSF 上文采集（GetTextBeforeCaret、KeyUp 路径、SetThreadFocus 刷新）
-│   ├── WeaselIPC/     # SET_CONTEXT_TEXT / RESET_CONTEXT IPC
-│   └── librime/       # 仅补丁头文件（rime_api.h），完整版用顶层 librime/
+├── weasel/            # 修改后的完整 weasel 源码（上游 0.17.4 release tag）
+│   ├── WeaselTSF/     # TSF 上文采集（TextEditSink 文档变化 + 提交时采集 + WPS 黑名单）
+│   ├── WeaselIPC/     # SET_CONTEXT_TEXT / RESET_CONTEXT IPC（枚举尾部追加，前缀兼容官方）
+│   ├── WeaselIPCServer/  # OnSetContextText / OnResetContext handler
+│   └── librime/       # 仅补丁头文件（rime_api.h，LLM 版含 set_context_text 等扩展 API）
 ├── pdsp.schema.yaml   # 拼读双拼方案 LLM 版（含 llm_rerank 配置节示例）
 ├── bin/               # 预编译产物（rime.dll / weaselx64.dll / WeaselServer.exe / WeaselDeployer.exe / opencc.dll / vcomp140.dll）+ deploy_llm.bat 一键部署脚本 + bench_threads.exe 线程数测定工具
 └── sync.py            # 本机维护脚本（编译源 → 项目目录 → GitHub 树）
@@ -37,9 +39,11 @@ rime-llm-ime/
 
 ### 一键部署（推荐）
 
-双击 `bin/deploy_llm.bat`（自动请求管理员权限）→ **重启系统** → 完成。
+双击 `bin/deploy_llm.bat`（自动请求管理员权限）→ **重启系统** → **托盘重新部署** → 完成。
 
 脚本自动：停止 WeaselServer → 复制 6 个文件到安装目录 → System32 TSF 组件延迟替换（重启生效）→ 重启 Server。
+
+> **托盘重新部署必须执行**：词典 build 必须由 LLM 版 librime 编译（官方部署会覆盖为官方格式，LLM librime 读不了 → 一码字词全部为空）。
 
 ### 手动步骤
 
@@ -50,7 +54,7 @@ rime-llm-ime/
    - `vcomp140.dll` — VC OpenMP 运行时（无 VS 运行库的机器必需）
 3. `weaselx64.dll` 同时复制为 `C:\Windows\System32\weasel.dll`（TSF 组件，被占用时用延迟替换——**切勿重命名替换**，会导致 TSF 注销、语言栏图标消失）
 4. 将 `pdsp.schema.yaml` 复制到 RIME 用户目录（`%APPDATA%\Rime\`），修改 `llm_rerank` 配置节的 `model_path`
-5. 托盘右键 → **重新部署** → **重启系统**（TSF 加载新版组件）
+5. 托盘右键 → **重新部署**（LLM librime 重建词典 build）→ **重启系统**（TSF 加载新版组件）
 
 ### 常见问题
 
@@ -113,6 +117,17 @@ llm_rerank:
 | llama.cpp | master（MT 静态构建） | llm_filter 推理后端 |
 | GGUF 模型 | 任意小模型 | 推理模型 |
 
+### weasel 源码说明（0.17.4 基底）
+
+**重要**：weasel 源码基于 **0.17.4 release tag**（`git clone --depth 1 --branch 0.17.4 https://github.com/rime/weasel.git`），**不是 master 分支**——master 与 0.17.4 存在 IPC 协议差异（UIStyle 序列化中间插字段等），混用官方 0.17.4 组件会导致输入法失效（WPS/Office 英文直出、IPC 错误）。
+
+本仓库 weasel/ 相对官方 0.17.4 的改动：
+1. `include/WeaselIPC.h`：枚举**尾部追加** `SET_CONTEXT_TEXT`/`RESET_CONTEXT`（前缀编号不变，与官方组件任意混用兼容）+ Client 接口 `SetContextText`/`ResetContext`
+2. `WeaselIPC/WeaselClientImpl.{h,cpp}`：`SendContextText`/`SendContextReset` 实现 + **channel_mutex 互斥锁**（TSF 采集线程与主线程共享管道，替代 master 的 TLS 管道重构）
+3. `WeaselIPCServer/WeaselServerImpl.{h,cpp}`：`OnSetContextText`/`OnResetContext` handler（调 librime `set_context_text`/`reset_context_text`）
+4. `WeaselTSF/`：光标上文采集——`CGetTextBeforeCaretEditSession`（GetSelection → GetText 分块，kMaxIter=128 防死循环）+ TextEditSink 文档变化触发 + `CEndCompositionEditSession` 提交时采集 + **WPS 黑名单**（`_IsTSFCtxReliable()`：wps.exe 等禁用 TSF 采集 → librime 自动退化上屏历史）
+5. **UIStyle 不加字段**（`ai_comment_text_color` 未移植——保持与官方 0.17.4 序列化 100% 兼容；AI 标记以 comment 文本显示）
+
 ### 步骤
 
 ```bat
@@ -133,12 +148,21 @@ cmake -B build -A x64 -DLLAMA_ROOT=D:/llama.cpp-mirror ^
       -DCMAKE_PREFIX_PATH=D:/rime-build/librime/install
 cmake --build build --config Release --target rime
 
-:: 4. 构建 weasel
-:: 将顶层 librime/include/rime_api.h 覆盖到 weasel/librime/include/
-:: 将 librime 构建的 rime.lib 放入 weasel/librime/build/lib/Release/
+:: 4. 构建 weasel（0.17.4 基底）
+:: 4a. 依赖准备
+::   - boost_1_84_0 放入 weasel/deps/（install_boost.bat 或从其他 weasel 树复制）
+::   - weasel.props 从 template 生成（替换 BOOST_ROOT/PLATFORM_TOOLSET=v143/VERSION=0.17.4.0）
+::   - afxres.h 放入 weasel/include/（VS 无 MFC 时需 stub）
+::   - LLM 版 rime_api.h（顶层 librime/src/rime_api.h，含 set_context_text 等扩展）
+::     复制到 weasel/librime/include/rime_api.h
+::   - rime.lib：librime 构建产物，或从 rime.dll 生成：
+::       dumpbin /exports rime.dll > exports.txt  →  写 rime.def  →  lib /def:rime.def /machine:x64
+::     放入 weasel/lib/ 和 weasel/lib64/（x64 Release 用 lib64）
+::   - WeaselIPCServer.vcxproj 的 include 路径需含 $(SolutionDir)\librime\include
+:: 4b. 编译
 cd weasel
-env.bat
-msbuild weasel.sln /p:Configuration=Release /p:Platform=x64
+msbuild weasel.sln /p:Configuration=Release /p:Platform=x64 /t:WeaselTSF /t:WeaselServer
+:: 产物在 weasel/output/weaselx64.dll + weasel/output/WeaselServer.exe
 ```
 
 > `src/CMakeLists.txt` 中 `LLAMA_ROOT` 为 CMake CACHE 变量，可用 `-DLLAMA_ROOT=<你的路径>` 覆盖。
@@ -146,25 +170,18 @@ msbuild weasel.sln /p:Configuration=Release /p:Platform=x64
 
 ### 替换安装文件
 
-产物：`librime/build/src/Release/rime.dll`、`weasel/output/Release/weaselx64.dll`、`WeaselServer.exe`、`WeaselDeployer.exe`，另需 `librime install/bin/opencc.dll`（rime.dll 的动态依赖）和 `vcomp140.dll`（VC OpenMP 运行时）。替换小狼毫安装目录同名文件后，注销重登（TSF 注册表缓存）或重启系统。
+产物：`librime/build/src/Release/rime.dll`、`weasel/output/weaselx64.dll`、`weasel/output/WeaselServer.exe`，另需 `librime install/bin/opencc.dll`（rime.dll 的动态依赖）和 `vcomp140.dll`（VC OpenMP 运行时）。替换小狼毫安装目录同名文件后，注销重登（TSF 注册表缓存）或重启系统，然后**托盘重新部署**（LLM librime 重建词典 build）。
 
 ## 候选窗 AI 标记
 
-LLM 重排生效时，首选候选的 comment 显示来源徽章：
+LLM 重排生效时，首选候选的 comment 显示来源徽章（文本形式，跟随候选窗 comment 样式）：
 
 | 标记 | 含义 |
 |------|------|
-| `AI·TSF` | 上文来自 TSF 光标前文本（首选通道） |
-| `AI·历史` | 上文来自上屏历史回退（TSF 不可用场景） |
+| `AI·TSF` | 上文来自 TSF 光标前文本（Word/记事本等 TSF 采集正常的应用） |
+| `AI·历史` | 上文来自上屏历史回退（WPS 等 TSF 采集不可用的应用，自动退化） |
 
-样式可配置（weasel.custom.yaml）：
-
-```yaml
-style:
-  # AI 首选标记色（默认金色；设透明色 0x00000000 可关闭）
-  # 注意: 默认 color_format: abgr, 8 位按 AABBGGRR 字节序 → 金色写 0xFF00B8E8
-  ai_comment_text_color: 0xFF00B8E8
-```
+> 注：0.17.4 基底未加独立强调色样式（保持与官方 UIStyle 序列化完全兼容）；如需自定义 comment 颜色，用候选窗 comment 样式即可。
 
 ## 日志
 
