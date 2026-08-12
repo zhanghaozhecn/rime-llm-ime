@@ -899,8 +899,17 @@ std::pair<std::string, std::string> LlmFilter::GetContextTextPair() const {
     if (text && *text)
       return {text, "tsf"};  // TSF caret text available
     if (api->context_text_valid && api->context_text_valid()) {
-      // TSF collection works but the caret is at an empty spot:
-      // a legitimately empty context -> no rerank, no fallback
+      // TSF collection works but the current text is empty. Two cases:
+      //  - genuinely empty (document start / new paragraph) -> no rerank;
+      //  - collection lag: right after a commit the async TSF refresh
+      //    (debounce + IPC) has not landed yet, so the cached text still
+      //    misses the just-committed word. The commit history IS up to
+      //    date (synchronous sink) -> use it as fallback so the next
+      //    candidate window still re-ranks instead of being skipped
+      //    (observed: 2nd word never re-ranked, 3rd word onwards did).
+      std::string hist = CommitHistoryText();
+      if (!hist.empty())
+        return {hist, "rime"};
       return {"", "tsf"};
     }
   }
