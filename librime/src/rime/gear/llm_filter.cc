@@ -896,8 +896,21 @@ std::pair<std::string, std::string> LlmFilter::GetContextTextPair() const {
   const RimeApi *api = rime_get_api();
   if (api && api->get_context_text) {
     const char *text = api->get_context_text();
-    if (text && *text)
+    if (text && *text) {
+      // 残留检测: TSF 文本可能属于其他应用——32 位应用（WPS 等）加载
+      // 官方 32 位 TSF（无 LLM 采集代码），librime 的 context_text 残留
+      // 上次采集应用的旧文本（非空）→ 推理会用错上文。commit history
+      // 是当前会话同步累积的（OnCommit sink），正常场景光标前文本必然
+      // 包含最近上屏词；若不包含 → context_text 过期 → 用 fallback。
+      std::string hist = CommitHistoryText();
+      if (!hist.empty()) {
+        size_t n = std::min<size_t>(8, hist.size());
+        std::string tail = hist.substr(hist.size() - n);
+        if (text.find(tail) == std::string::npos)
+          return {hist, "rime"};
+      }
       return {text, "tsf"};  // TSF caret text available
+    }
     if (api->context_text_valid && api->context_text_valid()) {
       // TSF collection works but the current text is empty. Two cases:
       //  - genuinely empty (document start / new paragraph) -> no rerank;
