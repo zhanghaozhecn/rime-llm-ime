@@ -68,7 +68,7 @@ if ($hasFilt) {
 if (-not $hasFilt) {
   $inFilt = $false; $inserted = $false
   for ($i = 0; $i -lt $lines.Count; $i++) {
-    if ($lines[$i] -match '^\s+filters:') { $inFilt = $true; continue }
+    if ($lines[$i] -match '^\s+filters:') { $out.Add($lines[$i]); $inFilt = $true; continue }
     if ($inFilt -and $lines[$i] -match '^\s+- uniquifier') {
       $out.Add($lines[$i])
       $out.Add("    - llm_filter")
