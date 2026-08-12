@@ -7,7 +7,8 @@
 # 完成后托盘重新部署生效。不修改方案源文件（操作对象 = 用户目录副本）。
 
 param(
-  [string]$SchemaName = "pdsp.schema.yaml"
+  [string]$SchemaName = "pdsp.schema.yaml",
+  [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,8 +25,44 @@ $lines = [IO.File]::ReadAllLines($schema, [Text.Encoding]::UTF8)
 $out = New-Object System.Collections.Generic.List[string]
 $changed = $false
 
+# 冲突检测：插件版（lua 版）组件存在 → 二选一，中止
+if (($lines | Where-Object { $_ -match 'lua_filter@\*llm_filter' }).Count -gt 0) {
+  Write-Host "[ERROR] 检测到插件版组件（lua_filter@*llm_filter）——源码版与插件版二选一，" -ForegroundColor Red
+  Write-Host "  双重重排会导致行为混乱 + 双倍推理。请先从 schema 移除插件版行再运行。" -ForegroundColor Red
+  exit 2
+}
+
 $hasFilt = ($lines | Where-Object { $_ -match '^\s+-\s+llm_filter(\s|$)' }).Count -gt 0
 $hasCfg  = ($lines | Where-Object { $_ -match '^llm_rerank:' }).Count -gt 0
+
+# 已存在时校验位置（uniquifier 之后、pin_fix 之前）——仅查存在性会漏掉
+# "已有但位置错"（如手动加在末尾 → 固顶词被 LLM 顶掉）
+if ($hasFilt) {
+  $fBegin = -1; $fEnd = $lines.Count  # filters 块范围
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match '^\s+filters:') { $fBegin = $i; continue }
+    if ($fBegin -ge 0 -and $lines[$i] -match '^\S' -and $i -gt $fBegin) { $fEnd = $i; break }
+  }
+  $pos = @{}  # 组件 → filters 块内行号（lua_filter@* 前缀的组件也匹配）
+  for ($i = $fBegin; $i -lt $fEnd; $i++) {
+    if ($lines[$i] -match '^\s+-\s+(?:lua_filter@\*)?(uniquifier|llm_filter|pin_fix_filter|hint_filter|no_match_placeholder)\s*$') {
+      $pos[$matches[1]] = $i
+    }
+  }
+  $ok = $true
+  if ($pos.ContainsKey("uniquifier") -and $pos["llm_filter"] -lt $pos["uniquifier"]) {
+    Write-Host "[警告] llm_filter 在 uniquifier 之前（去重顺序错误）——请调整或恢复默认方案后重跑" -ForegroundColor Yellow
+    $ok = $false
+  }
+  if ($pos.ContainsKey("pin_fix_filter") -and $pos["llm_filter"] -gt $pos["pin_fix_filter"]) {
+    Write-Host "[警告] llm_filter 在 pin_fix_filter 之后（固顶词会被 LLM 重排顶掉）——请调整或恢复默认方案后重跑" -ForegroundColor Yellow
+    $ok = $false
+  }
+  if ($ok) { Write-Host "  llm_filter 已存在且位置正确（uniquifier 后、pin_fix 前），跳过" }
+  elseif (-not $Force) {
+    Write-Host "  中止（用 -Force 跳过位置检查）"; exit 3
+  }
+}
 
 # 1. filters: uniquifier 行后插入 - llm_filter（精确位置）
 if (-not $hasFilt) {
