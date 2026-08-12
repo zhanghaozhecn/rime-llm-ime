@@ -29,11 +29,14 @@ if not exist "%DEST%" (
   exit /b 1
 )
 
-echo [1/4] Stopping WeaselServer...
+echo [1/6] Checking LLM model...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0deploy_llm_model.ps1"
+
+echo [2/6] Stopping WeaselServer...
 taskkill /f /im WeaselServer.exe >nul 2>&1
 timeout /t 3 /nobreak >nul
 
-echo [2/4] Copying LLM files to install dir...
+echo [3/6] Copying LLM files to install dir...
 copy /y "%SRC%rime.dll" "%DEST%\" >nul
 copy /y "%SRC%weaselx64.dll" "%DEST%\" >nul
 copy /y "%SRC%WeaselServer.exe" "%DEST%\" >nul
@@ -42,16 +45,16 @@ copy /y "%SRC%opencc.dll" "%DEST%\" >nul
 copy /y "%SRC%vcomp140.dll" "%DEST%\" >nul
 echo     done (rime.dll / weaselx64.dll / WeaselServer / WeaselDeployer / opencc / vcomp140)
 
-echo [3/4] System32 TSF delayed replace (takes effect after reboot, keeps TSF registration)...
+echo [4/6] System32 TSF delayed replace (takes effect after reboot, keeps TSF registration)...
 powershell -Command "Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class M{[DllImport(\"kernel32.dll\",SetLastError=true,CharSet=CharSet.Unicode)]public static extern bool MoveFileEx(string a,string b,int f);}'; Copy-Item -Path '%SRC%weaselx64.dll' -Destination 'C:\Windows\System32\weasel.dll.new' -Force; if (-not [M]::MoveFileEx('C:\Windows\System32\weasel.dll.new','C:\Windows\System32\weasel.dll',5)) { Write-Host ('MoveFileEx failed: ' + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()); exit 1 }"
 if %errorlevel% neq 0 (
   echo     [WARNING] delayed replace failed, copy weaselx64.dll to C:\Windows\System32\weasel.dll manually
 )
 
-echo [4/5] Starting WeaselServer...
+echo [5/6] Starting WeaselServer...
 start "" "%DEST%\WeaselServer.exe"
 
-echo [5/5] Inserting LLM config into scheme...
+echo [6/6] Inserting LLM config into scheme...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0deploy_llm_schema.ps1"
 
 echo.
