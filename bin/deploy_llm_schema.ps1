@@ -1,4 +1,4 @@
-# deploy_llm_schema.ps1 — 源码版（rime-llm-ime）方案配置插入
+﻿# deploy_llm_schema.ps1 — 源码版（rime-llm-ime）方案配置插入
 # 用法：powershell -ExecutionPolicy Bypass -File deploy_llm_schema.ps1 [-SchemaName pdsp.schema.yaml]
 # 在 RIME 用户目录的 <SchemaName> 中插入（幂等，可重复运行）：
 #   1. engine.filters 的 uniquifier 之后插 - llm_filter（原生 C++ 组件，
