@@ -174,8 +174,9 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   void _ProcessKeyEvent(WPARAM wParam, LPARAM lParam, BOOL* pfEaten);
   // 按键时获取光标前文本 (TSF 文档锁内) 并发送给 server (供 LLM 上文)
   friend class CGetTextBeforeCaretEditSession;
-  void _RequestContextText(ITfContext* pContext);
-  void _OnContextTextReady(const std::wstring& text);
+  friend class CEndCompositionEditSession;  // 提交后立即采集 (下一词 TSF 上文)
+  void _RequestContextText(ITfContext* pContext, bool immediate = false);
+  void _OnContextTextReady(const std::wstring& text, bool immediate = false);
   // 上文采集去抖 (CEF 类应用文档更新极频繁, 限流 SetContextText 避免
   // IPC + Server 端 prepare 风暴): 300ms 内合并为最新文本, 相同不重发
   std::mutex m_ctx_debounce_mutex;

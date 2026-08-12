@@ -119,6 +119,10 @@ STDAPI CEndCompositionEditSession::DoEditSession(TfEditCookie ec) {
   _pComposition->EndComposition(ec);
   if (_pTextService)  // if _pTextService released, skip _FinalizeComposition
     _pTextService->_FinalizeComposition();
+  // rime-llm-ime: 提交后立即采集光标前文本 (immediate 跳过去抖延迟)——
+  // 让下一词首键前 TSF 上文已到位, 第二词重排用 TSF 上文而非历史回退。
+  // _RequestContextText 内部是异步 RequestEditSession, 不阻塞本编辑会话。
+  _pTextService->_RequestContextText(_pContext, true);
   return S_OK;
 }
 

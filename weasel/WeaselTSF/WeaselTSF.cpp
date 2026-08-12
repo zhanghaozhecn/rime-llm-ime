@@ -289,8 +289,9 @@ bool WeaselTSF::_EnsureServerConnected() {
 class CGetTextBeforeCaretEditSession : public CEditSession {
  public:
   CGetTextBeforeCaretEditSession(com_ptr<WeaselTSF> pTextService,
-                                 com_ptr<ITfContext> pContext)
-      : CEditSession(pTextService, pContext) {}
+                                 com_ptr<ITfContext> pContext,
+                                 bool immediate = false)
+      : CEditSession(pTextService, pContext), immediate_(immediate) {}
 
   STDMETHODIMP DoEditSession(TfEditCookie ec) {
     TF_SELECTION selection;
@@ -348,16 +349,19 @@ class CGetTextBeforeCaretEditSession : public CEditSession {
     }
     if ((int)text.size() > kMaxCtxChars)
       text = text.substr(text.size() - kMaxCtxChars);
-    _pTextService->_OnContextTextReady(text);
+    _pTextService->_OnContextTextReady(text, immediate_);
     return S_OK;
   }
+
+ private:
+  bool immediate_;  // 提交路径: 跳过去抖延迟立即发送 (第二词需在首键前送达)
 };
 
-void WeaselTSF::_RequestContextText(ITfContext* pContext) {
+void WeaselTSF::_RequestContextText(ITfContext* pContext, bool immediate) {
   if (!pContext)
     return;
   com_ptr<CGetTextBeforeCaretEditSession> pEditSession(
-      new CGetTextBeforeCaretEditSession(this, pContext));
+      new CGetTextBeforeCaretEditSession(this, pContext, immediate));
   HRESULT hr = E_FAIL;
   // 只读锁 + 异步 (按键时锁可能被占用; 缺 TF_ES_READ 权限位会直接 E_FAIL)
   pContext->RequestEditSession(_tfClientId, pEditSession,
@@ -371,7 +375,7 @@ void WeaselTSF::_OnContextReset() {
   m_ctx_last_sent.clear();
 }
 
-void WeaselTSF::_OnContextTextReady(const std::wstring& text) {
+void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate) {
   m_textBeforeCaret = text;
   // 发送移出 TSF 文档锁 (EditSession 回调必须快速返回, 禁同步阻塞 IPC):
   // 独立线程执行管道 Transact (PipeChannel 线程安全, thread_local 管道句柄)。
@@ -396,8 +400,11 @@ void WeaselTSF::_OnContextTextReady(const std::wstring& text) {
     spawn = true;
   }
   if (spawn) {
-    std::thread([this]() {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::thread([this, immediate]() {
+      // 提交路径 (immediate): 提交后立即发送, 下一词首键前上文已到位
+      // (第二词重排用 TSF 上文而非历史回退); 普通文档变化保持 100ms
+      // 合并 (CEF 类应用启动/滚动风暴防护)。
+      std::this_thread::sleep_for(std::chrono::milliseconds(immediate ? 0 : 100));
       for (;;) {
         std::string send;
         {
