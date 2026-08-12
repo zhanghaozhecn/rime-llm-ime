@@ -5,6 +5,7 @@
 #include <ShellScalingApi.h>
 #include <VersionHelpers.hpp>
 #include <WeaselIPCData.h>
+#include <algorithm>
 
 #include "VerticalLayout.h"
 #include "HorizontalLayout.h"
@@ -54,9 +55,11 @@ WeaselPanel::WeaselPanel(weasel::UI& ui)
       m_ctx(ui.ctx()),
       m_octx(ui.octx()),
       m_status(ui.status()),
+      m_in_server(ui.InServer()),
       m_style(ui.style()),
       m_ostyle(ui.ostyle()),
       m_candidateCount(0),
+      m_lastCandidateCount(0),
       m_current_zhung_icon(),
       m_inputPos(CRect()),
       m_sticky(false),
@@ -132,13 +135,20 @@ void WeaselPanel::_CreateLayout() {
 void WeaselPanel::Refresh() {
   bool should_show_icon =
       (m_status.ascii_mode || !m_status.composing || !m_ctx.aux.empty());
-  m_candidateCount = (BYTE)m_ctx.cinfo.candies.size();
+  m_candidateCount = min(m_ctx.cinfo.candies.size(), MAX_CANDIDATES_COUNT);
+  // When the candidate window changes from having content to having no content,
+  // reset the sticky state
+  if (m_lastCandidateCount > 0 && m_candidateCount == 0) {
+    m_sticky = false;
+  }
+  m_lastCandidateCount = m_candidateCount;
   // check if to hide candidates window
   // show tips status, two kind of situation: 1) only aux strings, don't care
   // icon status; 2)only icon(ascii mode switching)
   bool show_tips =
-      (!m_ctx.aux.empty() && m_ctx.cinfo.empty() && m_ctx.preedit.empty()) ||
-      (m_ctx.empty() && should_show_icon);
+      m_in_server &&
+      ((!m_ctx.aux.empty() && m_ctx.cinfo.empty() && m_ctx.preedit.empty()) ||
+       (m_ctx.empty() && should_show_icon));
   // show schema menu status: schema_id == L".default"
   bool show_schema_menu = m_status.schema_id == L".default";
   bool margin_negative =
@@ -192,8 +202,8 @@ void WeaselPanel::_InitFontRes(bool forced) {
 static HBITMAP CopyDCToBitmap(HDC hDC, LPRECT lpRect) {
   if (!hDC || !lpRect || IsRectEmpty(lpRect))
     return NULL;
-  HDC hMemDC;
-  HBITMAP hBitmap, hOldBitmap;
+  HDC hMemDC = NULL;
+  HBITMAP hBitmap = NULL, hOldBitmap = NULL;
   int nX, nY, nX2, nY2;
   int nWidth, nHeight;
 
@@ -205,14 +215,32 @@ static HBITMAP CopyDCToBitmap(HDC hDC, LPRECT lpRect) {
   nHeight = nY2 - nY;
 
   hMemDC = CreateCompatibleDC(hDC);
-  hBitmap = CreateCompatibleBitmap(hDC, nWidth, nHeight);
-  hOldBitmap = (HBITMAP)SelectObject(hMemDC, hBitmap);
-  StretchBlt(hMemDC, 0, 0, nWidth, nHeight, hDC, nX, nY, nWidth, nHeight,
-             SRCCOPY);
-  hBitmap = (HBITMAP)SelectObject(hMemDC, hOldBitmap);
+  if (!hMemDC)
+    return NULL;
 
+  hBitmap = CreateCompatibleBitmap(hDC, nWidth, nHeight);
+  if (!hBitmap) {
+    DeleteDC(hMemDC);
+    return NULL;
+  }
+
+  hOldBitmap = (HBITMAP)SelectObject(hMemDC, hBitmap);
+  if (!hOldBitmap) {
+    DeleteObject(hBitmap);
+    DeleteDC(hMemDC);
+    return NULL;
+  }
+
+  if (!BitBlt(hMemDC, 0, 0, nWidth, nHeight, hDC, nX, nY, SRCCOPY)) {
+    // restore and cleanup
+    SelectObject(hMemDC, hOldBitmap);
+    DeleteObject(hBitmap);
+    DeleteDC(hMemDC);
+    return NULL;
+  }
+
+  SelectObject(hMemDC, hOldBitmap);
   DeleteDC(hMemDC);
-  DeleteObject(hOldBitmap);
   return hBitmap;
 }
 
@@ -221,16 +249,29 @@ void WeaselPanel::_CaptureRect(CRect& rect) {
   CRect rc;
   GetWindowRect(&rc);
   POINT WindowPosAtScreen = {rc.left, rc.top};
-  rect.OffsetRect(WindowPosAtScreen);
-  // capture input window
-  if (OpenClipboard()) {
-    HBITMAP bmp = CopyDCToBitmap(ScreenDC, LPRECT(rect));
-    EmptyClipboard();
-    SetClipboardData(CF_BITMAP, bmp);
-    CloseClipboard();
+  CRect captureRect = rect;
+  captureRect.OffsetRect(WindowPosAtScreen);
+  // create bitmap first (avoid holding clipboard while capturing)
+  HBITMAP bmp = CopyDCToBitmap(ScreenDC, LPRECT(captureRect));
+  if (!bmp) {
+    ::ReleaseDC(NULL, ScreenDC);
+    return;
+  }
+
+  // capture input window to clipboard
+  if (!OpenClipboard()) {
+    DEBUG << "_CaptureRect: OpenClipord ailed";
+    DeleteObject(bmp);
+    ::ReleaseDC(NULL, ScreenDC);
+    return;
+  }
+  EmptyClipboard();
+  if (!SetClipboardData(CF_BITMAP, bmp)) {
+    DEBUG << "_CaptureRect: SetClipboardData failed";
     DeleteObject(bmp);
   }
-  ReleaseDC(ScreenDC);
+  CloseClipboard();
+  ::ReleaseDC(NULL, ScreenDC);
 }
 
 LRESULT WeaselPanel::OnMouseActivate(UINT uMsg,
@@ -438,6 +479,16 @@ LRESULT WeaselPanel::OnMouseMove(UINT uMsg,
   CPoint point;
   point.x = GET_X_LPARAM(lParam);
   point.y = GET_Y_LPARAM(lParam);
+
+  // Ignore if mouse screen position not changed
+  CPoint ptScreen = point;
+  ClientToScreen(&ptScreen);
+  if (ptScreen == m_lastMousePos || m_lastMousePos.x == -1) {
+    if (m_lastMousePos.x == -1)
+      m_lastMousePos = ptScreen;
+    return 0;
+  }
+  m_lastMousePos = ptScreen;
 
   for (size_t i = 0; i < m_candidateCount && i < MAX_CANDIDATES_COUNT; ++i) {
     CRect rect = m_layout->GetCandidateRect((int)i);
@@ -890,6 +941,11 @@ bool WeaselPanel::_DrawCandidates(CDCHandle& dc, bool back) {
       // Draw comment
       std::wstring comment = comments.at(i).str;
       if (!comment.empty() && COLORNOTTRANSPARENT(comment_text_color)) {
+        // LLM AI 首选标记 (rime-llm-ime): 高亮候选 comment 含 "AI·" 时用强调色
+        if (i == m_ctx.cinfo.highlighted &&
+            comment.find(L"AI·") != std::wstring::npos &&
+            COLORNOTTRANSPARENT(m_style.ai_comment_text_color))
+          comment_text_color = m_style.ai_comment_text_color;
         rect = m_layout->GetCandidateCommentRect((int)i);
         if (m_istorepos)
           rect.OffsetRect(0, m_offsetys[i]);
@@ -1103,6 +1159,7 @@ LRESULT WeaselPanel::OnDestroy(UINT uMsg,
                                LPARAM lParam,
                                BOOL& bHandled) {
   m_hoverIndex = -1;
+  m_lastMousePos = {-1, -1};
   m_sticky = false;
   delete m_layout;
   m_layout = NULL;
@@ -1121,6 +1178,23 @@ void WeaselPanel::MoveTo(RECT const& rc) {
   if (!m_layout)
     return;  // avoid handling nullptr in _RepositionWindow
   m_redraw_by_monitor_change = false;
+  // The conditions for resetting the sticky state:
+  // 1. When the input session ends (ctx.empty() is true)
+  // 2. When the input position changes significantly (the position change
+  // exceeds the threshold)
+  // 3. When the content of the candidate window is empty
+  bool should_reset_sticky =
+      (m_ctx.empty() || (abs(rc.left - m_inputPos.left) > 50) ||
+       (abs(rc.bottom - m_inputPos.bottom) > 50));
+  if (should_reset_sticky && m_sticky) {
+    m_sticky = false;
+    // Force reposition the window
+    m_inputPos = rc;
+    m_inputPos.OffsetRect(0, 6);
+    _RepositionWindow(true);
+    RedrawWindow();
+    return;
+  }
   // if ascii_tip_follow_cursor set, move tip icon to mouse cursor
   if (m_style.ascii_tip_follow_cursor && m_ctx.empty() &&
       (!m_status.composing) && m_layout->ShouldDisplayStatusIcon()) {

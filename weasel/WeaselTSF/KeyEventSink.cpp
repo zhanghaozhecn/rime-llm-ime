@@ -92,6 +92,8 @@ STDAPI WeaselTSF::OnTestKeyDown(ITfContext* pContext,
     *pfEaten = TRUE;
     return S_OK;
   }
+  // 2026-08-11: 移除 _HandleEditKeyReset/_RequestContextText — WPS 中
+  // 按键回调内调用失败会致 TSF 停用 text service (英文直出); 回归官方按键链路
   _ProcessKeyEvent(wParam, lParam, pfEaten);
   _UpdateComposition(pContext);
   if (*pfEaten)
@@ -108,10 +110,55 @@ STDAPI WeaselTSF::OnKeyDown(ITfContext* pContext,
     _fTestKeyDownPending = FALSE;
     *pfEaten = TRUE;
   } else {
+    // 2026-08-11: 同上, 移除按键回调内新增调用
     _ProcessKeyEvent(wParam, lParam, pfEaten);
     _UpdateComposition(pContext);
   }
   return S_OK;
+}
+
+void WeaselTSF::_HandleEditKeyReset(WPARAM wParam) {
+  // composition 非空时退格等是删编码, 光标位置未变, 不重置
+  if (_status.composing)
+    return;
+  // 防重: TSF 的 TestKeyDown/KeyDown/TestKeyUp/KeyUp 四个回调都会进入
+  // 本函数, 同一物理按键会重复 ResetContext (reset 代次翻倍, 且可能
+  // 清掉刚采集送达的 ctx); 500ms 内相同按键合并为一次。
+  // 窗口需覆盖一次按键全周期 (Down->Up 保持时间可达 200ms+, 实测
+  // 100ms 窗口下 KeyUp 落窗外导致每按 2 次 reset): reset 幂等,
+  // 快速连按/长按 auto-repeat 合并无害。
+  {
+    static DWORD s_last_tick = 0;
+    static WPARAM s_last_key = 0;
+    DWORD now = GetTickCount();
+    if (wParam == s_last_key && now - s_last_tick < 500)
+      return;
+    s_last_tick = now;
+    s_last_key = wParam;
+  }
+  const char* reason = nullptr;
+  switch (wParam) {
+    case VK_BACK:     // BackSpace
+      reason = "editkey:backspace";
+      break;
+    case VK_DELETE:   // Delete
+      reason = "editkey:delete";
+      break;
+    case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
+    case VK_HOME: case VK_END:
+    case VK_PRIOR: case VK_NEXT:  // Page_Up / Page_Down
+      reason = "editkey:navigation";
+      break;
+    case VK_RETURN:  // Enter (换行)
+      reason = "editkey:enter";
+      break;
+    default:
+      break;
+  }
+  if (reason) {
+    m_client.ResetContext(reason);  // 触发场景随 IPC 传递, 日志记录
+    _OnContextReset();              // 清去抖标记, 下次采集强制重发
+  }
 }
 
 STDAPI WeaselTSF::OnTestKeyUp(ITfContext* pContext,
@@ -123,6 +170,10 @@ STDAPI WeaselTSF::OnTestKeyUp(ITfContext* pContext,
     *pfEaten = TRUE;
     return S_OK;
   }
+  // Some apps (chat windows etc.) deliver keys via KeyUp only:
+  // refresh the caret context here too, or the cached context text
+  // stays stale after switching windows.
+  // 2026-08-11: 同上, 移除按键回调内新增调用
   _ProcessKeyEvent(wParam, lParam, pfEaten);
   _UpdateComposition(pContext);
   if (*pfEaten)
@@ -139,6 +190,7 @@ STDAPI WeaselTSF::OnKeyUp(ITfContext* pContext,
     _fTestKeyUpPending = FALSE;
     *pfEaten = TRUE;
   } else {
+    // 2026-08-11: 同上, 移除按键回调内新增调用
     _ProcessKeyEvent(wParam, lParam, pfEaten);
     if (!_async_edit)
       _UpdateComposition(pContext);

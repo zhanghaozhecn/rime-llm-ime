@@ -50,14 +50,10 @@ STDAPI WeaselTSF::OnEndEdit(ITfContext* pContext,
                                              &pEnumTextChanges) == S_OK) {
     if (pEnumTextChanges->Next(1, &pRange, NULL) == S_OK) {
       pRange->Release();
-      // rime-llm-ime: 文档文本变化 (上屏/退格/删除/粘贴): 光标前文本已变,
-      // 异步刷新 LLM 上文采集。退格时按键采集拿到的是退格前文本, 文档
-      // 变化后不刷新会一直用旧上文; 去抖在 _OnContextTextReady 内
-      // (100ms 合并 + 相同不重发)。
-      // 无条件采集: WPS 中提交采集 (CEndCompositionEditSession 嵌套
-      // RequestEditSession) 失败, 上屏后的刷新只能靠本触发点; 禁采
-      // 会致 WPS 完全无 TSF 上文。composition 中触发的脏读取 (如首
-      // 字符编码残留) 由去抖 + 后续提交采集的正确文本覆盖。
+      // 文档文本变化 (上屏/退格/删除/粘贴): 光标前文本已变, 异步刷新
+      // LLM 上文采集。退格时按键采集拿到的是退格前文本, 文档变化后
+      // 不刷新会一直用旧上文 (或 ResetContext 后无文本 → 不推理);
+      // 去抖在 _OnContextTextReady 内 (300ms 合并 + 相同不重发)。
       _RequestContextText(pContext);
     }
     pEnumTextChanges->Release();

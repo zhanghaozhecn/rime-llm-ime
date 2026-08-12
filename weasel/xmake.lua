@@ -4,6 +4,7 @@ set_project("weasel")
 -- 定义全局变量
 set_xmakever("2.9.4")
 set_languages("c++17")
+set_runtimes("MT")  -- 设置运行时库为静态链接，避免/MD与/MT冲突
 add_defines("UNICODE", "_UNICODE")
 add_defines("WINDOWS")
 add_defines("MSVC")
@@ -15,7 +16,7 @@ boost_include_path = boost_root
 boost_lib_path = boost_root .. "/stage/lib"
 add_includedirs(boost_include_path)
 add_linkdirs(boost_lib_path)
-add_cxflags("/utf-8 /MP /O2 /Oi /Gm- /EHsc /MT /GS /Gy /fp:precise /Zc:wchar_t /Zc:forScope /Zc:inline /external:W3 /Gd /TP /FC")
+add_cxflags("/utf-8 /MP /O2 /Oi /Gm- /EHsc /MT /GS /Gy /fp:precise /Zc:wchar_t /Zc:forScope /Zc:inline /external:W3 /Gd /TP")
 add_ldflags("/TLBID:1 /DYNAMICBASE /NXCOMPAT")
 
 -- 全局ATL lib路径
@@ -45,7 +46,7 @@ end
 
 add_links("atls", "shell32", "advapi32", "gdi32", "user32", "uuid", "ole32")
 
-includes("WeaselIPC", "WeaselUI", "WeaselTSF", "WeaselIME")
+includes("WeaselIPC", "WeaselUI", "WeaselTSF")
 
 if is_arch("x64") or is_arch("x86") then
   includes("RimeWithWeasel", "WeaselIPCServer", "WeaselServer", "WeaselDeployer")
@@ -96,12 +97,12 @@ rule("use_weaselconstants")
       return false
     end
     if check_include_weasel_constants_in_dir(target:scriptdir()) then
-      target:add("defines", {
-        "VERSION_MAJOR=" .. os.getenv("VERSION_MAJOR"),
-        "VERSION_MINOR=" .. os.getenv("VERSION_MINOR"),
-        "VERSION_PATCH=" .. os.getenv("VERSION_PATCH"),
-        "FILE_VERSION=" .. os.getenv("FILE_VERSION"),
-        "PRODUCT_VERSION=" .. os.getenv("PRODUCT_VERSION")
-    })
+      target:add("rcflags", {
+        "/dVERSION_MAJOR=" .. (os.getenv("VERSION_MAJOR") or "0"),
+        "/dVERSION_MINOR=" .. (os.getenv("VERSION_MINOR") or "0"),
+        "/dVERSION_PATCH=" .. (os.getenv("VERSION_PATCH") or "0"),
+        "/dFILE_VERSION=" .. (os.getenv("FILE_VERSION") or "\"0.0.0.0\""),
+        "/dPRODUCT_VERSION=" .. (os.getenv("PRODUCT_VERSION") or "\"0.0.0.0\"")
+      })
     end
   end)

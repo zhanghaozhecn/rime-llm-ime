@@ -1,5 +1,6 @@
 ﻿#include "stdafx.h"
 #include "WeaselServerImpl.h"
+#include <algorithm>
 #include <mutex>
 #include <Windows.h>
 #include <resource.h>
@@ -140,7 +141,7 @@ DWORD ServerImpl::OnCommand(WEASEL_IPC_COMMAND uMsg,
   return handled;
 }
 
-int ServerImpl::Start() {
+HWND ServerImpl::Start() {
   std::wstring instanceName = L"(WEASEL)Furandōru-Sukāretto-";
   instanceName += getUsername();
   HANDLE hMutexOneInstance = ::CreateMutex(NULL, FALSE, instanceName.c_str());
@@ -153,7 +154,7 @@ int ServerImpl::Start() {
 
   HWND hwnd = Create(NULL);
 
-  return (int)hwnd;
+  return hwnd;
 }
 
 int ServerImpl::Stop() {
@@ -173,7 +174,6 @@ int ServerImpl::Run() {
   // auto listener = boost::bind(&PipeServer::Listen, channel.get(), handler);
   //
   auto listener = [this](PipeMessage msg, PipeServer::Respond resp) -> void {
-    std::lock_guard guard(g_api_mutex);
     HandlePipeMessage(msg, resp);
   };
   pipeThread = std::make_unique<boost::thread>(
@@ -346,25 +346,10 @@ DWORD ServerImpl::OnHighlightCandidateOnCurrentPage(WEASEL_IPC_COMMAND uMsg,
   return 0;
 }
 
-DWORD ServerImpl::OnChangePage(WEASEL_IPC_COMMAND uMsg,
-                               DWORD wParam,
-                               DWORD lParam) {
-  if (m_pRequestHandler) {
-    auto eat = [this](std::wstring& msg) -> bool {
-      *channel << msg;
-      return true;
-    };
-    m_pRequestHandler->ChangePage(wParam, lParam, eat);
-  }
-  return 0;
-}
-
-// rime-llm-ime: 光标前上文文本 (SET_CONTEXT_TEXT body: 宽字符 UTF-16,
-// lParam = body 字节数), 转 UTF-8 存入 librime 上下文缓存, llm_filter
-// 通过 rime_api.get_context_text 读取。来自 TSF 采集线程 (独立管道连接)。
 DWORD ServerImpl::OnSetContextText(WEASEL_IPC_COMMAND uMsg,
                                    DWORD wParam,
                                    DWORD lParam) {
+  // body: 宽字符 (wbufferstream 写入), 转 UTF-8 存入 librime 上下文缓存
   size_t len = lParam;
   if (len > 0 && len <= 4096 * sizeof(wchar_t)) {
     wchar_t* wbuf = reinterpret_cast<wchar_t*>(channel->SendBuffer());
@@ -375,6 +360,7 @@ DWORD ServerImpl::OnSetContextText(WEASEL_IPC_COMMAND uMsg,
       std::string text(ulen, '\0');
       WideCharToMultiByte(CP_UTF8, 0, wtext.c_str(), (int)wtext.size(),
                           &text[0], ulen, NULL, NULL);
+      // 存入 librime 上下文缓存, lua 通过 rime_api.get_context_text 读取
       RimeApi* api = rime_get_api();
       if (api && api->set_context_text)
         api->set_context_text(text.c_str());
@@ -383,14 +369,14 @@ DWORD ServerImpl::OnSetContextText(WEASEL_IPC_COMMAND uMsg,
   return 0;
 }
 
-// rime-llm-ime: 编辑键/窗口切换: 清空光标前文本缓存 + 递增 reset 代次,
-// llm_filter 的 commit-history 兜底由此从头积累。
-// body: 宽字符 reason (触发场景, 仅日志诊断用), 转 UTF-8 传入
 DWORD ServerImpl::OnResetContext(WEASEL_IPC_COMMAND uMsg,
                                  DWORD wParam,
                                  DWORD lParam) {
+  // 编辑键/窗口切换: 清空光标前文本缓存 + 递增 reset 代次,
+  // llm_filter 的 commit-history fallback 由此从头积累。
+  // body: 宽字符 reason (触发场景, 仅日志诊断用), 转 UTF-8 传入
   std::string reason;
-  if (lParam > 0 && lParam <= 128 * sizeof(wchar_t)) {
+  if (lParam > 0 && lParam <= 128) {
     wchar_t* wbuf = reinterpret_cast<wchar_t*>(channel->SendBuffer());
     if (wbuf) {
       std::wstring wtext(wbuf, lParam / sizeof(wchar_t));
@@ -405,6 +391,19 @@ DWORD ServerImpl::OnResetContext(WEASEL_IPC_COMMAND uMsg,
   RimeApi* api = rime_get_api();
   if (api && api->reset_context_text)
     api->reset_context_text(reason.empty() ? "unknown" : reason.c_str());
+  return 0;
+}
+
+DWORD ServerImpl::OnChangePage(WEASEL_IPC_COMMAND uMsg,
+                               DWORD wParam,
+                               DWORD lParam) {
+  if (m_pRequestHandler) {
+    auto eat = [this](std::wstring& msg) -> bool {
+      *channel << msg;
+      return true;
+    };
+    m_pRequestHandler->ChangePage(wParam, lParam, eat);
+  }
   return 0;
 }
 
@@ -446,9 +445,9 @@ void ServerImpl::HandlePipeMessage(PipeMessage pipe_msg, _Resp resp) {
   PIPE_MSG_HANDLE(WEASEL_IPC_HIGHLIGHT_CANDIDATE_ON_CURRENT_PAGE,
                   OnHighlightCandidateOnCurrentPage);
   PIPE_MSG_HANDLE(WEASEL_IPC_CHANGE_PAGE, OnChangePage);
-  PIPE_MSG_HANDLE(WEASEL_IPC_TRAY_COMMAND, OnCommand);
   PIPE_MSG_HANDLE(WEASEL_IPC_SET_CONTEXT_TEXT, OnSetContextText);
   PIPE_MSG_HANDLE(WEASEL_IPC_RESET_CONTEXT, OnResetContext);
+  PIPE_MSG_HANDLE(WEASEL_IPC_TRAY_COMMAND, OnCommand);
   END_MAP_PIPE_MSG_HANDLE(result);
 
   resp(result);
@@ -465,6 +464,7 @@ void PipeServer::Listen(ServerHandler const& handler) {
       pipe = _ConnectServerPipe(pname);
       boost::thread th(
           [&handler, pipe, this] { _ProcessPipeThread(pipe, handler); });
+      th.detach();
     } catch (DWORD ex) {
       _FinalizePipe(pipe);
     }
@@ -481,9 +481,38 @@ void PipeServer::_ProcessPipeThread(HANDLE pipe, ServerHandler const& handler) {
   try {
     for (;;) {
       Res msg;
-      _Receive(pipe, &msg, sizeof(msg));
-      handler(msg, [this, pipe](Msg resp) { _Send(pipe, resp); });
+      memset(&msg, 0, sizeof(msg));
+      // 一次 ReadFile 读完整条消息 (消息模式原子性): 头+body 都在本地缓冲,
+      // 绕开 _Receive 的 fallback (部分读取后管道已空, 二次读 body 会死锁)
+      {
+        char big[4096];
+        DWORD got = 0;
+        ::SetLastError(0);
+        if (!::ReadFile(pipe, big, sizeof(big), &got, NULL)) {
+          DWORD e = GetLastError();
+          // 本机部分读取返回 183/234 (消息 > 缓冲时); 本项目消息均 < 4096,
+          // 正常路径一次读完整条; 其余错误抛错断开连接
+          if (e != ERROR_MORE_DATA && e != ERROR_ALREADY_EXISTS)
+            throw e;
+        }
+        memcpy(&msg, big, sizeof(msg) < (size_t)got ? sizeof(msg) : (size_t)got);
+        // 消息后可跟 body (SET_CONTEXT_TEXT: UTF-8 上文; RESET_CONTEXT:
+        // 宽字符 reason, 仅日志用)
+        if (msg.lParam > 0 &&
+            (msg.Msg == WEASEL_IPC_SET_CONTEXT_TEXT ||
+             msg.Msg == WEASEL_IPC_RESET_CONTEXT)) {
+          size_t body_len = (size_t)msg.lParam < (size_t)4096 ? (size_t)msg.lParam
+                                                              : (size_t)4096;
+          if (got >= sizeof(msg) + body_len)
+            memcpy(SendBuffer(), big + sizeof(msg), body_len);
+        }
+      }
+      // flush=false: 响应不等待客户端读取 (客户端可能正等 Server 读
+      // 下一条消息 → 双方 FlushFileBuffers 互锁死锁, 见 PipeChannel::_WritePipe)
+      handler(msg, [this, pipe](Msg resp) { _Send(pipe, resp, false); });
     }
+  } catch (DWORD ex) {
+    _FinalizePipe(pipe);
   } catch (...) {
     _FinalizePipe(pipe);
   }
@@ -498,7 +527,7 @@ Server::~Server() {
     delete m_pImpl;
 }
 
-int Server::Start() {
+HWND Server::Start() {
   return m_pImpl->Start();
 }
 
