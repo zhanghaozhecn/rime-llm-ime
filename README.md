@@ -60,7 +60,7 @@ rime-llm-ime/
 
 - **Win+Space 无小狼毫**：设置 → 时间和语言 → 中文 → 键盘 → 添加键盘 → 小狼毫
 - **32 位应用（QQ 音乐等）**：保持官方安装器的 32 位组件（勿删 SysWOW64\weasel.dll）
-- **内存 ≤4GB**：`backend: off` 或调小 `min_free_mem_mb`（模型需约 2GB）
+- **内存 ≤4GB**：`enabled: false` 或调小 `min_free_mem_mb`（模型需约 2GB）
 - **语言栏图标消失**：多为 System32 DLL 被重命名替换导致，恢复方式：重装官方包 → 设置添加键盘 → 重新部署
 
 > 使用其他方案：把 `llm_rerank` 配置节加入任意 RIME 方案，并确认其 filters 链末尾（uniquifier 后）有 `llm_filter`。配置节仅依赖四码输入编码，与具体方案无关。
@@ -69,7 +69,7 @@ rime-llm-ime/
 
 ```yaml
 llm_rerank:
-  backend: cpu          # off | cpu | gpu — off 时透传不推理
+  enabled: true         # true=启用 LLM 重排 | false=关闭（组件透传，不推理）
   min_code_len: 4       # 输入编码长度小于此值时不重排
   min_tokens: 1         # 上文 token 数小于此值时不推理
   max_tokens: 10        # 上文 token 上限
@@ -103,7 +103,7 @@ llm_rerank:
 
 不跑本工具也可以直接用默认值 4（=GGML 默认，适用旧设备；线程数固定，无运行时动态调整）。
 
-> 内存需求：0.8B Q4 模型加载后 WeaselServer 占用约 2GB。**内存 ≤4GB 的机器建议 `backend: off`**（输入法照常使用，仅无 LLM 重排），或调小 `min_free_mem_mb` 谨慎尝试。
+> 内存需求：0.8B Q4 模型加载后 WeaselServer 占用约 2GB。**内存 ≤4GB 的机器建议 `enabled: false`**（输入法照常使用，仅无 LLM 重排），或调小 `min_free_mem_mb` 谨慎尝试。
 
 ## 构建（开发者）
 
@@ -166,7 +166,7 @@ msbuild weasel.sln /p:Configuration=Release /p:Platform=x64 /t:WeaselTSF /t:Weas
 ```
 
 > `src/CMakeLists.txt` 中 `LLAMA_ROOT` 为 CMake CACHE 变量，可用 `-DLLAMA_ROOT=<你的路径>` 覆盖。
-> CUDA 后端（`backend: gpu`）需自行接入 llama.cpp CUDA 构建，本仓库验证的是 CPU 路线。
+> 仅 CPU 路线（llama.cpp MT 静态构建）；GPU 版已退役不发布。
 
 ### 替换安装文件
 

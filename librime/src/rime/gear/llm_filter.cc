@@ -46,10 +46,10 @@ static std::atomic<bool> g_loaded{false};
 static std::atomic<bool> g_loading{false};
 
 // schema llm_rerank/ section (defaults match the old project):
-//   backend: off | cpu | gpu — off disables rerank entirely (pass-through)
+//   enabled: true|false — false disables rerank entirely (pass-through)
 //   min_code_len: input code length below this -> no rerank
 static std::string g_model_path = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
-static std::string g_backend = "off";
+static bool g_enabled = false;  // CPU only; GPU build retired (not published)
 static int g_min_code_len = 4;
 static int g_min_tokens = 1;
 static int g_max_ctx_tokens = 10;  // tok=10: 93.4% acc, 10->17 gains only +1.1pp
@@ -733,10 +733,9 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
   // rime-llm-ime project, while the published generic scheme stays clean.
   if (Config *config = engine_->schema()->config()) {
     string s;
-    if (config->GetString("llm_rerank/backend", &s) && !s.empty())
-      g_backend = s;
     if (config->GetString("llm_rerank/model_path", &s) && !s.empty())
       g_model_path = s;
+    config->GetBool("llm_rerank/enabled", &g_enabled);
     int v = 0;
     if (config->GetInt("llm_rerank/min_code_len", &v))
       g_min_code_len = v;
@@ -755,10 +754,10 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     unsigned hw = std::thread::hardware_concurrency();
     if (hw > 0 && (unsigned)g_n_threads > hw)
       g_n_threads = (int)hw;
-    log_msg("config: backend=%s min_code_len=%d min_tokens=%d "
+    log_msg("config: enabled=%d min_code_len=%d min_tokens=%d "
             "max_tokens=%d max_candidates=%d cpu_cores=%d "
             "min_free_mem_mb=%d model=%s",
-            g_backend.c_str(), g_min_code_len, g_min_tokens,
+            g_enabled ? 1 : 0, g_min_code_len, g_min_tokens,
             g_max_ctx_tokens, g_max_candidates, g_n_threads,
             g_min_free_mem_mb, g_model_path.c_str());
   }
@@ -770,10 +769,10 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
   const RimeApi *api2 = rime_get_api();
   if (api2 && api2->set_context_changed_callback)
     api2->set_context_changed_callback(&on_context_changed);
-  if (g_backend != "off")
+  if (g_enabled)
     load_model_async();
   else
-    log_msg("config: backend off, LLM rerank disabled");
+    log_msg("config: enabled=false, LLM rerank disabled");
 }
 
 LlmFilter::~LlmFilter() { commit_conn_.disconnect(); }
@@ -939,8 +938,8 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
   if (!translation)
     return translation;
 
-  if (g_backend == "off")
-    return translation;  // backend off -> pass-through
+  if (!g_enabled)
+    return translation;  // enabled=false -> pass-through
 
   if (engine_->context() &&
       (int)engine_->context()->input().size() < g_min_code_len)

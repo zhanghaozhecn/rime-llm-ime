@@ -55,7 +55,7 @@ engine:
 
 # LLM 候选重排配置（llm_filter 原生组件读取；参数与旧项目默认相同）
 llm_rerank:
-  backend: cpu          # off | cpu | gpu — off 时组件透传（不推理）。cpu/gpu 均 CPU 推理
+  enabled: true         # true=启用 LLM 重排 | false=关闭（组件透传，不推理）
   min_code_len: 4       # 输入编码长度小于此值时不重排
   min_tokens: 1         # 上文 token 数小于此值时不推理（0 = 空上文也推理）
   max_tokens: 10        # 上文 token 上限，超出时从末尾截断
