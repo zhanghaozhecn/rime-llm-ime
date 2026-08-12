@@ -48,8 +48,11 @@ if %errorlevel% neq 0 (
   echo     [WARNING] delayed replace failed, copy weaselx64.dll to C:\Windows\System32\weasel.dll manually
 )
 
-echo [4/4] Starting WeaselServer...
+echo [4/5] Starting WeaselServer...
 start "" "%DEST%\WeaselServer.exe"
+
+echo [5/5] Inserting LLM config into scheme...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0deploy_llm_schema.ps1"
 
 echo.
 echo ==== Deploy complete! ====
@@ -57,5 +60,7 @@ echo 1. Reboot to activate the System32 TSF component
 echo 2. Tray icon - Redeploy (rebuilds dict build with LLM librime - REQUIRED,
 echo    official redeploy overwrites it with official format and 1-code chars
 echo    come up empty)
+echo 3. Deploy script inserted llm_filter + llm_rerank into pdsp.schema.yaml
+echo    (idempotent, exact position: uniquifier after, pin_fix before)
 echo 3. Verify: WPS = AI-hist mark, others = AI-TSF mark
 pause
