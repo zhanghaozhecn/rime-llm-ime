@@ -906,7 +906,7 @@ std::pair<std::string, std::string> LlmFilter::GetContextTextPair() const {
       if (!hist.empty()) {
         size_t n = std::min<size_t>(8, hist.size());
         std::string tail = hist.substr(hist.size() - n);
-        if (text.find(tail) == std::string::npos)
+        if (strstr(text, tail.c_str()) == nullptr)
           return {hist, "rime"};
       }
       return {text, "tsf"};  // TSF caret text available
