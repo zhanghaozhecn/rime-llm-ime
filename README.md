@@ -3,34 +3,41 @@
 将 LLM 候选重排**源码级集成**进 RIME 小狼毫（weasel + librime）的中文输入方案：不需要外挂进程或 lua 插件，`llm_filter` 作为 librime 原生 filter 组件（C++）编译进 `rime.dll`，TSF 原生采集光标上文。
 
 - **开发者**：仓库含修改后的完整 weasel + librime 源码树，可按本 README 构建
-- **普通用户**：`bin/` 提供预编译产物，替换小狼毫安装文件即可使用（需自行下载 GGUF 模型）
+- **普通用户**：`bin/` 提供预编译产物 + 一键部署脚本，替换小狼毫安装文件即可使用（模型由部署脚本自动检查/下载）
 
 ## 特性
 
 | 特性 | 说明 |
 |------|------|
 | 原生 filter 组件 | `llm_filter`（gear/llm_filter.{h,cc}）编译进 rime.dll，无外部进程、无 lua 依赖 |
-| TSF 光标上文 | 原生采集光标前 ~64 字符（TextEditSink 文档变化 + 提交时主动采集，0.17.4 基底） |
-| WPS 兼容 | WPS 系应用（Kso 定制 Qt 的 TSF 实现不完整）自动禁用 TSF 采集，退化到上屏历史（`AI·历史`），打字稳定 |
+| TSF 光标上文 | 原生采集光标前 ~64 字符：文档变化触发 + **提交后立即采集**（跳过去抖，下一词首键前上文已到位） |
+| 上文来源自适应 | TSF 采集正常 → `AI·TSF`；采集不可用（32 位应用等）→ commit history 回退 `AI·历史`；**残留检测**：TSF 文本不含最近上屏词时判为其他应用残留，自动改用历史 |
+| WPS 兼容 | WPS 系应用自动退化到上屏历史（`AI·历史`），打字稳定 |
 | prepare 预解码 | commit 后异步预解码上文（KV cache 复用），score 命中跳过重复解码（prep=1，2ms vs ~50ms） |
 | 长候选外推 | 4+ token 候选按尾部 CE 外推（λ=0.5，语料模拟调参），不增加 decode 次数，3-token 词不受长词挤压 |
 | 性能日志 | `rime_llm_filter_log.txt` 每推理一行：wait/S1/KV/S2/total/prep/ctx_tok/cand |
-| AI 首选标记 | 重排后首选候选 comment 显示 `AI·TSF`（光标前上文）/ `AI·历史`（上屏历史回退，WPS 等场景） |
+| AI 首选标记 | 重排后首选候选 comment 显示 `AI·TSF` / `AI·历史` |
 
 ## 目录结构
 
 ```
 rime-llm-ime/
 ├── librime/           # 修改后的完整 librime 源码（上游 1.17.0 @ 1d0df6e）
-│   └── src/rime/gear/llm_filter.{h,cc}   # LLM filter 组件（新增）
+│   └── src/rime/gear/llm_filter.{h,cc}   # LLM filter 组件（新增，含上文来源自适应）
 ├── weasel/            # 修改后的完整 weasel 源码（上游 0.17.4 release tag）
-│   ├── WeaselTSF/     # TSF 上文采集（TextEditSink 文档变化 + 提交时采集 + WPS 黑名单）
+│   ├── WeaselTSF/     # TSF 上文采集（文档变化 + 提交后立即采集 + WPS 黑名单）
 │   ├── WeaselIPC/     # SET_CONTEXT_TEXT / RESET_CONTEXT IPC（枚举尾部追加，前缀兼容官方）
 │   ├── WeaselIPCServer/  # OnSetContextText / OnResetContext handler
 │   └── librime/       # 仅补丁头文件（rime_api.h，LLM 版含 set_context_text 等扩展 API）
-├── pdsp.schema.yaml   # 拼读双拼方案 LLM 版（含 llm_rerank 配置节示例）
-├── bin/               # 预编译产物（rime.dll / weaselx64.dll / WeaselServer.exe / WeaselDeployer.exe / opencc.dll / vcomp140.dll）+ deploy_llm.bat 一键部署脚本 + bench_threads.exe 线程数测定工具
-└── sync.py            # 本机维护脚本（编译源 → 项目目录 → GitHub 树）
+├── pdsp.schema.yaml   # 拼读双拼方案（含 llm_rerank 配置节示例；部署时由脚本自动插入）
+├── bin/               # 预编译产物 + 部署/验证脚本（见下）
+│   ├── rime.dll / weaselx64.dll / WeaselServer.exe / WeaselDeployer.exe / opencc.dll / vcomp140.dll
+│   ├── deploy_llm.bat          # 一键部署（模型检查 → 组件复制 → System32 → schema 插入）
+│   ├── deploy_llm_model.ps1    # 模型检查/下载（ModelScope，断点续传）
+│   ├── deploy_llm_schema.ps1   # 方案配置插入（llm_filter + llm_rerank 节，幂等，位置校验）
+│   ├── verify_deploy.bat       # 部署验证（与源包自动对比 md5）
+│   └── bench_threads.exe       # 线程数测定工具
+└── CHANGES.md         # 变更记录
 ```
 
 ## 快速开始（普通用户）
@@ -39,31 +46,41 @@ rime-llm-ime/
 
 ### 一键部署（推荐）
 
-双击 `bin/deploy_llm.bat`（自动请求管理员权限）→ **重启系统** → **托盘重新部署** → 完成。
-
-脚本自动：停止 WeaselServer → 复制 6 个文件到安装目录 → System32 TSF 组件延迟替换（重启生效）→ 重启 Server。
+1. 下载仓库 zip（或 `git clone`），解压到任意目录
+2. 双击 `bin/deploy_llm.bat`（自动请求管理员权限），流程：
+   - **[1/6] 模型检查**：默认路径 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf` 已有则跳过；缺失则询问是否下载（约 500MB，ModelScope，断点续传；跳过则 LLM 不工作但输入法正常）
+   - **[2/6] 停止 WeaselServer → [3/6] 复制 6 个组件到安装目录 → [4/6] System32 TSF 延迟替换 → [5/6] 重启 Server**
+   - **[6/6] 方案配置插入**：在 RIME 用户目录的 `pdsp.schema.yaml` 中幂等插入 `- llm_filter`（uniquifier 后、pin_fix 前，位置校验）与 `llm_rerank:` 配置节
+3. **重启系统**（System32 TSF 组件生效）
+4. **托盘右键 → 重新部署**（重建词典 build，必须）
 
 > **托盘重新部署必须执行**：词典 build 必须由 LLM 版 librime 编译（官方部署会覆盖为官方格式，LLM librime 读不了 → 一码字词全部为空）。
 
-### 手动步骤
+### 手动步骤（脚本不可用时）
 
-1. 下载 GGUF 模型（本机验证使用 `Qwen3.5-0.8B-Q4_K_M.gguf`，任意小模型均可，建议 ≤2B Q4）
+1. 下载 GGUF 模型（本机验证使用 `Qwen3.5-0.8B-Q4_K_M.gguf`，任意小模型均可，建议 ≤2B Q4）放到 `d:\gguf_models\`
 2. 将 `bin/` 下 **6 个文件**复制到小狼毫安装目录（`C:\Program Files\Rime\weasel-0.17.4`）：
    - `rime.dll` / `weaselx64.dll` / `WeaselServer.exe` / `WeaselDeployer.exe` — 本方案产物
    - `opencc.dll` — rime.dll 的动态依赖（缺失会报"找不到 opencc.dll"）
    - `vcomp140.dll` — VC OpenMP 运行时（无 VS 运行库的机器必需）
 3. `weaselx64.dll` 同时复制为 `C:\Windows\System32\weasel.dll`（TSF 组件，被占用时用延迟替换——**切勿重命名替换**，会导致 TSF 注销、语言栏图标消失）
-4. 将 `pdsp.schema.yaml` 复制到 RIME 用户目录（`%APPDATA%\Rime\`），修改 `llm_rerank` 配置节的 `model_path`
-5. 托盘右键 → **重新部署**（LLM librime 重建词典 build）→ **重启系统**（TSF 加载新版组件）
+4. 方案配置插入（二选一）：
+   - `powershell -ExecutionPolicy Bypass -File bin\deploy_llm_schema.ps1`（推荐，幂等）
+   - 手动在 `%APPDATA%\Rime\pdsp.schema.yaml` 的 filters 块 uniquifier 之后加 `- llm_filter`，并添加 `llm_rerank:` 配置节
+5. 托盘右键 → **重新部署** → **重启系统**
+
+### 部署验证
+
+`bin/verify_deploy.bat`（与部署文件放同一目录）逐项检查：安装目录 3 组件 md5（与源包自动对比）、System32 TSF、注册表、Server 进程。
 
 ### 常见问题
 
 - **Win+Space 无小狼毫**：设置 → 时间和语言 → 中文 → 键盘 → 添加键盘 → 小狼毫
-- **32 位应用（QQ 音乐等）**：保持官方安装器的 32 位组件（勿删 SysWOW64\weasel.dll）
-- **内存 ≤4GB**：`enabled: false` 或调小 `min_free_mem_mb`（模型需约 2GB）
+- **32 位应用（QQ 音乐、WPS 等）**：加载官方 32 位 TSF（SysWOW64\weasel.dll），无 LLM 采集 → 自动回退上屏历史（`AI·历史`），打字正常；勿删 SysWOW64\weasel.dll
+- **内存 ≤4GB**：`enabled: false` 或调小 `min_free_mem_mb`（0.8B Q4 模型加载后 WeaselServer 约占 2GB）
 - **语言栏图标消失**：多为 System32 DLL 被重命名替换导致，恢复方式：重装官方包 → 设置添加键盘 → 重新部署
 
-> 使用其他方案：把 `llm_rerank` 配置节加入任意 RIME 方案，并确认其 filters 链末尾（uniquifier 后）有 `llm_filter`。配置节仅依赖四码输入编码，与具体方案无关。
+> 使用其他方案：`deploy_llm_schema.ps1 -SchemaName <你的方案>.schema.yaml`，或手动加 `llm_rerank` 配置节 + filters 链 uniquifier 后的 `- llm_filter`。配置节仅依赖四码输入编码，与具体方案无关。
 
 ### llm_rerank 配置节（全部可选）
 
@@ -79,9 +96,7 @@ llm_rerank:
   model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
 ```
 
-> **各线程数延迟实测**：运行 `bin/bench_threads.exe` 即可在本机实测 1~10（或最大核数）各线程数的推理耗时，打印延迟表（中位数 + mid50 区间），自行选择后填入 schema 的 `cpu_cores`，提示重新部署即可。每档采样 99 次，约 2.5 分钟。结果同时写入 exe 同目录 `bench_threads_result.txt`（覆盖）。
-
-### 线程数实测（可选，普通用户）
+### 线程数实测（可选）
 
 `bin/bench_threads.exe` 在**本机实测**各线程数的推理延迟：
 
@@ -98,12 +113,10 @@ llm_rerank:
      thr= 6: median  65.6 ms/pass (mid50  64.2- 67.1)
      ...
    ```
-   工具**不做推荐**——自行权衡"延迟 vs 线程占用"，把选定的数字填入方案 schema 的 `llm_rerank.cpu_cores`（通常选曲线拐点附近的最小线程数即可；`mid50` 区间窄 = 该档稳定）
+   工具**不做推荐**——自行权衡"延迟 vs 线程占用"，把选定的数字填入 schema 的 `llm_rerank.cpu_cores`（通常选曲线拐点附近的最小线程数即可；`mid50` 区间窄 = 该档稳定）
 3. 托盘右键 → 重新部署 → 生效
 
-不跑本工具也可以直接用默认值 4（=GGML 默认，适用旧设备；线程数固定，无运行时动态调整）。
-
-> 内存需求：0.8B Q4 模型加载后 WeaselServer 占用约 2GB。**内存 ≤4GB 的机器建议 `enabled: false`**（输入法照常使用，仅无 LLM 重排），或调小 `min_free_mem_mb` 谨慎尝试。
+不跑本工具也可以直接用默认值 4（=GGML 默认，线程数固定，无运行时动态调整）。
 
 ## 构建（开发者）
 
@@ -125,8 +138,12 @@ llm_rerank:
 1. `include/WeaselIPC.h`：枚举**尾部追加** `SET_CONTEXT_TEXT`/`RESET_CONTEXT`（前缀编号不变，与官方组件任意混用兼容）+ Client 接口 `SetContextText`/`ResetContext`
 2. `WeaselIPC/WeaselClientImpl.{h,cpp}`：`SendContextText`/`SendContextReset` 实现 + **channel_mutex 互斥锁**（TSF 采集线程与主线程共享管道，替代 master 的 TLS 管道重构）
 3. `WeaselIPCServer/WeaselServerImpl.{h,cpp}`：`OnSetContextText`/`OnResetContext` handler（调 librime `set_context_text`/`reset_context_text`）
-4. `WeaselTSF/`：光标上文采集——`CGetTextBeforeCaretEditSession`（GetSelection → GetText 分块，kMaxIter=128 防死循环）+ TextEditSink 文档变化触发 + `CEndCompositionEditSession` 提交时采集 + **WPS 黑名单**（`_IsTSFCtxReliable()`：wps.exe 等禁用 TSF 采集 → librime 自动退化上屏历史）
+4. `WeaselTSF/`：光标上文采集——`CGetTextBeforeCaretEditSession`（GetSelection → GetText 分块，kMaxIter=128 防死循环）+ TextEditSink 文档变化触发（100ms 去抖合并防 CEF 风暴）+ **提交后立即采集**（`immediate` 跳过去抖，下一词首键前 TSF 上文到位）+ **WPS 黑名单**（`_IsTSFCtxReliable()`：wps.exe 等禁用 TSF 采集 → librime 自动退化上屏历史）
 5. **UIStyle 不加字段**（`ai_comment_text_color` 未移植——保持与官方 0.17.4 序列化 100% 兼容；AI 标记以 comment 文本显示）
+
+librime 侧（`gear/llm_filter.cc`，新增组件）：
+- 上文来源自适应（`GetContextTextPair`）：TSF 文本优先；TSF 文本空/滞后 → commit history 兜底（提交后同步累积，必有最近上屏词）；**残留检测**——TSF 文本不含 commit history 尾部（最近上屏词）时判为其他应用残留（32 位官方 TSF 无采集的场景），改用历史
+- 预解码（`prepare`）：commit/上下文变化后异步 decode 上文，score 命中复用 KV
 
 ### 步骤
 
@@ -170,7 +187,7 @@ msbuild weasel.sln /p:Configuration=Release /p:Platform=x64 /t:WeaselTSF /t:Weas
 
 ### 替换安装文件
 
-产物：`librime/build/src/Release/rime.dll`、`weasel/output/weaselx64.dll`、`weasel/output/WeaselServer.exe`，另需 `librime install/bin/opencc.dll`（rime.dll 的动态依赖）和 `vcomp140.dll`（VC OpenMP 运行时）。替换小狼毫安装目录同名文件后，注销重登（TSF 注册表缓存）或重启系统，然后**托盘重新部署**（LLM librime 重建词典 build）。
+产物：`librime/build/src/Release/rime.dll`、`weasel/output/weaselx64.dll`、`weasel/output/WeaselServer.exe`，另需 `librime install/bin/opencc.dll`（rime.dll 的动态依赖）和 `vcomp140.dll`（VC OpenMP 运行时）。复制到安装目录后，重启系统（TSF 注册表缓存），然后**托盘重新部署**（LLM librime 重建词典 build）。
 
 ## 候选窗 AI 标记
 
@@ -179,17 +196,23 @@ LLM 重排生效时，首选候选的 comment 显示来源徽章（文本形式�
 | 标记 | 含义 |
 |------|------|
 | `AI·TSF` | 上文来自 TSF 光标前文本（Word/记事本等 TSF 采集正常的应用） |
-| `AI·历史` | 上文来自上屏历史回退（WPS 等 TSF 采集不可用的应用，自动退化） |
+| `AI·历史` | 上文来自上屏历史回退（WPS、32 位应用等 TSF 采集不可用的场景，自动退化） |
 
 > 注：0.17.4 基底未加独立强调色样式（保持与官方 UIStyle 序列化完全兼容）；如需自定义 comment 颜色，用候选窗 comment 样式即可。
 
 ## 日志
 
-`%APPDATA%\Rime\rime_llm_filter_log.txt` — 每次推理一行：
+`%APPDATA%\Rime\rime_llm_filter_log.txt`：
 
 ```
 score: wait=12ms S1=48ms KV=3ms S2=9ms total=72ms prep=1 ctx_tok=9 cand=5
+ctx: [上文]              # 推理时用的上文（normalize 后）
+ctx raw: [原始上文]       # normalize 前后不一致时记录原始值
+RESET: context cleared (gen=N reason=...)   # TSF 上下文被清空（编辑键/切窗）
+config: enabled=1 ...    # 部署/会话启动时的配置
 ```
+
+事件日志（`时间|计数|编码|候选|上文|排序后候选|延迟|来源`）用于选词质量排查。
 
 ## 许可证
 
@@ -203,4 +226,4 @@ score: wait=12ms S1=48ms KV=3ms S2=9ms total=72ms prep=1 ctx_tok=9 cand=5
 ## 相关项目
 
 - [拼读双拼](https://github.com/zhanghaozhecn/rime-pindu-double-pinyin) — 本方案使用的编码方案（带调双拼）
-- [rime-llm-rerank](https://github.com/zhanghaozhecn/rime-llm-rerank) — 旧版 lua 插件路线（已封存，功能与此仓库等效，上文仅用上屏历史）
+- [rime-llm-rerank](https://github.com/zhanghaozhecn/rime-llm-rerank) — 插件版（lua + DLL 路线），功能与此仓库等效，上文仅用上屏历史；源码版与插件版二选一
