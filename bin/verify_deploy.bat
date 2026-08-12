@@ -1,23 +1,21 @@
 @echo off
+setlocal EnableDelayedExpansion
 REM ============================================
 REM  rime-llm-ime deploy verification (run on the TARGET machine)
-REM  Checks: install dir components, System32 TSF, registry, guidance
-REM  Expected md5 (0.17.4-base final build, 2026-08-12):
-REM    weaselx64.dll    18f39c9732d2d5d4ddec7cd2c173ad9a  TSF + LLM ctx + WPS blacklist
-REM    WeaselServer.exe 3c9229814fef350e4cc50da7a2695546  server + SET_CONTEXT_TEXT IPC
-REM    rime.dll         97c6343dadd3932e758bc702dcabc534  librime + llm_filter
-REM    opencc.dll       0d9f9b2a1526d720fbe7a77636a0e831
-REM    vcomp140.dll     a0e2cc1573537419a7b9327f9062d448
-REM    WeaselDeployer   4f26c2c7723e12d2a7e5c50cd5709d90
+REM  Checks install dir components + System32 TSF + registry + server
+REM  Expected values are auto-compared against the SOURCE files in this
+REM  script's own directory (the deploy package) -- always in sync with
+REM  the latest bin. Reference md5 (2026-08-12 final build):
+REM    weaselx64.dll    18f39c9732d2d5d4ddec7cd2c173ad9a
+REM    WeaselServer.exe 3c9229814fef350e4cc50da7a2695546
+REM    rime.dll         1477909ba667cbfbef55102fcc33f760
 REM ============================================
 
-set EXPECT_TF=18f39c9732d2d5d4ddec7cd2c173ad9a
-set EXPECT_SV=3c9229814fef350e4cc50da7a2695546
-set EXPECT_RL=97c6343dadd3932e758bc702dcabc534
 set CLSID={A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}
+set SRC=%~dp0
 
 echo ================================================
-echo [1/5] Install dir components
+echo [1/5] Install dir components (vs source package)
 echo ================================================
 for %%D in ("C:\Program Files\Rime\weasel-0.17.4" "C:\Program Files (x86)\Rime\weasel-0.17.4") do (
   if exist "%%~D\rime.dll" (
@@ -27,27 +25,24 @@ for %%D in ("C:\Program Files\Rime\weasel-0.17.4" "C:\Program Files (x86)\Rime\w
   )
 )
 echo   [FAIL] install dir not found. Expected C:\Program Files\Rime\weasel-0.17.4
-echo          (deploy_llm.bat hard-codes this path; if the target machine
-echo           installed another version, files were NOT copied)
 goto :reg
 
 :found
-echo   checking md5...
-for /f "delims=" %%h in ('certutil -hashfile "%DEST%\weaselx64.dll" MD5 ^| findstr /i /v "CertUtil hashfile MD5"') do set TF=%%h
-for /f "delims=" %%h in ('certutil -hashfile "%DEST%\WeaselServer.exe" MD5 ^| findstr /i /v "CertUtil hashfile MD5"') do set SV=%%h
-for /f "delims=" %%h in ('certutil -hashfile "%DEST%\rime.dll" MD5 ^| findstr /i /v "CertUtil hashfile MD5"') do set RL=%%h
-if /i "%TF%"=="%EXPECT_TF%" (echo   weaselx64.dll    OK   %TF%) else (echo   [FAIL] weaselx64.dll    %TF% ^<^> expected %EXPECT_TF%)
-if /i "%SV%"=="%EXPECT_SV%" (echo   WeaselServer.exe OK   %SV%) else (echo   [FAIL] WeaselServer.exe %SV% ^<^> expected %EXPECT_SV%)
-if /i "%RL%"=="%EXPECT_RL%" (echo   rime.dll         OK   %RL%) else (echo   [FAIL] rime.dll         %RL% ^<^> expected %EXPECT_RL%)
+for %%F in (weaselx64.dll WeaselServer.exe rime.dll) do (
+  if exist "%SRC%%%F" (
+    powershell -NoProfile -Command "$a=(Get-FileHash -Algorithm MD5 -Path (Join-Path '%SRC%' '%%F')).Hash; $b=(Get-FileHash -Algorithm MD5 -Path (Join-Path '!DEST!' '%%F')).Hash; if($a -eq $b){Write-Host ('  %%F  OK   '+$a)}else{Write-Host ('  [FAIL] %%F  install='+$b+'  src='+$a)}"
+  ) else (
+    echo   [SKIP] source file missing in this folder: %%F
+  )
+)
 
 :reg
 echo.
 echo ================================================
-echo [2/5] System32 TSF component
+echo [2/5] System32 TSF component (vs source package)
 echo ================================================
 if exist "C:\Windows\System32\weasel.dll" (
-  for /f "delims=" %%h in ('certutil -hashfile "C:\Windows\System32\weasel.dll" MD5 ^| findstr /i /v "CertUtil hashfile MD5"') do set SYS=%%h
-  if /i "%SYS%"=="%EXPECT_TF%" (echo   System32\weasel.dll OK   %SYS%) else (echo   [FAIL] System32\weasel.dll %SYS% ^<^> expected %EXPECT_TF%)
+  powershell -NoProfile -Command "$a=(Get-FileHash -Algorithm MD5 -Path (Join-Path '%SRC%' 'weaselx64.dll')).Hash; $b=(Get-FileHash -Algorithm MD5 -Path 'C:\Windows\System32\weasel.dll').Hash; if($a -eq $b){Write-Host ('  System32\weasel.dll OK   '+$a)}else{Write-Host ('  [FAIL] System32\weasel.dll '+$b+'  src='+$a)}"
   echo   NOTE: System32 replace takes effect only AFTER REBOOT. If this FAILs
   echo         but the file was copied, reboot first and re-check.
 ) else (
