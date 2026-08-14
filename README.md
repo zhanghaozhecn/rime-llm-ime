@@ -158,8 +158,9 @@ scripts\build_rime.bat          :: 产物 librime\build\bin\Release\rime.dll
 
 :: 4. weasel 依赖准备（首次）
 ::   - weasel\weasel.props：从 weasel.props.template 复制并替换 BOOST_ROOT 为本地 boost 路径
-::   - weasel\librime\include\rime_api.h：用 librime\src\rime_api.h 覆盖
-::     （LLM 版含 set_context_text/context_text_age_ms 等扩展 API——头布局必须与 rime.dll 一致）
+::   - weasel\librime\include\rime_api.h：仓库内已与 librime\src\rime_api.h 同步
+::     （LLM 版含 set_context_text/context_text_age_ms 等扩展 API——头布局必须与 rime.dll
+::      一致，改动 rime_api.h 后需重新覆盖到 weasel 树）
 ::   - rime.lib 入库：scripts\gen_rime_lib.bat（从 librime\dist\lib 拷到 weasel\lib + lib64）
 ::   - 注：WeaselIPCServer.vcxproj 的 include 路径已在仓库内改好（$(SolutionDir)\librime\include）
 
