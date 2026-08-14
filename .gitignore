@@ -21,7 +21,27 @@ Desktop.ini
 
 # bench_threads 运行时生成的结果文件
 bench_threads_result.txt
-scripts/
+
+# scripts/ 白名单：只发布构建/部署/测试工具，本机专用脚本（gbk 历史脚本、
+# deploy_test*、eval_*、run_server_console、test_rime.exe 等）保持忽略
+# 注意：须用 scripts/* 形式（忽略内容而非目录本身），! 白名单才生效
+scripts/*
+!scripts/cmake_rime.bat
+!scripts/build_rime.bat
+!scripts/build_tsf.bat
+!scripts/build_tsf32.bat
+!scripts/build_server.bat
+!scripts/build_boost32.bat
+!scripts/gen_rime_lib.bat
+!scripts/deploy_install.bat
+!scripts/deploy_system32.bat
+!scripts/deploy_tsf32.bat
+!scripts/tsf_switch.ps1
+!scripts/copy_system32.ps1
+!scripts/test_ipc.ps1
+!scripts/test_rime.cpp
+!scripts/build_test_rime.bat
+!scripts/run_test_rime.bat
 
 # bin 目录中的构建产物 (脚本/配置保留跟踪)
 bin/*.dll
