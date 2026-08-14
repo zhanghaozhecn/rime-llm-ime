@@ -46,12 +46,13 @@ rime-llm-ime/
 
 ### 一键部署（推荐）
 
-1. 下载仓库 zip（或 `git clone`），解压到任意目录
-2. 双击 `bin/deploy_llm.bat`（自动请求管理员权限），流程：
-   - **[1/6] 模型检查**：默认路径 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf` 已有则跳过；缺失则询问是否下载（约 500MB，ModelScope，断点续传；跳过则 LLM 不工作但输入法正常）
-   - **[2/6] 停止 WeaselServer → [3/6] 复制 6 个组件到安装目录 → [4/6] System32 TSF 延迟替换 → [5/6] 重启 Server**
-   - **[6/6] 方案配置插入**：在 RIME 用户目录的 `pdsp.schema.yaml` 中幂等插入 `- llm_filter`（uniquifier 后、pin_fix 前，位置校验）与 `llm_rerank:` 配置节
-3. **重启系统**（System32 TSF 组件生效）
+1. 从 [Releases](../../releases) 下载部署包 zip（`rime-llm-deploy-*.zip`），解压到任意目录
+   > 仓库 zip / `git clone` **不含**预编译二进制（bin 二进制不进 git）。源码构建见文末"从源码构建"节。
+2. 双击 `deploy_llm.bat`（自动请求管理员权限），流程：
+   - **[1/7] 模型检查**：默认路径 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf` 已有则跳过；缺失则询问是否下载（约 500MB，ModelScope，断点续传；跳过则 LLM 不工作但输入法正常）
+   - **[2/7] 停止 WeaselServer → [3/7] 复制 7 个组件到安装目录（含 32 位 TSF）→ [4/7] WeaselSetup /u+/i 官方部署（SysWOW64 + System32 双 TSF）→ [5/7] 32 位视图注册兜底 → [6/7] 重启 Server**
+   - **[7/7] 方案配置插入**：在 RIME 用户目录的 `pdsp.schema.yaml` 中幂等插入 `- llm_filter`（uniquifier 后、pin_fix 前，位置校验）与 `llm_rerank:` 配置节
+3. **重启系统**（System32/SysWOW64 TSF 组件生效）
 4. **托盘右键 → 重新部署**（重建词典 build，必须）
 
 > **托盘重新部署必须执行**：词典 build 必须由 LLM 版 librime 编译（官方部署会覆盖为官方格式，LLM librime 读不了 → 一码字词全部为空）。
@@ -76,7 +77,7 @@ rime-llm-ime/
 ### 常见问题
 
 - **Win+Space 无小狼毫**：设置 → 时间和语言 → 中文 → 键盘 → 添加键盘 → 小狼毫
-- **32 位应用（QQ 音乐、WPS 等）**：加载官方 32 位 TSF（SysWOW64\weasel.dll），无 LLM 采集 → 自动回退上屏历史（`AI·历史`），打字正常；勿删 SysWOW64\weasel.dll
+- **32 位应用（QQ 音乐、WPS 等）**：加载 32 位 LLM TSF（SysWOW64\weasel.dll，部署包 `weasel32.dll`）；32 位视图注册缺失时输入英文，用部署脚本 [5/7] 兜底（`SysWOW64\regsvr32.exe /s` + `TEXTSERVICE_PROFILE=hans`）
 - **内存 ≤4GB**：`enabled: false` 或调小 `min_free_mem_mb`（0.8B Q4 模型加载后 WeaselServer 约占 2GB）
 - **语言栏图标消失**：多为 System32 DLL 被重命名替换导致，恢复方式：重装官方包 → 设置添加键盘 → 重新部署
 
