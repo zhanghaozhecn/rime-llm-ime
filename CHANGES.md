@@ -19,15 +19,19 @@ LLM 候选重排为**源码级集成**：`llm_filter` 作为 librime 原生 filt
 
 ```yaml
 llm_rerank:
-  backend: cpu          # off | cpu | gpu — off 时透传不推理
+  enabled: true         # true=启用 LLM 重排 | false=关闭（组件透传，不推理）
   min_code_len: 4       # 输入编码长度小于此值时不重排
+  max_code_len: 0       # 编码长度上限（0=不限制）；超出不推理，与 min_code_len 组成触发区间
+  multi_char_first: false # true=重排后多字词（≥2 字）优先、单字靠后，组内保持 LLM 评分序
   min_tokens: 1         # 上文 token 数小于此值时不推理
   max_tokens: 10        # 上文 token 上限
   max_candidates: 5     # 参与打分的候选数上限
-  cpu_cores: 7          # 推理线程数（自动不超过物理核数）
+  cpu_cores: 4          # 推理线程数（自动不超过物理核数）
   min_free_mem_mb: 2560 # 可用内存低于此值时不加载模型（防小内存机器系统卡死）
   model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
 ```
+
+> 注：`backend` 选项已随 GPU 版退役移除，`enabled` 承担开关职责（08-14 与插件版参数对齐）。
 
 功能模块：
 
@@ -162,3 +166,39 @@ llama.cpp 集成：`LLAMA_ROOT` CACHE 变量（默认 `D:/llama.cpp-mirror`，�
 **根因**：上屏后客户端等 300ms 去抖才发送光标上文；快速打字（~100ms/键）下一词 4 码打满（~350ms）早于上文送达 → Server 上下文为空 → 重排跳过（无标记）→ 词库默认顺序顶上错词。
 
 **修复**（`WeaselTSF/WeaselTSF.cpp`）：去抖 **300ms → 100ms**（Server 端 `on_context_changed` 另有 300ms 节流 + 上下文去重防解码风暴，文档更新风暴场景不受影响）。
+
+---
+
+## 六、2026-08-14 修复记录（TSF 上文采集四模块 + 参数对齐 + 发布体系）
+
+### 1. TSF 光标上文四模块
+
+| 模块 | 说明 |
+|------|------|
+| OnEndEdit selection-change 采集 | 非 composing 时 selection 变化也触发上文采集（此前只监听 TextEditSink 文档变化，光标移动后上文滞后） |
+| 编辑键 reset 恢复 | 08-11 因 WPS 停用（同步 Transact 拉长 TSF 处理链）→ 改**异步线程发送**恢复；判定在按键送达 server **之前**（`_status.composing` 是上一拍状态——有编码时退格被方案转 ESC 清码，事后判定 composing 已变 false 会误清上文） |
+| OnSetFocus(DocumentMgr) reset+collect | 仅 DocumentMgr 真变化时执行（同应用内重聚焦频繁，否则打字期间缓存反复被清） |
+| ShiftStart(-64) 主路径 | 负移只在真移动时 honored（IsEqualStart 判据）；transitory context 回退 MOVESTART 大块方案（迭代上限 128 防死循环） |
+
+### 2. WPS 滞后检测（llm_filter）
+
+WPS 自研适配层只暴露最近 composition 文本（连续打字只采到 2 字符）+ ShiftStart 负移不 honored。判定层新增**滞后检测**：TSF 文本是上屏历史的尾部子串且长度 < 一半 → 自动改用更全的 fallback（标 AI·历史但上文完整）。WPS 全历史 + 完整上文，记事本/VSCode 全 TSF 无误伤。
+
+### 3. 参数对齐（插件版 → 源码版）
+
+`max_code_len`（触发区间上限，0=不限制）+ `multi_char_first`（重排后多字词≥2 字优先、单字靠后，组内保持 LLM 评分序）。
+
+### 4. 关键 bug 修复
+
+- **RimeApi 头布局不同步**：`weasel\librime\include\rime_api.h` 与 `librime\src\rime_api.h` 必须一致（函数指针表错位 → 调用错误函数 → 字母直出）
+- **UTF-8 8 字节截断**切在多字节字符中间 → 残留检测恒误判；需字符边界对齐
+- **IPC buffer 竞争**：异步 reset 线程与 flush/主线程并发写 channel buffer → 消息体错位（"focus:switch"→"cus:switch"）；ClientImpl 全部发送加 recursive_mutex
+- **空文本语义**：打字期间 selection-change 采集到 transient 空 → 客户端 800ms 去抖 + 服务端 age 判定区分 transient 空 vs 真空
+- **bin\data 缺失** → detect_modifications 抛异常 → 永久维护循环（每键部署弹窗）
+
+### 5. 构建/发布体系
+
+- **32/64 位双构建**：Win32 平台 → `weasel.dll`（32 位），x64 → `weaselx64.dll`（64 位）；32 位 boost 用 `b2 architecture=x86 address-model=32`（-x32- 后缀库）；`scripts/` 构建链全部 %~dp0 相对化并发布
+- **部署**：WeaselSetup /u + /i 官方流程（双 TSF + 64 位注册）；32 位视图注册失效需手动 `SysWOW64\regsvr32.exe /s` + `TEXTSERVICE_PROFILE=hans`；System32 被锁用 MoveFileEx DELAY_UNTIL_REBOOT
+- **GitHub Releases**：bin 二进制不进 git，发布走 tag + Releases 部署包 zip（`rime-llm-deploy-*.zip`：6 二进制 + 4 脚本，`deploy_llm.bat` 7 步一键部署）
+- **测试工具**：`scripts/test_ipc.ps1`（IPC 直发验证）、`scripts/test_rime.cpp`（LoadLibrary 冒烟，从 bin 运行）、`scripts/tsf_switch.ps1`（注册表切换测试 DLL 免重启）

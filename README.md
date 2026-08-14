@@ -29,16 +29,17 @@ rime-llm-ime/
 │   ├── WeaselIPC/     # SET_CONTEXT_TEXT / RESET_CONTEXT IPC（枚举尾部追加，前缀兼容官方）
 │   ├── WeaselIPCServer/  # OnSetContextText / OnResetContext handler
 │   └── librime/       # 仅补丁头文件（rime_api.h，LLM 版含 set_context_text 等扩展 API）
-├── pdsp.schema.yaml   # 拼读双拼方案（含 llm_rerank 配置节示例；部署时由脚本自动插入）
 ├── bin/               # 预编译产物 + 部署/验证脚本（见下）
-│   ├── rime.dll / weaselx64.dll / WeaselServer.exe / WeaselDeployer.exe / opencc.dll / vcomp140.dll
-│   ├── deploy_llm.bat          # 一键部署（模型检查 → 组件复制 → System32 → schema 插入）
+│   ├── rime.dll / weaselx64.dll / weasel32.dll / WeaselServer.exe / WeaselDeployer.exe / opencc.dll / vcomp140.dll
+│   ├── deploy_llm.bat          # 一键部署（模型检查 → 组件复制 → WeaselSetup 官方部署 → 注册兜底 → schema 插入）
 │   ├── deploy_llm_model.ps1    # 模型检查/下载（ModelScope，断点续传）
 │   ├── deploy_llm_schema.ps1   # 方案配置插入（llm_filter + llm_rerank 节，幂等，位置校验）
-│   ├── verify_deploy.bat       # 部署验证（与源包自动对比 md5）
-│   └── bench_threads.exe       # 线程数测定工具
+│   └── verify_deploy.bat       # 部署验证（与源包自动对比 md5）
+├── scripts/           # 构建/部署/测试脚本（发布清单，见"从源码构建"）
 └── CHANGES.md         # 变更记录
 ```
+
+> 方案（`pdsp.schema.yaml`）不在本仓库——部署脚本在 RIME 用户目录的方案中幂等插入 `llm_filter` 组件与 `llm_rerank` 配置节。
 
 ## 快速开始（普通用户）
 
@@ -60,11 +61,11 @@ rime-llm-ime/
 ### 手动步骤（脚本不可用时）
 
 1. 下载 GGUF 模型（本机验证使用 `Qwen3.5-0.8B-Q4_K_M.gguf`，任意小模型均可，建议 ≤2B Q4）放到 `d:\gguf_models\`
-2. 将 `bin/` 下 **6 个文件**复制到小狼毫安装目录（`C:\Program Files\Rime\weasel-0.17.4`）：
-   - `rime.dll` / `weaselx64.dll` / `WeaselServer.exe` / `WeaselDeployer.exe` — 本方案产物
+2. 将 `bin/` 下 **7 个文件**复制到小狼毫安装目录（`C:\Program Files\Rime\weasel-0.17.4`）：
+   - `rime.dll` / `weaselx64.dll` / `weasel32.dll`（复制为 `weasel.dll`）/ `WeaselServer.exe` / `WeaselDeployer.exe` — 本方案产物
    - `opencc.dll` — rime.dll 的动态依赖（缺失会报"找不到 opencc.dll"）
    - `vcomp140.dll` — VC OpenMP 运行时（无 VS 运行库的机器必需）
-3. `weaselx64.dll` 同时复制为 `C:\Windows\System32\weasel.dll`（TSF 组件，被占用时用延迟替换——**切勿重命名替换**，会导致 TSF 注销、语言栏图标消失）
+3. 运行 `WeaselSetup.exe /u + /i`（官方部署流程：安装目录 `weasel.dll` → SysWOW64、`weaselx64.dll` → System32，并注册；32 位视图注册缺失时用 `SysWOW64\regsvr32.exe /s C:\Windows\SysWOW64\weasel.dll` + `TEXTSERVICE_PROFILE=hans` 补注册）；System32 被占用时用延迟替换（**切勿重命名替换**，会导致 TSF 注销、语言栏图标消失）
 4. 方案配置插入（二选一）：
    - `powershell -ExecutionPolicy Bypass -File bin\deploy_llm_schema.ps1`（推荐，幂等）
    - 手动在 `%APPDATA%\Rime\pdsp.schema.yaml` 的 filters 块 uniquifier 之后加 `- llm_filter`，并添加 `llm_rerank:` 配置节
@@ -99,39 +100,17 @@ llm_rerank:
   model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
 ```
 
-### 线程数实测（可选）
-
-`bin/bench_threads.exe` 在**本机实测**各线程数的推理延迟：
-
-```
-双击/命令行运行 bin/bench_threads.exe [模型路径]
-```
-
-1. **建议在系统空闲时运行**（有编译/下载/游戏在跑会压平曲线、延迟失真）
-2. 约 2.5 分钟后输出各线程数延迟表（每档采样 99 次，中位数 + mid50 区间）：
-   ```
-   == bench_threads: per-thread latency ==
-   ...
-     thr= 5: median  69.2 ms/pass (mid50  67.7- 71.6)
-     thr= 6: median  65.6 ms/pass (mid50  64.2- 67.1)
-     ...
-   ```
-   工具**不做推荐**——自行权衡"延迟 vs 线程占用"，把选定的数字填入 schema 的 `llm_rerank.cpu_cores`（通常选曲线拐点附近的最小线程数即可；`mid50` 区间窄 = 该档稳定）
-3. 托盘右键 → 重新部署 → 生效
-
-不跑本工具也可以直接用默认值 4（=GGML 默认，线程数固定，无运行时动态调整）。
-
 ## 构建（开发者）
 
 ### 依赖
 
-| 依赖 | 版本 | 用途 |
-|------|------|------|
-| Visual Studio 2022 Build Tools | v143 | 编译 |
-| Boost | 1.84.0 | weasel 构建（`weasel/deps/` 下，官方 `install_boost.bat` 可获取） |
-| librime 依赖 | marisa-trie / opencc / leveldb / yaml-cpp / glog | `cd librime && git submodule update --init --recursive`，按 librime 官方流程构建（产出 install 目录：marisa.lib/opencc.lib/leveldb.lib/yaml-cpp.lib） |
-| llama.cpp | master（MT 静态构建） | llm_filter 推理后端 |
-| GGUF 模型 | 任意小模型 | 推理模型 |
+| 依赖 | 版本 | 获取方式 |
+|------|------|---------|
+| Visual Studio 2022 Build Tools | v143（含 vcvars64.bat） | 官方安装器，C++ 桌面开发工作负载 |
+| Boost | 1.84.0 | 仓库 `weasel/install_boost.bat`（官方脚本，自动下载）→ `weasel/deps/boost_1_84_0` |
+| librime 依赖 | marisa / opencc / leveldb / yaml-cpp / glog | `cd librime && git submodule update --init --recursive`，官方 `build.bat` 构建并安装到 `librime/` 与 `librime/dist/` |
+| llama.cpp | master | clone + MT 静态构建（命令见下），路径经 `-DLLAMA_ROOT=` 传入 |
+| GGUF 模型 | 任意小模型（建议 ≤2B Q4） | 部署脚本自动检查/下载 |
 
 ### weasel 源码说明（0.17.4 基底）
 
@@ -139,58 +118,66 @@ llm_rerank:
 
 本仓库 weasel/ 相对官方 0.17.4 的改动：
 1. `include/WeaselIPC.h`：枚举**尾部追加** `SET_CONTEXT_TEXT`/`RESET_CONTEXT`（前缀编号不变，与官方组件任意混用兼容）+ Client 接口 `SetContextText`/`ResetContext`
-2. `WeaselIPC/WeaselClientImpl.{h,cpp}`：`SendContextText`/`SendContextReset` 实现 + **channel_mutex 互斥锁**（TSF 采集线程与主线程共享管道，替代 master 的 TLS 管道重构）
+2. `WeaselIPC/WeaselClientImpl.{h,cpp}`：`SendContextText`/`SendContextReset` 实现 + **recursive_mutex 互斥锁**（TSF 采集线程与主线程共享管道 buffer，防消息体错位）
 3. `WeaselIPCServer/WeaselServerImpl.{h,cpp}`：`OnSetContextText`/`OnResetContext` handler（调 librime `set_context_text`/`reset_context_text`）
-4. `WeaselTSF/`：光标上文采集——`CGetTextBeforeCaretEditSession`（GetSelection → GetText 分块，kMaxIter=128 防死循环）+ TextEditSink 文档变化触发（100ms 去抖合并防 CEF 风暴）+ **提交后立即采集**（`immediate` 跳过去抖，下一词首键前 TSF 上文到位）+ **WPS 黑名单**（`_IsTSFCtxReliable()`：wps.exe 等禁用 TSF 采集 → librime 自动退化上屏历史）
+4. `WeaselTSF/`：光标上文采集——`CGetTextBeforeCaretEditSession`（GetSelection → GetText 分块，kMaxIter=128 防死循环）+ TextEditSink 文档变化触发（100ms 去抖合并防 CEF 风暴）+ **提交后立即采集**（`immediate` 跳过去抖，下一词首键前 TSF 上文到位）+ **编辑键 reset**（有编码时退格豁免——方案将其转 ESC 清码，上文不变）+ **焦点切换 reset+采集** + **ShiftStart(-64) 主路径**（MOVESTART 兜底）+ **WPS 滞后检测**（TSF 文本明显短于上屏历史且为其尾部 → 自动改用完整历史）
 5. **UIStyle 不加字段**（`ai_comment_text_color` 未移植——保持与官方 0.17.4 序列化 100% 兼容；AI 标记以 comment 文本显示）
 
 librime 侧（`gear/llm_filter.cc`，新增组件）：
-- 上文来源自适应（`GetContextTextPair`）：TSF 文本优先；TSF 文本空/滞后 → commit history 兜底（提交后同步累积，必有最近上屏词）；**残留检测**——TSF 文本不含 commit history 尾部（最近上屏词）时判为其他应用残留（32 位官方 TSF 无采集的场景），改用历史
+- 上文来源自适应（`GetContextTextPair`）：TSF 文本优先；TSF 文本空/滞后 → commit history 兜底（提交后同步累积，必有最近上屏词）；**残留检测**——TSF 文本不含 commit history 尾部（最近上屏词）时判为其他应用残留，改用历史
 - 预解码（`prepare`）：commit/上下文变化后异步 decode 上文，score 命中复用 KV
+- 触发区间 `[min_code_len, max_code_len]`（0=不限制）+ 重排后 `multi_char_first` 分组（与插件版参数对齐）
 
-### 步骤
+### 构建步骤
+
+仓库自带 `scripts/` 构建链（已发布，路径相对仓库根，任意目录 clone 后可直接使用）。以下按顺序执行：
 
 ```bat
-:: 1. librime 依赖
+:: 0. 官方 0.17.4 安装版 weasel 一次获取依赖（boost + 官方二进制）——仅首次
+weasel\install_boost.bat        :: 自动下载 boost 1.84.0 → weasel\deps\boost_1_84_0
+
+:: 1. librime 依赖 + 官方构建（产出 librime\dist\lib\rime.lib 等）
 cd librime
 git submodule update --init --recursive
-build.bat                      :: 官方流程，产出 build/install 等
+build.bat                       :: 官方流程（依赖 install 到 librime\，rime 装到 dist\）
+cd ..
 
 :: 2. llama.cpp MT 静态构建（MT 运行时，与 librime 一致）
-git clone https://github.com/ggml-org/llama.cpp
+git clone https://github.com/ggml-org/llama.cpp <你的 llama 目录>
+cd <你的 llama 目录>
 cmake -B build-mt -A x64 -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
 cmake --build build-mt --config Release
 :: 产出 build-mt/src/Release/llama.lib + build-mt/ggml/src/Release/ggml*.lib
+cd ..
 
-:: 3. 构建 rime.dll（llm_filter 链接 llama）
-cmake -B build -A x64 -DLLAMA_ROOT=D:/llama.cpp-mirror ^
-      -DCMAKE_PREFIX_PATH=D:/rime-build/librime/install
-cmake --build build --config Release --target rime
+:: 3. 配置 + 构建 rime.dll（llm_filter 链接 llama）
+set LLAMA_ROOT=<你的 llama 目录>
+scripts\cmake_rime.bat          :: 生成 librime\build\*.sln（deps 探测见下）
+scripts\build_rime.bat          :: 产物 librime\build\bin\Release\rime.dll
 
-:: 4. 构建 weasel（0.17.4 基底）
-:: 4a. 依赖准备
-::   - boost_1_84_0 放入 weasel/deps/（install_boost.bat 或从其他 weasel 树复制）
-::   - weasel.props 从 template 生成（替换 BOOST_ROOT/PLATFORM_TOOLSET=v143/VERSION=0.17.4.0）
-::   - afxres.h 放入 weasel/include/（VS 无 MFC 时需 stub）
-::   - LLM 版 rime_api.h（顶层 librime/src/rime_api.h，含 set_context_text 等扩展）
-::     复制到 weasel/librime/include/rime_api.h
-::   - rime.lib：librime 构建产物，或从 rime.dll 生成：
-::       dumpbin /exports rime.dll > exports.txt  →  写 rime.def  →  lib /def:rime.def /machine:x64
-::     放入 weasel/lib/ 和 weasel/lib64/（x64 Release 用 lib64）
-::   - WeaselIPCServer.vcxproj 的 include 路径需含 $(SolutionDir)\librime\include
-:: 4b. 编译
-cd weasel
-msbuild weasel.sln /p:Configuration=Release /p:Platform=x64 /t:WeaselTSF /t:WeaselServer
-:: 产物在 weasel/output/weaselx64.dll + weasel/output/WeaselServer.exe
+:: 4. weasel 依赖准备（首次）
+::   - weasel\weasel.props：从 weasel.props.template 复制并替换 BOOST_ROOT 为本地 boost 路径
+::   - weasel\librime\include\rime_api.h：用 librime\src\rime_api.h 覆盖
+::     （LLM 版含 set_context_text/context_text_age_ms 等扩展 API——头布局必须与 rime.dll 一致）
+::   - rime.lib 入库：scripts\gen_rime_lib.bat（从 librime\dist\lib 拷到 weasel\lib + lib64）
+::   - 注：WeaselIPCServer.vcxproj 的 include 路径已在仓库内改好（$(SolutionDir)\librime\include）
+
+:: 5. 构建 weasel
+scripts\build_tsf.bat           :: x64 TSF → weasel\output\weaselx64.dll
+scripts\build_server.bat        :: server → weasel\output\WeaselServer.exe
+:: 32 位 TSF（可选，WPS 等 32 位应用）：
+scripts\build_boost32.bat       :: 32 位 boost（-x32- 后缀库，首次）
+scripts\build_tsf32.bat         :: Win32 TSF → weasel\output\weasel.dll（官方命名 32 位）
 ```
 
-> `src/CMakeLists.txt` 中 `LLAMA_ROOT` 为 CMake CACHE 变量，可用 `-DLLAMA_ROOT=<你的路径>` 覆盖。
-> 仅 CPU 路线（llama.cpp MT 静态构建）；GPU 版已退役不发布。
+**`cmake_rime.bat` 的 deps 解析**：优先探测 `deps\prebuilt\`（本地预编译库，本机布局）；不存在则回退 librime 官方 build.bat 的安装位置（`librime\` 本身）。两者都可用 `RIME_DEPS` 环境变量覆盖。`BOOST_ROOT`/`LLAMA_ROOT` 同理（环境变量优先，默认 `deps\boost_1_84_0` / `D:/llama.cpp-mirror`）。
+
+> `src/CMakeLists.txt` 中 `LLAMA_ROOT` 为 CMake CACHE 变量；仅 CPU 路线（llama.cpp MT 静态构建），GPU 版已退役不发布。
 
 ### 替换安装文件
 
-产物：`librime/build/src/Release/rime.dll`、`weasel/output/weaselx64.dll`、`weasel/output/WeaselServer.exe`，另需 `librime install/bin/opencc.dll`（rime.dll 的动态依赖）和 `vcomp140.dll`（VC OpenMP 运行时）。复制到安装目录后，重启系统（TSF 注册表缓存），然后**托盘重新部署**（LLM librime 重建词典 build）。
+产物齐后，把 `librime\build\bin\Release\rime.dll`、`weasel\output\weaselx64.dll`、`weasel\output\weasel.dll`（32 位）、`weasel\output\WeaselServer.exe` 放进 `bin\`（连同 opencc.dll / vcomp140.dll），然后按上面"一键部署"流程（`deploy_llm.bat` 或 `scripts\deploy_tsf32.bat` 官方 WeaselSetup 流程）部署，重启系统（TSF 注册表缓存），最后**托盘重新部署**（LLM librime 重建词典 build）。
 
 ## 候选窗 AI 标记
 
@@ -212,7 +199,7 @@ score: wait=12ms S1=48ms KV=3ms S2=9ms total=72ms prep=1 ctx_tok=9 cand=5
 ctx: [上文]              # 推理时用的上文（normalize 后）
 ctx raw: [原始上文]       # normalize 前后不一致时记录原始值
 RESET: context cleared (gen=N reason=...)   # TSF 上下文被清空（编辑键/切窗）
-config: enabled=1 ...    # 部署/会话启动时的配置
+config: enabled=1 min_code_len=4 max_code_len=0 multi_char_first=0 ...   # 部署/会话启动时的配置
 ```
 
 事件日志（`时间|计数|编码|候选|上文|排序后候选|延迟|来源`）用于选词质量排查。
