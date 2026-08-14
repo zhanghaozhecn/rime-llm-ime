@@ -48,9 +48,15 @@ static std::atomic<bool> g_loading{false};
 // schema llm_rerank/ section (defaults match the old project):
 //   enabled: true|false — false disables rerank entirely (pass-through)
 //   min_code_len: input code length below this -> no rerank
+//   max_code_len: input code length above this -> no rerank (0 = unlimited);
+//                 [min, max] = rerank trigger window
+//   multi_char_first: true = after rerank, group multi-char (>=2 chars) words
+//                 before single chars, keeping LLM score order within groups
 static std::string g_model_path = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static bool g_enabled = false;  // CPU only; GPU build retired (not published)
 static int g_min_code_len = 4;
+static int g_max_code_len = 0;  // 0 = no upper limit (plugin-version parity)
+static bool g_multi_char_first = false;
 static int g_min_tokens = 1;
 static int g_max_ctx_tokens = 10;  // tok=10: 93.4% acc, 10->17 gains only +1.1pp
 static int g_n_threads = 4;        // default = GGML_DEFAULT_N_THREADS; override via cpu_cores
@@ -694,6 +700,25 @@ void LlmRerankTranslation::Collect() {
         for (int i : order)
           reranked.push_back(candidates_[i]);
         candidates_ = reranked;
+        // 多字词优先 (multi_char_first, 与插件版语义一致): 重排后按
+        // "多字(≥2 字) → 单字"分组, 组内保持 LLM 评分序。必须在徽章之前
+        // (徽章加在最终首候选上)。
+        if (g_multi_char_first && candidates_.size() > 1) {
+          std::vector<an<Candidate>> multi, single;
+          for (auto &c : candidates_) {
+            const std::string &t = c->text();
+            size_t n = 0;  // UTF-8 字符数: 数非续字节
+            for (unsigned char ch : t)
+              if ((ch & 0xC0) != 0x80)
+                n++;
+            (n >= 2 ? multi : single).push_back(c);
+          }
+          std::vector<an<Candidate>> grouped;
+          grouped.reserve(candidates_.size());
+          grouped.insert(grouped.end(), multi.begin(), multi.end());
+          grouped.insert(grouped.end(), single.begin(), single.end());
+          candidates_ = std::move(grouped);
+        }
         // AI 首选徽章: 重排后首候选 comment 追加来源标记 (与已有 comment 合并,
         // ShadowCandidate 包装避免污染原候选; weasel 端识别 "AI·" 用强调色渲染)
         if (!candidates_.empty()) {
@@ -739,6 +764,9 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     int v = 0;
     if (config->GetInt("llm_rerank/min_code_len", &v))
       g_min_code_len = v;
+    if (config->GetInt("llm_rerank/max_code_len", &v))
+      g_max_code_len = v;
+    config->GetBool("llm_rerank/multi_char_first", &g_multi_char_first);
     if (config->GetInt("llm_rerank/min_tokens", &v))
       g_min_tokens = v;
     if (config->GetInt("llm_rerank/max_tokens", &v))
@@ -754,10 +782,12 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     unsigned hw = std::thread::hardware_concurrency();
     if (hw > 0 && (unsigned)g_n_threads > hw)
       g_n_threads = (int)hw;
-    log_msg("config: enabled=%d min_code_len=%d min_tokens=%d "
+    log_msg("config: enabled=%d min_code_len=%d max_code_len=%d "
+            "multi_char_first=%d min_tokens=%d "
             "max_tokens=%d max_candidates=%d cpu_cores=%d "
             "min_free_mem_mb=%d model=%s",
-            g_enabled ? 1 : 0, g_min_code_len, g_min_tokens,
+            g_enabled ? 1 : 0, g_min_code_len, g_max_code_len,
+            g_multi_char_first ? 1 : 0, g_min_tokens,
             g_max_ctx_tokens, g_max_candidates, g_n_threads,
             g_min_free_mem_mb, g_model_path.c_str());
   }
@@ -989,9 +1019,10 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
   if (!g_enabled)
     return translation;  // enabled=false -> pass-through
 
-  if (engine_->context() &&
-      (int)engine_->context()->input().size() < g_min_code_len)
-    return translation;  // input code length below min_code_len -> no rerank
+  size_t code_len = engine_->context() ? engine_->context()->input().size() : 0;
+  if ((int)code_len < g_min_code_len ||
+      (g_max_code_len > 0 && (int)code_len > g_max_code_len))
+    return translation;  // code length outside [min_code_len, max_code_len]
 
   // context source: TSF caret text, or commit history fallback
   auto [ctx, src] = GetContextTextPair();
