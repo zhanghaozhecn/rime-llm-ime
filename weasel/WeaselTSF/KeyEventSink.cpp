@@ -94,11 +94,13 @@ STDAPI WeaselTSF::OnTestKeyDown(ITfContext* pContext,
     *pfEaten = TRUE;
     return S_OK;
   }
-  _ProcessKeyEvent(wParam, lParam, pfEaten);
-  // 编辑键 reset 恢复 (2026-08-13): 08-11 因 WPS 停用移除——当时同步
-  // Transact 拉长按键回调链; 现改为异步发送 (见 _HandleEditKeyReset),
-  // 按键回调内只做轻量 IPC 线程 spawn, 不再阻塞 TSF 处理链。
+  // 编辑键 reset (2026-08-14 修正): 判定必须在 _ProcessKeyEvent 之前——
+  // _status.composing 是上个按键的 server 状态; 有编码时退格被方案转
+  // ESC 清码 (按键处理后 composing 已变 false), 事后检查会误判为
+  // "无编码退格"而误清上文。同时保持异步发送 (08-13): 同步 Transact
+  // 在按键回调内拉长 TSF 处理链, 08-11 WPS 停用的教训。
   _HandleEditKeyReset(wParam);
+  _ProcessKeyEvent(wParam, lParam, pfEaten);
   _UpdateComposition(pContext);
   if (*pfEaten)
     _fTestKeyDownPending = TRUE;
@@ -114,11 +116,12 @@ STDAPI WeaselTSF::OnKeyDown(ITfContext* pContext,
     _fTestKeyDownPending = FALSE;
     *pfEaten = TRUE;
   } else {
-    _ProcessKeyEvent(wParam, lParam, pfEaten);
     // 编辑键 reset (2026-08-13): 部分应用/按键仅走 OnKeyDown 不走
     // OnTestKeyDown (QQ 类), 两处都调用, _HandleEditKeyReset 内
     // 500ms 去重防同一按键重复 reset。
+    // 2026-08-14: 判定移到 _ProcessKeyEvent 之前, 见 OnTestKeyDown 注释。
     _HandleEditKeyReset(wParam);
+    _ProcessKeyEvent(wParam, lParam, pfEaten);
     _UpdateComposition(pContext);
   }
   return S_OK;
