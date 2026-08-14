@@ -46,6 +46,11 @@ class ClientImpl {
   bool is_ime;
 
   PipeChannel<PipeMessage> channel;
+  // 发送串行化 (2026-08-13): ClearBufferStream/Write 非线程安全,
+  // TSF 异步线程的 ResetContext 与 flush 线程的 SetContextText 及主线程
+  // 按键 IPC 并发写 buffer → body 内容错位 (实测 "focus:switch" 被截成
+  // "cus:switch")。递归锁: 公共方法可能互相调用 (如 Echo→Connect)。
+  std::recursive_mutex send_mutex_;
 };
 
 }  // namespace weasel

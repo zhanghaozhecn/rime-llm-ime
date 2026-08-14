@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "WeaselTSF.h"
+#include <thread>
 
 STDAPI WeaselTSF::OnInitDocumentMgr(ITfDocumentMgr* pDocMgr) {
   return S_OK;
@@ -11,7 +12,25 @@ STDAPI WeaselTSF::OnUninitDocumentMgr(ITfDocumentMgr* pDocMgr) {
 
 STDAPI WeaselTSF::OnSetFocus(ITfDocumentMgr* pDocMgrFocus,
                              ITfDocumentMgr* pDocMgrPrevFocus) {
+  TSFDbgLog(L"OnSetFocusDocMgr enter");
   _InitTextEditSink(pDocMgrFocus);
+
+  // rime-llm-ime: 窗口切换 (DocumentMgr 真正变化) → 服务端缓存的上文
+  // 属于旧窗口, 异步 reset 防新窗口第一词用旧窗口文本重排 (残留检测
+  // 互证失效场景: fallback 未清时旧 TSF 文本与旧 fallback 互证"通过")。
+  // 仅 prevFocus != focus 才 reset: 同一 DocumentMgr 的重聚焦 (打字期间
+  // 候选窗/输入焦点变化会频繁触发 OnSetFocus) 不 reset, 否则缓存被
+  // 反复清空 → 大量词无标记 (2026-08-13 实测)。
+  // 顺序: 先 spawn reset 线程 (立即发送, <5ms), 再发起采集请求
+  // (TSF 异步编辑会话排队执行, 到达在 reset 之后) → 服务端先清旧再收新。
+  if (pDocMgrFocus && pDocMgrFocus != pDocMgrPrevFocus) {
+    std::thread([](weasel::Client* c) { c->ResetContext("focus:switch"); },
+                &m_client).detach();
+    _OnContextReset();  // 清去抖标记, 新窗口首次采集强制重发
+    com_ptr<ITfContext> pContext;
+    if (pDocMgrFocus->GetTop(&pContext) == S_OK && pContext)
+      _RequestContextText(pContext);
+  }
 
   com_ptr<ITfDocumentMgr> pCandidateListDocumentMgr;
   com_ptr<ITfContext> pTfContext = _GetUIContextDocument();

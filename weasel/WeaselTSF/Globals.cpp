@@ -7,6 +7,24 @@ LONG g_cRefDll = -1;
 
 CRITICAL_SECTION g_cs;
 
+void TSFDbgLog(const wchar_t* fmt, ...) {
+  wchar_t buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  _vsnwprintf_s(buf, _countof(buf), _TRUNCATE, fmt, ap);
+  va_end(ap);
+  wchar_t path[MAX_PATH];
+  ExpandEnvironmentStringsW(L"%TEMP%\\weasel_tsf_dbg.log", path,
+                            _countof(path));
+  FILE* f = _wfopen(path, L"a");
+  if (f) {
+    fwprintf(f, L"[%llu] [%lu.%lu] %s\n",
+             (unsigned long long)GetTickCount64(), GetCurrentProcessId(),
+             GetCurrentThreadId(), buf);
+    fclose(f);
+  }
+}
+
 // {A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}
 static const GUID c_clsidTextService = {
     0xa3f4cded,

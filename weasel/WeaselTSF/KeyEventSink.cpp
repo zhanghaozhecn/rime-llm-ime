@@ -3,6 +3,8 @@
 #include "WeaselTSF.h"
 #include <KeyEvent.h>
 #include "CandidateList.h"
+#include <thread>
+#include <string>
 
 static weasel::KeyEvent prevKeyEvent;
 static BOOL prevfEaten = FALSE;
@@ -92,9 +94,11 @@ STDAPI WeaselTSF::OnTestKeyDown(ITfContext* pContext,
     *pfEaten = TRUE;
     return S_OK;
   }
-  // 2026-08-11: 移除 _HandleEditKeyReset/_RequestContextText — WPS 中
-  // 按键回调内调用失败会致 TSF 停用 text service (英文直出); 回归官方按键链路
   _ProcessKeyEvent(wParam, lParam, pfEaten);
+  // 编辑键 reset 恢复 (2026-08-13): 08-11 因 WPS 停用移除——当时同步
+  // Transact 拉长按键回调链; 现改为异步发送 (见 _HandleEditKeyReset),
+  // 按键回调内只做轻量 IPC 线程 spawn, 不再阻塞 TSF 处理链。
+  _HandleEditKeyReset(wParam);
   _UpdateComposition(pContext);
   if (*pfEaten)
     _fTestKeyDownPending = TRUE;
@@ -110,8 +114,11 @@ STDAPI WeaselTSF::OnKeyDown(ITfContext* pContext,
     _fTestKeyDownPending = FALSE;
     *pfEaten = TRUE;
   } else {
-    // 2026-08-11: 同上, 移除按键回调内新增调用
     _ProcessKeyEvent(wParam, lParam, pfEaten);
+    // 编辑键 reset (2026-08-13): 部分应用/按键仅走 OnKeyDown 不走
+    // OnTestKeyDown (QQ 类), 两处都调用, _HandleEditKeyReset 内
+    // 500ms 去重防同一按键重复 reset。
+    _HandleEditKeyReset(wParam);
     _UpdateComposition(pContext);
   }
   return S_OK;
@@ -121,6 +128,7 @@ void WeaselTSF::_HandleEditKeyReset(WPARAM wParam) {
   // composition 非空时退格等是删编码, 光标位置未变, 不重置
   if (_status.composing)
     return;
+  TSFDbgLog(L"EditKeyReset vk=%d", (int)wParam);
   // 防重: TSF 的 TestKeyDown/KeyDown/TestKeyUp/KeyUp 四个回调都会进入
   // 本函数, 同一物理按键会重复 ResetContext (reset 代次翻倍, 且可能
   // 清掉刚采集送达的 ctx); 500ms 内相同按键合并为一次。
@@ -156,7 +164,12 @@ void WeaselTSF::_HandleEditKeyReset(WPARAM wParam) {
       break;
   }
   if (reason) {
-    m_client.ResetContext(reason);  // 触发场景随 IPC 传递, 日志记录
+    // 异步发送 (2026-08-13): 同步 Transact 在按键回调内拉长 TSF 处理链,
+    // 08-11 WPS 停用 (英文直出) 的教训; 独立线程发送, 按键回调立即返回。
+    // PipeChannel thread_local 句柄: 新线程自行连接管道, 线程安全
+    // (与 _OnContextTextReady 的 flush 线程同模式)。
+    std::string r = reason;
+    std::thread([this, r]() { m_client.ResetContext(r.c_str()); }).detach();
     _OnContextReset();              // 清去抖标记, 下次采集强制重发
   }
 }

@@ -107,6 +107,9 @@ void ClientImpl::SendContextText(const std::string& utf8_text) {
   // 注意: 本方法可能从 TSF 回调的独立发送线程调用, 该线程的
   // thread_local 管道句柄未连接 (_Active() 检查会误判 false 而静默跳过),
   // 因此不检查 _Active(); Transact 内部 _Ensure() 会按需建立连接。
+  // 串行化: ClearBufferStream/Write 非线程安全, 与 SendContextReset
+  // (编辑键异步线程) 并发会损坏 body (2026-08-13 实测错位)
+  std::lock_guard<std::recursive_mutex> lock(send_mutex_);
   try {
     // 管道 body 流为 wbufferstream (宽字符), 需转 wstring 写入
     int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8_text.c_str(),
@@ -128,6 +131,7 @@ void ClientImpl::SendContextReset(const char* reason) {
   // 上屏历史不再代表光标前上文, librime 侧清空并递增 reset 代次,
   // llm_filter 的 commit-history fallback 从头积累。
   // reason 经 body 传递 (宽字符流), librime 日志记录触发场景。
+  std::lock_guard<std::recursive_mutex> lock(send_mutex_);
   try {
     PipeMessage req{WEASEL_IPC_RESET_CONTEXT, 0, 0};
     if (reason && *reason) {
@@ -227,6 +231,7 @@ bool ClientImpl::GetResponseData(ResponseHandler const& handler) {
 }
 
 bool ClientImpl::_WriteClientInfo() {
+  std::lock_guard<std::recursive_mutex> lock(send_mutex_);
   channel << L"action=session\n";
   channel << L"session.client_app=" << app_name.c_str() << L"\n";
   channel << L"session.client_type=" << (is_ime ? L"ime" : L"tsf") << L"\n";
@@ -237,6 +242,10 @@ bool ClientImpl::_WriteClientInfo() {
 LRESULT ClientImpl::_SendMessage(WEASEL_IPC_COMMAND Msg,
                                  DWORD wParam,
                                  DWORD lParam) {
+  // 串行化: 与异步线程的 SendContextText/SendContextReset 共用 buffer,
+  // 并发写会损坏 body (2026-08-13 "focus:switch"→"cus:switch" 错位)。
+  // 递归锁: StartSession 内 _WriteClientInfo → _SendMessage 重入安全。
+  std::lock_guard<std::recursive_mutex> lock(send_mutex_);
   try {
     PipeMessage req{Msg, wParam, lParam};
     return channel.Transact(req);

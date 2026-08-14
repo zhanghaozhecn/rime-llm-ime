@@ -22,6 +22,7 @@ static void error_message(const WCHAR* msg) {
 }
 
 WeaselTSF::WeaselTSF() {
+  TSFDbgLog(L"WeaselTSF ctor");
   _cRef = 1;
 
   _dwThreadMgrEventSinkCookie = TF_INVALID_COOKIE;
@@ -125,22 +126,27 @@ STDAPI WeaselTSF::Deactivate() {
 STDAPI WeaselTSF::ActivateEx(ITfThreadMgr* pThreadMgr,
                              TfClientId tfClientId,
                              DWORD dwFlags) {
+  TSFDbgLog(L"ActivateEx enter");
   com_ptr<ITfDocumentMgr> pDocMgrFocus;
   _activateFlags = dwFlags;
 
   _pThreadMgr = pThreadMgr;
   _tfClientId = tfClientId;
 
-  if (!_InitThreadMgrEventSink())
+  if (!_InitThreadMgrEventSink()) {
+    TSFDbgLog(L"ActivateEx fail: ThreadMgrEventSink");
     goto ExitError;
+  }
 
   if ((_pThreadMgr->GetFocus(&pDocMgrFocus) == S_OK) &&
       (pDocMgrFocus != NULL)) {
     _InitTextEditSink(pDocMgrFocus);
   }
 
-  if (!_InitKeyEventSink())
+  if (!_InitKeyEventSink()) {
+    TSFDbgLog(L"ActivateEx fail: KeyEventSink");
     goto ExitError;
+  }
 
   // if (!_InitDisplayAttributeGuidAtom())
   //	goto ExitError;
@@ -148,21 +154,31 @@ STDAPI WeaselTSF::ActivateEx(ITfThreadMgr* pThreadMgr,
   // like some opengl stuff
   _InitDisplayAttributeGuidAtom();
 
-  if (!_InitPreservedKey())
+  if (!_InitPreservedKey()) {
+    TSFDbgLog(L"ActivateEx fail: PreservedKey");
     goto ExitError;
+  }
 
-  if (!_InitLanguageBar())
+  if (!_InitLanguageBar()) {
+    TSFDbgLog(L"ActivateEx fail: LanguageBar");
     goto ExitError;
+  }
 
   if (!_IsKeyboardOpen())
     _SetKeyboardOpen(TRUE);
 
-  if (!_InitCompartment())
+  if (!_InitCompartment()) {
+    TSFDbgLog(L"ActivateEx fail: Compartment");
     goto ExitError;
-  if (!_InitThreadFocusSink())
+  }
+  if (!_InitThreadFocusSink()) {
+    TSFDbgLog(L"ActivateEx fail: ThreadFocusSink");
     goto ExitError;
+  }
 
+  TSFDbgLog(L"ActivateEx before EnsureServerConnected");
   _EnsureServerConnected();
+  TSFDbgLog(L"ActivateEx after EnsureServerConnected");
 
   return S_OK;
 
@@ -172,6 +188,7 @@ ExitError:
 }
 
 STDMETHODIMP WeaselTSF::OnSetThreadFocus() {
+  TSFDbgLog(L"OnSetThreadFocus enter");
   std::wstring _ToggleImeOnOpenClose{};
   RegGetStringValue(HKEY_CURRENT_USER, L"Software\\Rime\\weasel",
                     L"ToggleImeOnOpenClose", _ToggleImeOnOpenClose);
@@ -228,11 +245,16 @@ STDMETHODIMP WeaselTSF::OnActivated(REFCLSID clsid,
 }
 
 void WeaselTSF::_Reconnect() {
+  TSFDbgLog(L"Reconnect: Disconnect");
   m_client.Disconnect();
+  TSFDbgLog(L"Reconnect: Connect");
   m_client.Connect(NULL);
+  TSFDbgLog(L"Reconnect: StartSession");
   m_client.StartSession();
+  TSFDbgLog(L"Reconnect: GetResponseData");
   weasel::ResponseParser parser(NULL, NULL, &_status, NULL, &_cand->style());
   bool ok = m_client.GetResponseData(std::ref(parser));
+  TSFDbgLog(L"Reconnect: GetResponseData done ok=%d", (int)ok);
   if (ok) {
     _UpdateLanguageBar(_status);
   }
@@ -241,8 +263,11 @@ void WeaselTSF::_Reconnect() {
 static unsigned int retry = 0;
 
 bool WeaselTSF::_EnsureServerConnected() {
+  TSFDbgLog(L"EnsureServerConnected enter");
   if (!m_client.Echo()) {
+    TSFDbgLog(L"EnsureServerConnected Echo fail, Reconnect");
     _Reconnect();
+    TSFDbgLog(L"EnsureServerConnected after Reconnect");
     retry++;
     if (retry >= 6) {
       HANDLE hMutex = CreateMutex(NULL, TRUE, L"WeaselDeployerExclusiveMutex");
@@ -281,6 +306,7 @@ bool WeaselTSF::_EnsureServerConnected() {
     }
     return (m_client.Echo() != 0);
   } else {
+    TSFDbgLog(L"EnsureServerConnected Echo ok");
     return true;
   }
 }
@@ -317,38 +343,59 @@ class CGetTextBeforeCaretEditSession : public CEditSession {
         pTextRange->ShiftEndToRange(ec, selection.range, TF_ANCHOR_END);
     if (FAILED(hrShift))
       return E_FAIL;
-    // 取 [doc_start, caret] 全文后截尾部 kMaxCtxChars (光标前最近字符)。
-    // 为何不直接用 ShiftStart(-64) 负移 (微软官方标准做法): 实测负移
-    // 返回 0 不移动 — (a) transitory context (Chrome/Firefox/记事本等
-    // 非 TSF-aware 应用) 不 honored 锚点移动; (b) 起点已在 doc_start 时
-    // 向左移被文档边界 clamp。GetText(NULL) 查询长度未文档化, 不可依赖。
-    // 大块 GetText (TF_TF_MOVESTART 推进起点): 短文档一次取完 (got < 块
-    // 大小即到底), 超长文档才追加下一块 — 调用次数不随文档长度线性增长,
-    // 瓶颈仅为不可避免的单次 O(n) 拷贝 (TSF 无"从尾部取 N 字符"API)。
-    // 防死循环: Office/WPS 等完整 TSF 实现可能不 honored TF_TF_MOVESTART
-    // (与 ShiftStart 负移同类问题, 2026-08-11 实测发现: Office/WPS 直接英文
-    // 上屏 = EditSession 永不返回 → TSF 线程挂起 → 输入法失效)。
-    // 若起点不推进, got 恒 = 块大小, 无限循环; 加迭代上限 128 (≤1MB 文本,
-    // 截尾 64 字符绰绰有余), 超限放弃本轮采集 (上下文缺失不影响打字)。
+    // 主路径: ShiftStart(-64) 负移 (微软官方标准做法, O(1) 轻量, TSF-aware
+    // 应用 (Office/WPS/完整 TSF 实现) 下直接拿到光标前 ≤64 字符)。
+    // 判据: 负移后起点 ≠ 文档起点 = 真的移动了 (transitory context 不
+    // honored 锚点移动 / 起点已在 doc_start 被边界 clamp 时不移动)
+    // → 回退 MOVESTART 大块方案。
+    // 08-11 教训: Office/WPS 中 ShiftStart 负移不移动但不挂起; 挂起的是
+    // MOVESTART 不被 honored 时的死循环 — 兜底方案有迭代上限防挂起。
     const ULONG kChunk = 8192;
     const int kMaxIter = 128;
     std::wstring text;
-    std::vector<WCHAR> chunk(kChunk);
-    for (int iter = 0; iter < kMaxIter; ++iter) {
-      ULONG got = 0;
-      HRESULT hrText = pTextRange->GetText(ec, TF_TF_MOVESTART, chunk.data(),
-                                           kChunk, &got);
-      if (FAILED(hrText)) {
-        return E_FAIL;
+    bool used_neg_shift = false;
+    {
+      com_ptr<ITfRange> pNeg;
+      if (pStart->Clone(&pNeg) == S_OK) {
+        HRESULT hrNeg = pNeg->ShiftStart(ec, -kMaxCtxChars, nullptr, nullptr);
+        BOOL equalStart = TRUE;
+        pNeg->IsEqualStart(ec, pStart.p, TF_ANCHOR_START, &equalStart);
+        if (SUCCEEDED(hrNeg) && !equalStart) {
+          WCHAR buf[128] = {0};
+          ULONG got = 0;
+          if (pNeg->GetText(ec, 0, buf, 128, &got) == S_OK && got > 0) {
+            text.assign(buf, (size_t)(got < (ULONG)kMaxCtxChars
+                                          ? got
+                                          : (ULONG)kMaxCtxChars));
+            used_neg_shift = true;
+          }
+        }
       }
-      if (got == 0)
-        break;
-      text.append(chunk.data(), got);
-      if (got < kChunk)
-        break;
     }
-    if ((int)text.size() > kMaxCtxChars)
-      text = text.substr(text.size() - kMaxCtxChars);
+    if (!used_neg_shift) {
+      // 兜底: 大块 GetText (TF_TF_MOVESTART 推进起点), 全文后截尾部
+      // kMaxCtxChars (光标前最近字符)。短文档一次取完 (got < 块大小即
+      // 到底), 超长文档才追加下一块。防死循环: 起点不推进时 got 恒 =
+      // 块大小 → 迭代上限 128 (≤1MB, 截尾 64 绰绰有余), 超限放弃本轮。
+      std::vector<WCHAR> chunk(kChunk);
+      for (int iter = 0; iter < kMaxIter; ++iter) {
+        ULONG got = 0;
+        HRESULT hrText = pTextRange->GetText(ec, TF_TF_MOVESTART, chunk.data(),
+                                             kChunk, &got);
+        if (FAILED(hrText)) {
+          return E_FAIL;
+        }
+        if (got == 0)
+          break;
+        text.append(chunk.data(), got);
+        if (got < kChunk)
+          break;
+      }
+      if ((int)text.size() > kMaxCtxChars)
+        text = text.substr(text.size() - kMaxCtxChars);
+    }
+    TSFDbgLog(L"CtxEditSession done chars=%d neg_shift=%d", (int)text.size(),
+              (int)used_neg_shift);
     _pTextService->_OnContextTextReady(text, immediate_);
     return S_OK;
   }
@@ -358,6 +405,7 @@ class CGetTextBeforeCaretEditSession : public CEditSession {
 };
 
 void WeaselTSF::_RequestContextText(ITfContext* pContext, bool immediate) {
+  TSFDbgLog(L"RequestContextText immediate=%d", (int)immediate);
   if (!pContext)
     return;
   com_ptr<CGetTextBeforeCaretEditSession> pEditSession(
@@ -400,11 +448,18 @@ void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate) {
     spawn = true;
   }
   if (spawn) {
-    std::thread([this, immediate]() {
+    std::thread([this, immediate, utf8]() {
       // 提交路径 (immediate): 提交后立即发送, 下一词首键前上文已到位
       // (第二词重排用 TSF 上文而非历史回退); 普通文档变化保持 100ms
       // 合并 (CEF 类应用启动/滚动风暴防护)。
-      std::this_thread::sleep_for(std::chrono::milliseconds(immediate ? 0 : 100));
+      // 空文本 (光标前无字符) 延长到 800ms: 打字期间 TSF 的 selection-change
+      // 会频繁触发采集且瞬间 selection 未稳定 → 拿到 transient 空 (chars=0)
+      // → 立即发送会覆盖服务端正常文本 (实测词 2 变历史/词 3 无标记)。
+      // 800ms 窗口内新文本 (提交/文档变化采集) 会覆盖 pending, 真空
+      // (光标真在开头) 800ms 后仍空才送达 (WPS 的 transient 空窗口
+      // 比记事本更长, 2026-08-14 实测 TSF/历史交叉, 延长窗口减少误送达)。
+      int delay = immediate ? 0 : (utf8.empty() ? 800 : 100);
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay));
       for (;;) {
         std::string send;
         {
@@ -412,8 +467,11 @@ void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate) {
           send = m_ctx_pending;
           m_ctx_last_sent = send;
         }
-        if (!send.empty())
-          m_client.SetContextText(send);
+        // 空文本有语义 ("光标前无文本"): 必须发送, 否则服务端缓存
+        // 保持旧文本 → 光标移到开头仍用旧上文重排 (2026-08-13 实测)。
+        // SetContextText 空 body 服务端转 set_context_text("")
+        // → 清缓存 + gen++ (librime 侧), 去重靠服务端 t==g_context_text。
+        m_client.SetContextText(send);
         {
           std::lock_guard<std::mutex> lock(m_ctx_debounce_mutex);
           if (m_ctx_pending == m_ctx_last_sent) {

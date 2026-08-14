@@ -22,6 +22,10 @@
 void DllAddRef();
 void DllRelease();
 
+// 诊断日志: 写 %TEMP%\weasel_tsf_dbg.log (每行 flush, 挂起时最后一行可见)
+// 格式: [tick] [pid.tid] msg  -- 用于定位 TSF 挂起/卡死位置
+void TSFDbgLog(const wchar_t* fmt, ...);
+
 extern HINSTANCE g_hInst;
 
 extern LONG g_cRefDll;

@@ -941,11 +941,6 @@ bool WeaselPanel::_DrawCandidates(CDCHandle& dc, bool back) {
       // Draw comment
       std::wstring comment = comments.at(i).str;
       if (!comment.empty() && COLORNOTTRANSPARENT(comment_text_color)) {
-        // LLM AI 首选标记 (rime-llm-ime): 高亮候选 comment 含 "AI·" 时用强调色
-        if (i == m_ctx.cinfo.highlighted &&
-            comment.find(L"AI·") != std::wstring::npos &&
-            COLORNOTTRANSPARENT(m_style.ai_comment_text_color))
-          comment_text_color = m_style.ai_comment_text_color;
         rect = m_layout->GetCandidateCommentRect((int)i);
         if (m_istorepos)
           rect.OffsetRect(0, m_offsetys[i]);

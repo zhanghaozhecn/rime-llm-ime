@@ -15,6 +15,25 @@ using namespace boost;
       throw err;                         \
   }
 
+// 诊断日志 (与 WeaselTSF 的 TSFDbgLog 写同一文件, 独立实现避免跨项目依赖)
+static void PipeDbgLog(const wchar_t* fmt, ...) {
+  wchar_t buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  _vsnwprintf_s(buf, _countof(buf), _TRUNCATE, fmt, ap);
+  va_end(ap);
+  wchar_t path[MAX_PATH];
+  ExpandEnvironmentStringsW(L"%TEMP%\\weasel_tsf_dbg.log", path,
+                            _countof(path));
+  FILE* f = _wfopen(path, L"a");
+  if (f) {
+    fwprintf(f, L"[%llu] [%lu.%lu] %s\n",
+             (unsigned long long)GetTickCount64(), GetCurrentProcessId(),
+             GetCurrentThreadId(), buf);
+    fclose(f);
+  }
+}
+
 PipeChannelBase::PipeChannelBase(std::wstring&& pn_cmd,
                                  size_t bs = 4 * 1024,
                                  SECURITY_ATTRIBUTES* s = NULL)
@@ -28,10 +47,14 @@ bool PipeChannelBase::_Ensure() {
   try {
     HANDLE* phandle = _GetPipeHandle();
     if (_Invalid(*phandle)) {
+      PipeDbgLog(L"Pipe Ensure: connect begin");
       *phandle = _Connect(pname.c_str());
+      PipeDbgLog(L"Pipe Ensure: connect done ok=%d",
+                 (int)!_Invalid(*phandle));
       return !_Invalid(*phandle);
     }
   } catch (...) {
+    PipeDbgLog(L"Pipe Ensure: exception");
     return false;
   }
 
@@ -40,8 +63,14 @@ bool PipeChannelBase::_Ensure() {
 
 HANDLE PipeChannelBase::_Connect(const wchar_t* name) {
   HANDLE pipe = INVALID_HANDLE_VALUE;
-  while (_Invalid(pipe = _TryConnect()))
+  int iter = 0;
+  while (_Invalid(pipe = _TryConnect())) {
+    if (iter++ % 5 == 0)
+      PipeDbgLog(L"Pipe Connect: retry iter=%d err=%d", iter,
+                 (int)GetLastError());
     ::WaitNamedPipe(name, 500);
+  }
+  PipeDbgLog(L"Pipe Connect: connected");
   DWORD mode = PIPE_READMODE_MESSAGE;
   if (!SetNamedPipeHandleState(pipe, &mode, NULL, NULL)) {
     _ThrowLastError;

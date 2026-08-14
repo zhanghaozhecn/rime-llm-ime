@@ -1411,11 +1411,6 @@ static bool _UpdateUIStyleColor(RimeConfig* config,
     COLOR("hilited_comment_text_color", style.hilited_comment_text_color,
           style.hilited_label_text_color);
     COLOR("hilited_mark_color", style.hilited_mark_color, 0);
-    // LLM AI 首选标记色 (rime-llm-ime): 默认金色, 未配置时高亮候选
-    // comment 含 "AI·" 仍用 hilited_comment_text_color (透明=不生效)
-    // 注意: fallback 不经过 color_format 转换, 需按 ABGR 字节序 (AABBGGRR)
-    // 金色 R=E8 G=B8 B=00 → 0xFF00B8E8 (写 0xFFE8B800 会错位成蓝青色)
-    COLOR("ai_comment_text_color", style.ai_comment_text_color, 0xFF00B8E8);
 #undef COLOR
     return true;
   }

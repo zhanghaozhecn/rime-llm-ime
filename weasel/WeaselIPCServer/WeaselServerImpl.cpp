@@ -174,6 +174,10 @@ int ServerImpl::Run() {
   // auto listener = boost::bind(&PipeServer::Listen, channel.get(), handler);
   //
   auto listener = [this](PipeMessage msg, PipeServer::Respond resp) -> void {
+    // 消息处理串行化 (2026-08-13): ① librime session 非线程安全,
+    // 多连接线程并发调 rime API 竞态 (实测 server 行为异常); ② 旧版
+    // PipeChannel 共享 buffer 的多线程竞争消除 (rime-build 基线同款锁)
+    std::lock_guard guard(g_api_mutex);
     HandlePipeMessage(msg, resp);
   };
   pipeThread = std::make_unique<boost::thread>(
@@ -351,20 +355,25 @@ DWORD ServerImpl::OnSetContextText(WEASEL_IPC_COMMAND uMsg,
                                    DWORD lParam) {
   // body: 宽字符 (wbufferstream 写入), 转 UTF-8 存入 librime 上下文缓存
   size_t len = lParam;
-  if (len > 0 && len <= 4096 * sizeof(wchar_t)) {
-    wchar_t* wbuf = reinterpret_cast<wchar_t*>(channel->SendBuffer());
-    if (wbuf) {
+  if (len <= 4096 * sizeof(wchar_t)) {
+    std::string text;
+    if (len > 0) {
+      wchar_t* wbuf = reinterpret_cast<wchar_t*>(channel->SendBuffer());
+      if (!wbuf)
+        return 0;
       std::wstring wtext(wbuf, len / sizeof(wchar_t));
       int ulen = WideCharToMultiByte(CP_UTF8, 0, wtext.c_str(),
                                      (int)wtext.size(), NULL, 0, NULL, NULL);
-      std::string text(ulen, '\0');
+      text.resize(ulen);
       WideCharToMultiByte(CP_UTF8, 0, wtext.c_str(), (int)wtext.size(),
                           &text[0], ulen, NULL, NULL);
-      // 存入 librime 上下文缓存, lua 通过 rime_api.get_context_text 读取
-      RimeApi* api = rime_get_api();
-      if (api && api->set_context_text)
-        api->set_context_text(text.c_str());
     }
+    // len==0 = 空文本送达 ("光标前无文本", 文档开头/删空): 仍需传递
+    // set_context_text("") → librime 清缓存 + 递增 reset 代次清 fallback
+    // (2026-08-13: 客户端 flush 空过滤已移除, 空文本现在会送达)
+    RimeApi* api = rime_get_api();
+    if (api && api->set_context_text)
+      api->set_context_text(text.c_str());
   }
   return 0;
 }
@@ -376,7 +385,7 @@ DWORD ServerImpl::OnResetContext(WEASEL_IPC_COMMAND uMsg,
   // llm_filter 的 commit-history fallback 由此从头积累。
   // body: 宽字符 reason (触发场景, 仅日志诊断用), 转 UTF-8 传入
   std::string reason;
-  if (lParam > 0 && lParam <= 128) {
+  if (lParam > 0 && lParam <= 128 * sizeof(wchar_t)) {
     wchar_t* wbuf = reinterpret_cast<wchar_t*>(channel->SendBuffer());
     if (wbuf) {
       std::wstring wtext(wbuf, lParam / sizeof(wchar_t));
@@ -386,6 +395,16 @@ DWORD ServerImpl::OnResetContext(WEASEL_IPC_COMMAND uMsg,
       if (ulen > 0)
         WideCharToMultiByte(CP_UTF8, 0, wtext.c_str(), (int)wtext.size(),
                             &reason[0], ulen, NULL, NULL);
+      // 诊断: 完整 body 验证 (2026-08-13 定位过 "focus:switch" 错位,
+      // 保留文本级日志以便 body 问题一眼定位)
+      char dbg[512];
+      sprintf_s(dbg, "RESET_IPC lParam=%lu reason=[%s]\n", lParam,
+                reason.c_str());
+      if (FILE* f = nullptr;
+          fopen_s(&f, "C:\\Users\\Administrator\\AppData\\Local\\Temp\\weasel_srv_dbg.log", "ab") == 0 && f) {
+        fwrite(dbg, 1, strlen(dbg), f);
+        fclose(f);
+      }
     }
   }
   RimeApi* api = rime_get_api();

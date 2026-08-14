@@ -20,6 +20,7 @@ static BOOL IsRangeCovered(TfEditCookie ec,
 STDAPI WeaselTSF::OnEndEdit(ITfContext* pContext,
                             TfEditCookie ecReadOnly,
                             ITfEditRecord* pEditRecord) {
+  TSFDbgLog(L"OnEndEdit enter");
   BOOL fSelectionChanged;
   IEnumTfRanges* pEnumTextChanges;
   ITfRange* pRange;
@@ -42,6 +43,14 @@ STDAPI WeaselTSF::OnEndEdit(ITfContext* pContext,
           pRangeComposition->Release();
         }
       }
+    } else {
+      // rime-llm-ime: 非 composing 时光标移动 (鼠标点击/导航键/方向键) →
+      // 光标前文本已变, 立即重新采集。TSF 的 EditRecord selection status
+      // 天然感知鼠标操作 (插件版 lua 做不到), 采集幂等 (相同文本不重发)。
+      // 注意 composing 期间不采集: selection 在 composition 内,
+      // 文档起点→光标会包含 composition 插入文本, 污染上文。
+      TSFDbgLog(L"OnEndEdit selection-changed, refresh ctx");
+      _RequestContextText(pContext);
     }
   }
 
