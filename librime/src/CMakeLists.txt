@@ -45,10 +45,12 @@ endif()
 
 set(rime_core_deps
     ${Boost_LIBRARIES}
-    ${Glog_LIBRARY}
     ${YamlCpp_LIBRARY}
     ${CMAKE_THREAD_LIBS_INIT}
     ${rime_optional_deps})
+if(Glog_FOUND)
+  list(APPEND rime_core_deps ${Glog_LIBRARY})
+endif()
 set(rime_dict_deps
     ${LevelDb_LIBRARY}
     ${Marisa_LIBRARY})

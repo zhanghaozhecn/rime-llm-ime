@@ -22,3 +22,15 @@ Desktop.ini
 # bench_threads 运行时生成的结果文件
 bench_threads_result.txt
 scripts/
+
+# bin 目录中的构建产物 (脚本/配置保留跟踪)
+bin/*.dll
+bin/*.exe
+bin/data/
+bin/test_rime.exe
+
+# 测试临时输出
+test_new.txt
+test_old.txt
+server_out.log
+server_err.log

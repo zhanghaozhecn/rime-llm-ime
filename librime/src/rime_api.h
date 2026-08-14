@@ -521,6 +521,11 @@ typedef struct RIME_FLAVORED(rime_api_t) {
   void (*reset_context_text)(const char* reason);
   //! 当前 reset 代次 (llm_filter 消费: 代次变化 = 旧上屏历史作废)
   int (*context_reset_generation)(void);
+  //! 光标前文本最后送达距今的毫秒数 (~0ULL = 从未送达)。
+  //! llm_filter 新鲜度判定: 5s 内送达的 TSF 文本直接可信, 跳过
+  //! "fallback 尾部须在 TSF 文本中"的重合检测 (该判据在光标移动后
+  //! 打词时必然误判——新词不在打词前采集的文本中)
+  unsigned long long (*context_text_age_ms)(void);
   //! 注册光标前文本更新回调 (set_context_text 每次送达时触发,
   //! 用于 llm_filter 在无 commit 的场景 (切窗后/模型加载完成) 预解码上文)
   void (*set_context_changed_callback)(void (*callback)(const char* text));

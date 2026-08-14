@@ -4,6 +4,7 @@
 #include "rime_api.h"
 
 #include <mutex>
+#include <chrono>
 #include <rime/common.h>
 #include <rime/composition.h>
 #include <rime/config.h>
@@ -1014,6 +1015,9 @@ static std::mutex g_context_text_mutex;
 static std::string g_context_text;
 static bool g_context_text_valid = false;  // true once TSF sent anything
 static int g_context_reset_gen = 0;        // bumped on reset (edit keys / focus switch)
+// 最后送达时间 (新鲜度判定: 残留检测的字节重合判据在光标移动后必然误判,
+// 新鲜送达 = TSF 采集链路工作正常, 直接可信)
+static std::chrono::steady_clock::time_point g_context_text_time{};
 static thread_local std::string g_context_text_tls;
 static void (*g_context_changed_cb)(const char* text) = nullptr;
 static void RimeSetContextText(const char* text) {
@@ -1024,10 +1028,16 @@ static void RimeSetContextText(const char* text) {
   if (t == g_context_text)
     return;
   g_context_text = t;
+  g_context_text_time = std::chrono::steady_clock::now();
   // 仅非空送达视为"TSF 采集可用"——空送达 (文档无内容/采集返回空)
   // 保持原状态, 使调用方可回退到上屏历史 (commit_history)
   if (!t.empty())
     g_context_text_valid = true;
+  // 注意: 空文本送达不递增 reset 代次 (2026-08-13 撤回)——打字期间
+  // TSF 的 selection-change 会频繁触发采集且瞬间 selection 未稳定,
+  // 拿到 transient 空 (chars=0) 就清 fallback 会误伤 (实测词 3 无标记)。
+  // "真空上文" (光标持续在开头) 由 llm_filter 判定层用送达年龄区分
+  // (context_text_age_ms: 空持续 >1.5s = 真空 → 不重排)。
   if (g_context_changed_cb)
     g_context_changed_cb(g_context_text.c_str());
 }
@@ -1044,6 +1054,15 @@ static const char* RimeGetContextText() {
 static Bool RimeContextTextValid() {
   std::lock_guard<std::mutex> lock(g_context_text_mutex);
   return g_context_text_valid ? True : False;
+}
+static unsigned long long RimeContextTextAgeMs() {
+  std::lock_guard<std::mutex> lock(g_context_text_mutex);
+  if (g_context_text_time.time_since_epoch().count() == 0)
+    return ~0ULL;  // 从未送达
+  return (unsigned long long)std::chrono::duration_cast<
+      std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                 g_context_text_time)
+      .count();
 }
 static void RimeResetContextText(const char* reason) {
   std::lock_guard<std::mutex> lock(g_context_text_mutex);
@@ -1294,6 +1313,7 @@ RIME_API RIME_FLAVORED(RimeApi) * RIME_FLAVORED(rime_get_api)() {
     s_api.context_text_valid = &RimeContextTextValid;
     s_api.reset_context_text = &RimeResetContextText;
     s_api.context_reset_generation = &RimeContextResetGeneration;
+    s_api.context_text_age_ms = &RimeContextTextAgeMs;
     s_api.set_context_changed_callback = &RimeSetContextChangedCallback;
   }
   return &s_api;

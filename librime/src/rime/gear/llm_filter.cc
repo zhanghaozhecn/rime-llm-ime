@@ -897,31 +897,57 @@ std::pair<std::string, std::string> LlmFilter::GetContextTextPair() const {
   if (api && api->get_context_text) {
     const char *text = api->get_context_text();
     if (text && *text) {
-      // 残留检测: TSF 文本可能属于其他应用——32 位应用（WPS 等）加载
-      // 官方 32 位 TSF（无 LLM 采集代码），librime 的 context_text 残留
-      // 上次采集应用的旧文本（非空）→ 推理会用错上文。commit history
-      // 是当前会话同步累积的（OnCommit sink），正常场景光标前文本必然
-      // 包含最近上屏词；若不包含 → context_text 过期 → 用 fallback。
       std::string hist = CommitHistoryText();
       if (!hist.empty()) {
-        size_t n = std::min<size_t>(8, hist.size());
-        std::string tail = hist.substr(hist.size() - n);
-        if (strstr(text, tail.c_str()) == nullptr)
-          return {hist, "rime"};
+        // 滞后检测 (2026-08-14, WPS): WPS 的 TSF 文本访问只暴露最近
+        // composition 相关文本 (实测连续打 N 个"测试"只采到 2 字符),
+        // 此时 TSF 文本是 fallback 的尾部子串且明显更短 → 用更全的
+        // fallback (标历史, 重排质量反而不降)。
+        size_t tlen = strlen(text);
+        if (tlen * 2 < hist.size() && hist.size() > tlen) {
+          if (hist.compare(hist.size() - tlen, tlen, text) == 0)
+            return {hist, "rime"};
+        }
+        // 新鲜度判定: 5s 内送达的 TSF 文本直接可信——"fallback 尾部须在
+        // TSF 文本中"的重合判据在光标移动后打词时必然误判 (新词在光标后,
+        // 不在打词前采集的文本中)。新鲜送达 = 采集链路工作正常。
+        bool fresh = api->context_text_age_ms &&
+                     api->context_text_age_ms() < 5000;
+        if (!fresh) {
+          // 残留检测: 陈旧 TSF 文本可能属于其他应用——32 位应用（WPS 等）
+          // 加载官方 32 位 TSF（无采集代码），context_text 残留上次采集
+          // 应用的旧文本。commit history 是当前会话同步累积的，正常场景
+          // 光标前文本必然包含最近上屏词；不含 → 过期 → 用 fallback。
+          // 尾部截断须对齐 UTF-8 字符边界 (8 字节按字节切会在汉字中间
+          // 切开 → strstr 恒失败 → 中文尾部恒误判过期, 2026-08-13 实测)
+          size_t n = std::min<size_t>(8, hist.size());
+          size_t start = hist.size() - n;
+          while (start < hist.size() &&
+                 (static_cast<unsigned char>(hist[start]) & 0xC0) == 0x80)
+            ++start;  // 跳过 continuation bytes, 尾部取完整字符
+          std::string tail = hist.substr(start);
+          if (strstr(text, tail.c_str()) == nullptr)
+            return {hist, "rime"};
+        }
       }
       return {text, "tsf"};  // TSF caret text available
     }
     if (api->context_text_valid && api->context_text_valid()) {
       // TSF collection works but the current text is empty. Two cases:
-      //  - genuinely empty (document start / new paragraph) -> no rerank;
-      //  - collection lag: right after a commit the async TSF refresh
-      //    (debounce + IPC) has not landed yet, so the cached text still
-      //    misses the just-committed word. The commit history IS up to
-      //    date (synchronous sink) -> use it as fallback so the next
-      //    candidate window still re-ranks instead of being skipped
-      //    (observed: 2nd word never re-ranked, 3rd word onwards did).
+      //  - transient empty: right after a commit the async TSF refresh
+      //    (debounce + IPC) has not landed yet, or a selection-change
+      //    collection caught an unstable selection → use the commit
+      //    history fallback (synchronous sink) so the candidate window
+      //    still re-ranks (2nd word never re-ranked, 3rd word onwards did);
+      //  - genuinely empty for >1.5s (caret at document start / all
+      //    deleted): the fallback words sit AFTER the caret, they are not
+      //    context → skip rerank (2026-08-13: moving to document start
+      //    still showed AI·历史 badge before this fix).
+      unsigned long long age = api->context_text_age_ms
+                                   ? api->context_text_age_ms()
+                                   : ~0ULL;
       std::string hist = CommitHistoryText();
-      if (!hist.empty())
+      if (age < 1500 && !hist.empty())
         return {hist, "rime"};
       return {"", "tsf"};
     }
