@@ -90,6 +90,20 @@ static std::atomic<int>         g_prep_seq{0};  // request seq, stale requests s
 static long                     g_seq0_gen = 0; // seq0 KV generation: bumped by any decode covering seq0
 static long                     g_prep_gen = 0; // generation at which prep was produced
 
+// ============================================================
+// score result cache: same (ctx, input) reuses the previous rerank
+// (翻页/候选窗重建不重复推理 — 对齐插件版 _G.llm_filter_cache)。
+// 只存评分顺序（候选文本），multi_char_first 分组与 AI 徽章每次按当前
+// 配置重放，改 multi_char_first 后重新部署缓存仍正确。reset 代次变
+// （编辑键/窗口切换）→ 失效；ctx/input 变 → key 不匹配自然失效。
+// engine 线程专用（Apply/Collect 均在引擎线程），无锁。
+// ============================================================
+static bool                      s_cache_valid = false;
+static std::string               s_cache_ctx;
+static std::string               s_cache_input;
+static std::vector<std::string>  s_cache_ranked;  // 评分后的候选文本顺序
+static int                       s_cache_gen = -1; // 缓存建立时的 reset 代次
+
 // Log file: RIME user data dir, single file rime_llm_filter_log.txt
 // (performance lines + per-inference event lines); falls back to %TEMP%.
 // resolve log file path: RIME user data dir + filename, fallback %TEMP%
@@ -267,6 +281,35 @@ static void load_model_async() {
   }).detach();
 }
 
+// release the loaded model (2GB) when rerank is disabled via schema
+// re-deploy. The filter is rebuilt on every deploy; the constructor's
+// enabled=false branch calls this so toggling enabled off actually frees
+// the RAM instead of keeping it resident until process exit.
+static void unload_model() {
+  // filter rebuild can race an in-flight load (async thread); wait for it
+  // to finish before freeing under the lock
+  while (g_loading.load())
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (g_loaded.load() || g_model || g_ctx) {
+    if (g_ctx) {
+      llama_free(g_ctx);
+      g_ctx = nullptr;
+    }
+    if (g_model) {
+      llama_model_free(g_model);
+      g_model = nullptr;
+    }
+    g_vocab = nullptr;
+    g_loaded.store(false);
+    g_prep_ready = false;
+    g_prep_ctx.clear();
+    g_prep_logits.clear();
+    s_cache_valid = false;  // 模型已卸载, 评分结果缓存一并作废
+    log_msg("model unloaded (enabled=false)");
+  }
+}
+
 // ============================================================
 // normalize: a newline (CRLF / LF / CR, all three forms) is a
 // paragraph boundary - only the last paragraph counts as context,
@@ -287,6 +330,55 @@ static std::string normalize_ctx(const std::string& s) {
           t.end());
   return t;
 }
+
+// ============================================================
+// 上文来源判定纯逻辑 (滞后/残留/新鲜度/空文本) — 不依赖引擎与模型,
+// 可独立测试。scripts/test_llm_context.cpp 复制本命名空间做 gold
+// 断言 — 修改判定必须同步测试文件并重跑 (改错会误用 TSF/历史通道)。
+// ============================================================
+namespace ctx_logic {
+
+// 滞后检测 (2026-08-14, WPS): WPS 的 TSF 文本访问只暴露最近 composition
+// 相关文本 (实测连续打 N 个"测试"只采到 2 字符), 此时 TSF 文本是上屏历史
+// 的尾部子串且明显更短 → 用更全的历史 (标 AI·历史, 重排质量反而不降)。
+inline bool lagging(const std::string &tsf, const std::string &hist) {
+  if (tsf.empty() || hist.empty())
+    return false;  // 空文本不在滞后检测范围内 (调用侧已排除非空 TSF)
+  size_t tlen = tsf.size();
+  return tlen * 2 < hist.size() && hist.size() > tlen &&
+         hist.compare(hist.size() - tlen, tlen, tsf) == 0;
+}
+
+// 取 hist 尾部 ≤max_bytes 的完整字符 (UTF-8 边界对齐): 按字节切会在汉字
+// 中间切开 → 子串匹配恒失败 → 中文尾部恒误判 (2026-08-13 实测)。
+inline std::string hist_tail(const std::string &hist, size_t max_bytes) {
+  // std::min<size_t>: 显式模板参数使 min 宏 (windows.h) 不展开 (min 后跟
+  // `<` 非 `(`), 与 GetContextTextPair 原实现一致
+  size_t n = std::min<size_t>(max_bytes, hist.size());
+  size_t start = hist.size() - n;
+  while (start < hist.size() &&
+         (static_cast<unsigned char>(hist[start]) & 0xC0) == 0x80)
+    ++start;  // 跳过 continuation bytes, 取完整字符
+  return hist.substr(start);
+}
+
+// 残留检测: 陈旧 TSF 文本可能属于其他应用 (32 位应用加载官方 TSF 无采集
+// 代码, context_text 残留上次应用旧文本)。commit history 是当前会话同步
+// 累积的, 正常场景光标前文本必然包含最近上屏词 (hist 尾部); 不含 → 过期。
+inline bool stale(const std::string &tsf, const std::string &hist) {
+  std::string tail = hist_tail(hist, 8);
+  return !tail.empty() && tsf.find(tail) == std::string::npos;
+}
+
+// 空文本分类: age<1.5s 且历史非空 → transient empty (commit 后 TSF 异步
+// 刷新未落地 / selection-change 采到不稳定选择) → 用历史兜底让候选窗仍
+// 重排; 否则真空 (光标在文档开头/全删, 历史上屏词在光标后不是上文) → 跳过。
+inline bool transient_empty(const std::string &hist,
+                            unsigned long long age_ms) {
+  return age_ms < 1500 && !hist.empty();
+}
+
+}  // namespace ctx_logic
 
 // ============================================================
 // tokenize
@@ -660,76 +752,126 @@ void LlmRerankTranslation::Collect() {
     // rerank with LLM (ctx_ computed by LlmFilter::Apply: TSF context
     // text, or commit history fallback when TSF is unavailable)
     std::string ctx = normalize_ctx(ctx_);
-    if (ctx != ctx_)  // newline/whitespace differences worth showing
-      log_msg("ctx raw: [%s]", escape_ctx(ctx_).c_str());
-    log_msg("ctx: [%s]", escape_ctx(ctx).c_str());
-    std::vector<llama_token> ctx_ids = tokenize(ctx.c_str());
-    if ((int)ctx_ids.size() >= g_min_tokens) {
-      if ((int)ctx_ids.size() > g_max_ctx_tokens)
-        ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - g_max_ctx_tokens);
 
-      std::vector<std::vector<llama_token>> cand_ids;
-      for (auto &c : candidates_) {
-        auto ids = tokenize(c->text().c_str());
-        if (ids.empty())
-          ids.push_back(0);
-        cand_ids.push_back(ids);
+    // reset generation: edit keys / window switch invalidate cached results
+    // (插件版由 processor 在编辑键时清缓存; 源码版无 lua 层, 用 reset 代次)
+    int gen = 0;
+    if (const RimeApi *api = rime_get_api())
+      if (api->context_reset_generation)
+        gen = api->context_reset_generation();
+    if (gen != s_cache_gen) {
+      s_cache_valid = false;
+      s_cache_gen = gen;
+    }
+
+    bool did_score = false;
+    double ev_ms = 0;
+    std::vector<int> order;  // candidate indices, score desc
+
+    if (s_cache_valid && ctx == s_cache_ctx && input_ == s_cache_input &&
+        !s_cache_ranked.empty()) {
+      // cache hit: 同一 (ctx, input) 的评分结果复用 — 翻页/候选窗重建
+      // 不再跑 S2/S3 (~36ms/次)。缓存只存评分顺序, 多字词分组与徽章按
+      // 当前配置重放; 候选集变化时新候选未命中 → 落到尾部 (与插件版一致)。
+      for (auto &t : s_cache_ranked)
+        for (size_t i = 0; i < candidates_.size(); i++)
+          if (candidates_[i]->text() == t) {
+            order.push_back((int)i);
+            break;
+          }
+    } else {
+      if (ctx != ctx_)  // newline/whitespace differences worth showing
+        log_msg("ctx raw: [%s]", escape_ctx(ctx_).c_str());
+      log_msg("ctx: [%s]", escape_ctx(ctx).c_str());
+      std::vector<llama_token> ctx_ids = tokenize(ctx.c_str());
+      if ((int)ctx_ids.size() >= g_min_tokens) {
+        if ((int)ctx_ids.size() > g_max_ctx_tokens)
+          ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - g_max_ctx_tokens);
+
+        std::vector<std::vector<llama_token>> cand_ids;
+        for (auto &c : candidates_) {
+          auto ids = tokenize(c->text().c_str());
+          if (ids.empty())
+            ids.push_back(0);
+          cand_ids.push_back(ids);
+        }
+
+        std::vector<double> scores;
+        auto ev_t0 = std::chrono::high_resolution_clock::now();
+        score_batch(ctx_ids, cand_ids, scores);
+        auto ev_t1 = std::chrono::high_resolution_clock::now();
+        ev_ms =
+            std::chrono::duration<double, std::milli>(ev_t1 - ev_t0).count();
+
+        if (scores.size() == candidates_.size()) {
+          std::vector<int> ord(scores.size());
+          for (size_t i = 0; i < ord.size(); i++)
+            ord[i] = (int)i;
+          std::sort(ord.begin(), ord.end(),
+                    [&](int a, int b) { return scores[a] > scores[b]; });
+          order = std::move(ord);
+          // store cache: 评分顺序 (候选文本), 命中时按文本重放
+          s_cache_valid = true;
+          s_cache_ctx = ctx;
+          s_cache_input = input_;
+          s_cache_ranked.clear();
+          for (int i : order)
+            s_cache_ranked.push_back(candidates_[i]->text());
+          did_score = true;
+        }
       }
+    }
 
-      std::vector<double> scores;
-      auto ev_t0 = std::chrono::high_resolution_clock::now();
-      score_batch(ctx_ids, cand_ids, scores);
-      auto ev_t1 = std::chrono::high_resolution_clock::now();
-      double ev_ms =
-          std::chrono::duration<double, std::milli>(ev_t1 - ev_t0).count();
-
-      if (scores.size() == candidates_.size()) {
-        // snapshot original order for the event log
-        std::string before;
+    if (!order.empty()) {
+      // 应用顺序 (缓存命中与真实评分共用): 未匹配候选(新候选)落尾部
+      std::vector<an<Candidate>> reranked;
+      std::vector<bool> used(candidates_.size(), false);
+      for (int i : order)
+        if (i >= 0 && (size_t)i < candidates_.size() && !used[i]) {
+          reranked.push_back(candidates_[i]);
+          used[i] = true;
+        }
+      for (size_t i = 0; i < candidates_.size(); i++)
+        if (!used[i])
+          reranked.push_back(candidates_[i]);
+      candidates_ = std::move(reranked);
+      // 多字词优先 (multi_char_first, 与插件版语义一致): 重排后按
+      // "多字(≥2 字) → 单字"分组, 组内保持 LLM 评分序。必须在徽章之前
+      // (徽章加在最终首候选上)。
+      if (g_multi_char_first && candidates_.size() > 1) {
+        std::vector<an<Candidate>> multi, single;
+        for (auto &c : candidates_) {
+          const std::string &t = c->text();
+          size_t n = 0;  // UTF-8 字符数: 数非续字节
+          for (unsigned char ch : t)
+            if ((ch & 0xC0) != 0x80)
+              n++;
+          (n >= 2 ? multi : single).push_back(c);
+        }
+        std::vector<an<Candidate>> grouped;
+        grouped.reserve(candidates_.size());
+        grouped.insert(grouped.end(), multi.begin(), multi.end());
+        grouped.insert(grouped.end(), single.begin(), single.end());
+        candidates_ = std::move(grouped);
+      }
+      // AI 首选徽章: 重排后首候选 comment 追加来源标记 (与已有 comment 合并,
+      // ShadowCandidate 包装避免污染原候选; weasel 端识别 "AI·" 用强调色渲染)
+      if (!candidates_.empty()) {
+        std::string tag = (src_ == "tsf") ? "AI·TSF" : "AI·历史";
+        auto &c0 = candidates_[0];
+        std::string merged =
+            c0->comment().empty() ? tag : c0->comment() + " " + tag;
+        candidates_[0] =
+            New<ShadowCandidate>(c0, c0->type(), string(), merged, false);
+      }
+      // 事件日志仅在真实推理时写 (缓存命中不重复推理, 也省日志 IO)
+      if (did_score) {
+        std::string before, after;
         for (auto &c : candidates_) {
           if (!before.empty())
             before += ",";
           before += c->text();
         }
-        std::vector<int> order(scores.size());
-        for (size_t i = 0; i < order.size(); i++)
-          order[i] = (int)i;
-        std::sort(order.begin(), order.end(),
-                  [&](int a, int b) { return scores[a] > scores[b]; });
-        std::vector<an<Candidate>> reranked;
-        for (int i : order)
-          reranked.push_back(candidates_[i]);
-        candidates_ = reranked;
-        // 多字词优先 (multi_char_first, 与插件版语义一致): 重排后按
-        // "多字(≥2 字) → 单字"分组, 组内保持 LLM 评分序。必须在徽章之前
-        // (徽章加在最终首候选上)。
-        if (g_multi_char_first && candidates_.size() > 1) {
-          std::vector<an<Candidate>> multi, single;
-          for (auto &c : candidates_) {
-            const std::string &t = c->text();
-            size_t n = 0;  // UTF-8 字符数: 数非续字节
-            for (unsigned char ch : t)
-              if ((ch & 0xC0) != 0x80)
-                n++;
-            (n >= 2 ? multi : single).push_back(c);
-          }
-          std::vector<an<Candidate>> grouped;
-          grouped.reserve(candidates_.size());
-          grouped.insert(grouped.end(), multi.begin(), multi.end());
-          grouped.insert(grouped.end(), single.begin(), single.end());
-          candidates_ = std::move(grouped);
-        }
-        // AI 首选徽章: 重排后首候选 comment 追加来源标记 (与已有 comment 合并,
-        // ShadowCandidate 包装避免污染原候选; weasel 端识别 "AI·" 用强调色渲染)
-        if (!candidates_.empty()) {
-          std::string tag = (src_ == "tsf") ? "AI·TSF" : "AI·历史";
-          auto &c0 = candidates_[0];
-          std::string merged =
-              c0->comment().empty() ? tag : c0->comment() + " " + tag;
-          candidates_[0] =
-              New<ShadowCandidate>(c0, c0->type(), string(), merged, false);
-        }
-        std::string after;
         for (auto &c : candidates_) {
           if (!after.empty())
             after += ",";
@@ -801,8 +943,11 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     api2->set_context_changed_callback(&on_context_changed);
   if (g_enabled)
     load_model_async();
-  else
+  else {
     log_msg("config: enabled=false, LLM rerank disabled");
+    // release a previously loaded model: enabled was toggled off via re-deploy
+    unload_model();
+  }
 }
 
 LlmFilter::~LlmFilter() { commit_conn_.disconnect(); }
@@ -929,36 +1074,18 @@ std::pair<std::string, std::string> LlmFilter::GetContextTextPair() const {
     if (text && *text) {
       std::string hist = CommitHistoryText();
       if (!hist.empty()) {
-        // 滞后检测 (2026-08-14, WPS): WPS 的 TSF 文本访问只暴露最近
-        // composition 相关文本 (实测连续打 N 个"测试"只采到 2 字符),
-        // 此时 TSF 文本是 fallback 的尾部子串且明显更短 → 用更全的
-        // fallback (标历史, 重排质量反而不降)。
-        size_t tlen = strlen(text);
-        if (tlen * 2 < hist.size() && hist.size() > tlen) {
-          if (hist.compare(hist.size() - tlen, tlen, text) == 0)
-            return {hist, "rime"};
-        }
+        // 滞后检测 (WPS): TSF 文本是历史尾部子串且明显更短 → 用更全的历史
+        if (ctx_logic::lagging(text, hist))
+          return {hist, "rime"};
         // 新鲜度判定: 5s 内送达的 TSF 文本直接可信——"fallback 尾部须在
         // TSF 文本中"的重合判据在光标移动后打词时必然误判 (新词在光标后,
         // 不在打词前采集的文本中)。新鲜送达 = 采集链路工作正常。
         bool fresh = api->context_text_age_ms &&
                      api->context_text_age_ms() < 5000;
-        if (!fresh) {
-          // 残留检测: 陈旧 TSF 文本可能属于其他应用——32 位应用（WPS 等）
-          // 加载官方 32 位 TSF（无采集代码），context_text 残留上次采集
-          // 应用的旧文本。commit history 是当前会话同步累积的，正常场景
-          // 光标前文本必然包含最近上屏词；不含 → 过期 → 用 fallback。
-          // 尾部截断须对齐 UTF-8 字符边界 (8 字节按字节切会在汉字中间
-          // 切开 → strstr 恒失败 → 中文尾部恒误判过期, 2026-08-13 实测)
-          size_t n = std::min<size_t>(8, hist.size());
-          size_t start = hist.size() - n;
-          while (start < hist.size() &&
-                 (static_cast<unsigned char>(hist[start]) & 0xC0) == 0x80)
-            ++start;  // 跳过 continuation bytes, 尾部取完整字符
-          std::string tail = hist.substr(start);
-          if (strstr(text, tail.c_str()) == nullptr)
-            return {hist, "rime"};
-        }
+        // 残留检测: 陈旧 TSF 文本可能属于其他应用; 光标前文本必然包含最近
+        // 上屏词 (hist 尾部), 不含 → 过期 → 用 fallback
+        if (!fresh && ctx_logic::stale(text, hist))
+          return {hist, "rime"};
       }
       return {text, "tsf"};  // TSF caret text available
     }
@@ -977,7 +1104,7 @@ std::pair<std::string, std::string> LlmFilter::GetContextTextPair() const {
                                    ? api->context_text_age_ms()
                                    : ~0ULL;
       std::string hist = CommitHistoryText();
-      if (age < 1500 && !hist.empty())
+      if (ctx_logic::transient_empty(hist, age))
         return {hist, "rime"};
       return {"", "tsf"};
     }

@@ -30,7 +30,7 @@ rime-llm-ime/
 │   ├── WeaselIPCServer/  # OnSetContextText / OnResetContext handler
 │   └── librime/       # 仅补丁头文件（rime_api.h，LLM 版含 set_context_text 等扩展 API）
 ├── bin/               # 预编译产物 + 部署/验证脚本（见下）
-│   ├── rime.dll / weaselx64.dll / weasel32.dll / WeaselServer.exe / WeaselDeployer.exe / opencc.dll / vcomp140.dll
+│   ├── rime.dll / weaselx64.dll / weasel32.dll / WeaselServer.exe / WeaselDeployer.exe / opencc.dll / vcomp140.dll / bench_threads.exe
 │   ├── deploy_llm.bat          # 一键部署（模型检查 → 组件复制 → WeaselSetup 官方部署 → 注册兜底 → schema 插入）
 │   ├── deploy_llm_model.ps1    # 模型检查/下载（ModelScope，断点续传）
 │   ├── deploy_llm_schema.ps1   # 方案配置插入（llm_filter + llm_rerank 节，幂等，位置校验）
@@ -95,7 +95,7 @@ llm_rerank:
   min_tokens: 1         # 上文 token 数小于此值时不推理
   max_tokens: 10        # 上文 token 上限
   max_candidates: 5     # 参与打分的候选数上限
-  cpu_cores: 4          # 默认线程数（=GGML 默认，适用旧设备；bench_threads.exe 实测后自行修改）
+  cpu_cores: 4          # 默认线程数（=GGML 默认，适用旧设备；用发布包内 bench_threads.exe 实测后自行修改）
   min_free_mem_mb: 2560 # 可用内存低于此值时不加载模型（防小内存机器系统卡死）
   model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
 ```

@@ -42,6 +42,10 @@ scripts/*
 !scripts/test_rime.cpp
 !scripts/build_test_rime.bat
 !scripts/run_test_rime.bat
+!scripts/test_llm_context.cpp
+!scripts/build_test_llm_context.bat
+!scripts/bench_threads.cpp
+!scripts/build_bench_threads.bat
 
 # bin 目录中的构建产物 (脚本/配置保留跟踪)
 bin/*.dll

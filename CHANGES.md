@@ -200,5 +200,33 @@ WPS 自研适配层只暴露最近 composition 文本（连续打字只采到 2 
 
 - **32/64 位双构建**：Win32 平台 → `weasel.dll`（32 位），x64 → `weaselx64.dll`（64 位）；32 位 boost 用 `b2 architecture=x86 address-model=32`（-x32- 后缀库）；`scripts/` 构建链全部 %~dp0 相对化并发布
 - **部署**：WeaselSetup /u + /i 官方流程（双 TSF + 64 位注册）；32 位视图注册失效需手动 `SysWOW64\regsvr32.exe /s` + `TEXTSERVICE_PROFILE=hans`；System32 被锁用 MoveFileEx DELAY_UNTIL_REBOOT
-- **GitHub Releases**：bin 二进制不进 git，发布走 tag + Releases 部署包 zip（`rime-llm-deploy-*.zip`：6 二进制 + 4 脚本，`deploy_llm.bat` 7 步一键部署）
+- **GitHub Releases**：bin 二进制不进 git，发布走 tag + Releases 部署包 zip（`rime-llm-deploy-*.zip`：7 二进制含 bench_threads.exe + 4 脚本，`deploy_llm.bat` 7 步一键部署）
 - **测试工具**：`scripts/test_ipc.ps1`（IPC 直发验证）、`scripts/test_rime.cpp`（LoadLibrary 冒烟，从 bin 运行）、`scripts/tsf_switch.ps1`（注册表切换测试 DLL 免重启）
+
+---
+
+## 七、2026-08-16 优化记录
+
+### 1. score 结果缓存（翻页/候选窗重建不重复推理）
+
+对齐插件版 `_G.llm_filter_cache`：`Collect()` 缓存「(ctx, input) → 评分顺序（候选文本）」，
+同一编码 + 同文的重排直接复用，不再跑 S2/S3 候选 decode（~36ms/次）。
+- 只存评分顺序，`multi_char_first` 分组与 AI 徽章每次按当前配置重放（改配置后缓存仍正确）
+- 失效：reset 代次变（编辑键/窗口切换）→ 缓存作废；ctx/input 变 → key 不匹配自然失效
+- 事件日志仅真实推理时写（缓存命中省日志 IO）
+
+### 2. 上文来源判定纯逻辑 + 回归测试
+
+`GetContextTextPair` 的判定（滞后检测/残留检测/空文本分类/UTF-8 边界对齐）抽取为
+`ctx_logic` 命名空间（不依赖引擎/模型），新增 `scripts/test_llm_context.cpp` 复制同函数
+做 20 个 gold 断言（`scripts/build_test_llm_context.bat` 编译运行）。改判定必须同步测试。
+
+### 3. enabled=false 释放模型
+
+filter 重建（重新部署）时 enabled=false 分支调用 `unload_model()` 释放已加载模型
+（WeaselServer ~2GB），不再常驻到进程退出。加 `lagging` 空串防御（生产调用侧已排除空 TSF）。
+
+### 4. bench_threads.exe 入发布包
+
+`scripts/bench_threads.cpp`（自插件版同源）+ `scripts/build_bench_threads.bat`（LLAMA_ROOT 环境变量，
+默认 `D:/llama.cpp-mirror`）；预编译 exe 进 Releases 部署包 zip（7 二进制）。
