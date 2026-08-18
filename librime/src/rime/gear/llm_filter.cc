@@ -381,6 +381,17 @@ inline bool transient_empty(const std::string &hist,
 }  // namespace ctx_logic
 
 // ============================================================
+// UTF-8 字符数（数非续字节 0x10xxxxxx）— 用于 long-word-first 词长排序
+// ============================================================
+static size_t utf8_len(const std::string &s) {
+  size_t n = 0;
+  for (unsigned char ch : s)
+    if ((ch & 0xC0) != 0x80)
+      n++;
+  return n;
+}
+
+// ============================================================
 // tokenize
 // ============================================================
 static std::vector<llama_token> tokenize(const char *text) {
@@ -835,24 +846,16 @@ void LlmRerankTranslation::Collect() {
         if (!used[i])
           reranked.push_back(candidates_[i]);
       candidates_ = std::move(reranked);
-      // 多字词优先 (multi_char_first, 与插件版语义一致): 重排后按
-      // "多字(≥2 字) → 单字"分组, 组内保持 LLM 评分序。必须在徽章之前
-      // (徽章加在最终首候选上)。
+      // long-word-first (multi_char_first): 候选算完 CE 后按词长降序排序,
+      // 同词长保持 CE 评分序。改为"完整按词长降序"(不再只分>2字/单字两组)——
+      // 用稳定排序, 键=词长降序, 同词长因 stable_sort 保持原(CE 序)。
+      // 真实评分与缓存命中共用: 此处 candidates_ 已是 CE 序 (reranked 由
+      // order 应用而来), 稳定排序保证同词长按 CE 序。徽章加在最终首候选上。
       if (g_multi_char_first && candidates_.size() > 1) {
-        std::vector<an<Candidate>> multi, single;
-        for (auto &c : candidates_) {
-          const std::string &t = c->text();
-          size_t n = 0;  // UTF-8 字符数: 数非续字节
-          for (unsigned char ch : t)
-            if ((ch & 0xC0) != 0x80)
-              n++;
-          (n >= 2 ? multi : single).push_back(c);
-        }
-        std::vector<an<Candidate>> grouped;
-        grouped.reserve(candidates_.size());
-        grouped.insert(grouped.end(), multi.begin(), multi.end());
-        grouped.insert(grouped.end(), single.begin(), single.end());
-        candidates_ = std::move(grouped);
+        std::stable_sort(candidates_.begin(), candidates_.end(),
+                         [](const an<Candidate> &a, const an<Candidate> &b) {
+                           return utf8_len(a->text()) > utf8_len(b->text());
+                         });
       }
       // AI 首选徽章: 重排后首候选 comment 追加来源标记 (与已有 comment 合并,
       // ShadowCandidate 包装避免污染原候选; weasel 端识别 "AI·" 用强调色渲染)
