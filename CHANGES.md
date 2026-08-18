@@ -22,7 +22,7 @@ llm_rerank:
   enabled: true         # true=启用 LLM 重排 | false=关闭（组件透传，不推理）
   min_code_len: 4       # 输入编码长度小于此值时不重排
   max_code_len: 0       # 编码长度上限（0=不限制）；超出不推理，与 min_code_len 组成触发区间
-  multi_char_first: false # true=long-word-first: 候选算完 CE 后按词长降序, 同词长按 CE 评分序
+  long_word_first: false # true=long-word-first: 候选算完 CE 后按词长降序, 同词长按 CE 评分序
   min_tokens: 1         # 上文 token 数小于此值时不推理
   max_tokens: 10        # 上文 token 上限
   max_candidates: 5     # 参与打分的候选数上限
@@ -186,7 +186,7 @@ WPS 自研适配层只暴露最近 composition 文本（连续打字只采到 2 
 
 ### 3. 参数对齐（插件版 → 源码版）
 
-`max_code_len`（触发区间上限，0=不限制）+ `multi_char_first`（long-word-first：候选算完 CE 后按词长降序，同词长按 CE 评分序）。
+`max_code_len`（触发区间上限，0=不限制）+ `long_word_first`（long-word-first：候选算完 CE 后按词长降序，同词长按 CE 评分序）。
 
 ### 4. 关键 bug 修复
 
@@ -211,7 +211,7 @@ WPS 自研适配层只暴露最近 composition 文本（连续打字只采到 2 
 
 对齐插件版 `_G.llm_filter_cache`：`Collect()` 缓存「(ctx, input) → 评分顺序（候选文本）」，
 同一编码 + 同文的重排直接复用，不再跑 S2/S3 候选 decode（~36ms/次）。
-- 只存评分顺序，`multi_char_first` long-word-first 排序与 AI 徽章每次按当前配置重放（改配置后缓存仍正确）
+- 只存评分顺序，`long_word_first` long-word-first 排序与 AI 徽章每次按当前配置重放（改配置后缓存仍正确）
 - 失效：reset 代次变（编辑键/窗口切换）→ 缓存作废；ctx/input 变 → key 不匹配自然失效
 - 事件日志仅真实推理时写（缓存命中省日志 IO）
 

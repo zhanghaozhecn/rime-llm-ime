@@ -50,13 +50,13 @@ static std::atomic<bool> g_loading{false};
 //   min_code_len: input code length below this -> no rerank
 //   max_code_len: input code length above this -> no rerank (0 = unlimited);
 //                 [min, max] = rerank trigger window
-//   multi_char_first: true = after rerank, group multi-char (>=2 chars) words
-//                 before single chars, keeping LLM score order within groups
+//   long_word_first: true = after rerank, sort by word length desc
+//                      (same length keeps CE order)
 static std::string g_model_path = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static bool g_enabled = false;  // CPU only; GPU build retired (not published)
 static int g_min_code_len = 4;
 static int g_max_code_len = 0;  // 0 = no upper limit (plugin-version parity)
-static bool g_multi_char_first = false;
+static bool g_long_word_first = false;
 static int g_min_tokens = 1;
 static int g_max_ctx_tokens = 10;  // tok=10: 93.4% acc, 10->17 gains only +1.1pp
 static int g_n_threads = 4;        // default = GGML_DEFAULT_N_THREADS; override via cpu_cores
@@ -93,8 +93,8 @@ static long                     g_prep_gen = 0; // generation at which prep was 
 // ============================================================
 // score result cache: same (ctx, input) reuses the previous rerank
 // (翻页/候选窗重建不重复推理 — 对齐插件版 _G.llm_filter_cache)。
-// 只存评分顺序（候选文本），multi_char_first 分组与 AI 徽章每次按当前
-// 配置重放，改 multi_char_first 后重新部署缓存仍正确。reset 代次变
+// 只存评分顺序（候选文本），long_word_first 排序与 AI 徽章每次按当前
+// 配置重放，改 long_word_first 后重新部署缓存仍正确。reset 代次变
 // （编辑键/窗口切换）→ 失效；ctx/input 变 → key 不匹配自然失效。
 // engine 线程专用（Apply/Collect 均在引擎线程），无锁。
 // ============================================================
@@ -846,12 +846,12 @@ void LlmRerankTranslation::Collect() {
         if (!used[i])
           reranked.push_back(candidates_[i]);
       candidates_ = std::move(reranked);
-      // long-word-first (multi_char_first): 候选算完 CE 后按词长降序排序,
+      // long-word-first (long_word_first): 候选算完 CE 后按词长降序排序,
       // 同词长保持 CE 评分序。改为"完整按词长降序"(不再只分>2字/单字两组)——
       // 用稳定排序, 键=词长降序, 同词长因 stable_sort 保持原(CE 序)。
       // 真实评分与缓存命中共用: 此处 candidates_ 已是 CE 序 (reranked 由
       // order 应用而来), 稳定排序保证同词长按 CE 序。徽章加在最终首候选上。
-      if (g_multi_char_first && candidates_.size() > 1) {
+      if (g_long_word_first && candidates_.size() > 1) {
         std::stable_sort(candidates_.begin(), candidates_.end(),
                          [](const an<Candidate> &a, const an<Candidate> &b) {
                            return utf8_len(a->text()) > utf8_len(b->text());
@@ -911,7 +911,7 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
       g_min_code_len = v;
     if (config->GetInt("llm_rerank/max_code_len", &v))
       g_max_code_len = v;
-    config->GetBool("llm_rerank/multi_char_first", &g_multi_char_first);
+    config->GetBool("llm_rerank/long_word_first", &g_long_word_first);
     if (config->GetInt("llm_rerank/min_tokens", &v))
       g_min_tokens = v;
     if (config->GetInt("llm_rerank/max_tokens", &v))
@@ -928,11 +928,11 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     if (hw > 0 && (unsigned)g_n_threads > hw)
       g_n_threads = (int)hw;
     log_msg("config: enabled=%d min_code_len=%d max_code_len=%d "
-            "multi_char_first=%d min_tokens=%d "
+            "long_word_first=%d min_tokens=%d "
             "max_tokens=%d max_candidates=%d cpu_cores=%d "
             "min_free_mem_mb=%d model=%s",
             g_enabled ? 1 : 0, g_min_code_len, g_max_code_len,
-            g_multi_char_first ? 1 : 0, g_min_tokens,
+            g_long_word_first ? 1 : 0, g_min_tokens,
             g_max_ctx_tokens, g_max_candidates, g_n_threads,
             g_min_free_mem_mb, g_model_path.c_str());
   }

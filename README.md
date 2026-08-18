@@ -91,7 +91,7 @@ llm_rerank:
   enabled: true         # true=启用 LLM 重排 | false=关闭（组件透传，不推理）
   min_code_len: 4       # 输入编码长度小于此值时不重排
   max_code_len: 0       # 编码长度上限（0=不限制）；超出不推理，与 min_code_len 组成触发区间
-  multi_char_first: false # true=long-word-first: 候选算完 CE 后按词长降序, 同词长按 CE 评分序
+  long_word_first: false # true=long-word-first: 候选算完 CE 后按词长降序, 同词长按 CE 评分序
   min_tokens: 1         # 上文 token 数小于此值时不推理
   max_tokens: 10        # 上文 token 上限
   max_candidates: 5     # 参与打分的候选数上限
@@ -126,7 +126,7 @@ llm_rerank:
 librime 侧（`gear/llm_filter.cc`，新增组件）：
 - 上文来源自适应（`GetContextTextPair`）：TSF 文本优先；TSF 文本空/滞后 → commit history 兜底（提交后同步累积，必有最近上屏词）；**残留检测**——TSF 文本不含 commit history 尾部（最近上屏词）时判为其他应用残留，改用历史
 - 预解码（`prepare`）：commit/上下文变化后异步 decode 上文，score 命中复用 KV
-- 触发区间 `[min_code_len, max_code_len]`（0=不限制）+ 重排后 `multi_char_first` long-word-first 排序（与插件版参数对齐）
+- 触发区间 `[min_code_len, max_code_len]`（0=不限制）+ 重排后 `long_word_first` long-word-first 排序（与插件版参数对齐）
 
 ### 构建步骤
 
@@ -200,7 +200,7 @@ score: wait=12ms S1=48ms KV=3ms S2=9ms total=72ms prep=1 ctx_tok=9 cand=5
 ctx: [上文]              # 推理时用的上文（normalize 后）
 ctx raw: [原始上文]       # normalize 前后不一致时记录原始值
 RESET: context cleared (gen=N reason=...)   # TSF 上下文被清空（编辑键/切窗）
-config: enabled=1 min_code_len=4 max_code_len=0 multi_char_first=0 ...   # 部署/会话启动时的配置
+config: enabled=1 min_code_len=4 max_code_len=0 long_word_first=0 ...   # 部署/会话启动时的配置
 ```
 
 事件日志（`时间|计数|编码|候选|上文|排序后候选|延迟|来源`）用于选词质量排查。
