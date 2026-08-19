@@ -1024,9 +1024,13 @@ static void RimeSetContextText(const char* text) {
   std::lock_guard<std::mutex> lock(g_context_text_mutex);
   std::string t = text ? text : "";
   // 去重: CEF 类应用文档更新极频繁, 相同文本重复送达不触发
-  // context-changed 回调 (避免 Server 端 prepare 风暴)
-  if (t == g_context_text)
+  // context-changed 回调 (避免 Server 端 prepare 风暴)。但时间戳要
+  // 刷新 (2026-08-18): 新鲜度按"最后送达"算, 重复送达 = 采集链路刚
+  // 证明存活, 不刷新会让 5s 新鲜窗口对刚重发的文本提前过期。
+  if (t == g_context_text) {
+    g_context_text_time = std::chrono::steady_clock::now();
     return;
+  }
   g_context_text = t;
   g_context_text_time = std::chrono::steady_clock::now();
   // 仅非空送达视为"TSF 采集可用"——空送达 (文档无内容/采集返回空)

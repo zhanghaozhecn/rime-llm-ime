@@ -36,7 +36,7 @@ rime-llm-ime/
 │   ├── deploy_llm_schema.ps1   # 方案配置插入（llm_filter + llm_rerank 节，幂等，位置校验）
 │   └── verify_deploy.bat       # 部署验证（与源包自动对比 md5）
 ├── scripts/           # 构建/部署/测试脚本（发布清单，见"从源码构建"）
-└── CHANGES.md         # 变更记录
+└── deploy/            # 发布部署包打包目录（gitignore，不进 git）
 ```
 
 > 方案（`pdsp.schema.yaml`）不在本仓库——部署脚本在 RIME 用户目录的方案中幂等插入 `llm_filter` 组件与 `llm_rerank` 配置节。

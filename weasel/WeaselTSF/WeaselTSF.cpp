@@ -327,6 +327,10 @@ class CGetTextBeforeCaretEditSession : public CEditSession {
     if (FAILED(hrSel) || nSelection == 0) {
       return E_FAIL;
     }
+    // GetSelection 返回的 range 引用归调用方 (原实现未 Release, 每次采集
+    // 泄漏一个 range 对象 — 21649 次采集即泄漏 21649 个); Attach 接管
+    com_ptr<ITfRange> pCaret;
+    pCaret.Attach(selection.range);
     // 只取光标前最近 kMaxCtxChars 字符 (LLM 上文 20 token x 1-2 字/token
     // = 40 字, 64 绰绰有余; 长文档时取开头而非光标前是错误的)
     const LONG kMaxCtxChars = 64;
@@ -340,26 +344,34 @@ class CGetTextBeforeCaretEditSession : public CEditSession {
       return E_FAIL;
     // 文档起点 → 光标 (selection.range 是光标处的空 range)
     HRESULT hrShift =
-        pTextRange->ShiftEndToRange(ec, selection.range, TF_ANCHOR_END);
+        pTextRange->ShiftEndToRange(ec, pCaret.p, TF_ANCHOR_END);
     if (FAILED(hrShift))
       return E_FAIL;
-    // 主路径: ShiftStart(-64) 负移 (微软官方标准做法, O(1) 轻量, TSF-aware
-    // 应用 (Office/WPS/完整 TSF 实现) 下直接拿到光标前 ≤64 字符)。
-    // 判据: 负移后起点 ≠ 文档起点 = 真的移动了 (transitory context 不
-    // honored 锚点移动 / 起点已在 doc_start 被边界 clamp 时不移动)
-    // → 回退 MOVESTART 大块方案。
-    // 08-11 教训: Office/WPS 中 ShiftStart 负移不移动但不挂起; 挂起的是
-    // MOVESTART 不被 honored 时的死循环 — 兜底方案有迭代上限防挂起。
+    // 主路径: 克隆光标 range → ShiftStart 负移 ≤64 字符 → [光标-64, 光标]
+    // (微软官方标准做法, O(1) 轻量, TSF-aware 应用 (Office/WPS/完整 TSF
+    // 实现) 下直接拿到光标前 ≤64 字符)。判据: 负移后起点 ≠ 原光标起点 =
+    // 真的移动了 (transitory context 不 honored 锚点移动 / 光标已在文档
+    // 开头被边界 clamp 时不移动) → 回退 MOVESTART 大块方案。
+    // 2026-08-18 修复: 原实现克隆的是 pStart (文档起点), 从文档起点向负
+    // 方向移动永远被钳住 → IsEqualStart 恒真 → 主路径从未生效 (日志
+    // 20379/20379 次 neg_shift=0), 全部走 O(全文) 大块兜底 (采集更慢更
+    // 易被拒: 8.4% 编辑会话静默丢弃; >1MB 文档取到错误文本)。负移的
+    // 对象必须是光标 range, 不是文档起点。
     const ULONG kChunk = 8192;
     const int kMaxIter = 128;
     std::wstring text;
     bool used_neg_shift = false;
     {
       com_ptr<ITfRange> pNeg;
-      if (pStart->Clone(&pNeg) == S_OK) {
-        HRESULT hrNeg = pNeg->ShiftStart(ec, -kMaxCtxChars, nullptr, nullptr);
+      if (pCaret->Clone(&pNeg) == S_OK) {
+        // pcch 必须传实参: 传 nullptr 时 msctf 实现疑似 E_POINTER
+        // (250/250 neg_shift=0 的疑因 — 与克隆对象修复无关, 新旧代码
+        // 同款写法, 恰好掩盖了 pStart→pCaret 修复的效果)
+        LONG cchMoved = 0;
+        HRESULT hrNeg =
+            pNeg->ShiftStart(ec, -kMaxCtxChars, &cchMoved, nullptr);
         BOOL equalStart = TRUE;
-        pNeg->IsEqualStart(ec, pStart.p, TF_ANCHOR_START, &equalStart);
+        pNeg->IsEqualStart(ec, pCaret.p, TF_ANCHOR_START, &equalStart);
         if (SUCCEEDED(hrNeg) && !equalStart) {
           WCHAR buf[128] = {0};
           ULONG got = 0;
@@ -369,6 +381,11 @@ class CGetTextBeforeCaretEditSession : public CEditSession {
                                           : (ULONG)kMaxCtxChars));
             used_neg_shift = true;
           }
+        } else {
+          // 诊断: 负移未生效的具体原因 (hr 失败 / 起点未移动=光标在文档
+          // 开头属正常)。一次采集一行, 与既有日志量级相同
+          TSFDbgLog(L"CtxNegShift fallback hr=0x%08X eq=%d",
+                    (unsigned)hrNeg, (int)equalStart);
         }
       }
     }
@@ -414,10 +431,125 @@ void WeaselTSF::_RequestContextText(ITfContext* pContext, bool immediate) {
   // 只读锁 + 异步 (按键时锁可能被占用; 缺 TF_ES_READ 权限位会直接 E_FAIL)
   pContext->RequestEditSession(_tfClientId, pEditSession,
                                TF_ES_READ | TF_ES_ASYNCDONTCARE, &hr);
+  // 被拒的编辑会话静默丢弃 (原实现 8.4% 请求无 "done" 日志), 至少留痕
+  if (FAILED(hr))
+    TSFDbgLog(L"RequestContextText: RequestEditSession denied hr=0x%08X",
+              (unsigned)hr);
 }
 
-void WeaselTSF::_OnContextReset() {
-  // Server 端上下文已清空 (RimeResetContextText): 清掉"已发送"标记,
+// ===== 架构调研 A 探针 (实验代码, 2026-08-18) =====
+// WPS 顶层 context 只暴露 composition 区域 (连续打字只读到最近词)。枚举
+// DocumentMgr 的 context 栈 (EnumContexts/GetBase), 逐个 context 试读
+// "文档起点→光标" 全文, 结果只写日志 — 验证全文是否藏在非顶层 context。
+// 触发: OnSetFocus (会话外, TSF 线程上, 安全); 2s 限流防焦点风暴刷屏。
+class CProbeContextEditSession : public CEditSession {
+ public:
+  CProbeContextEditSession(com_ptr<WeaselTSF> pTextService,
+                           com_ptr<ITfContext> pContext, int idx, bool isTop,
+                           bool isBase)
+      : CEditSession(pTextService, pContext),
+        idx_(idx),
+        isTop_(isTop),
+        isBase_(isBase) {}
+
+  STDMETHODIMP DoEditSession(TfEditCookie ec) {
+    TF_SELECTION selection;
+    ULONG nSelection = 0;
+    HRESULT hrSel = _pContext->GetSelection(ec, TF_DEFAULT_SELECTION, 1,
+                                            &selection, &nSelection);
+    if (FAILED(hrSel) || nSelection == 0) {
+      TSFDbgLog(L"CtxProbe[%d top=%d base=%d] no-selection hr=0x%08X", idx_,
+                (int)isTop_, (int)isBase_, (unsigned)hrSel);
+      return S_OK;
+    }
+    com_ptr<ITfRange> pCaret;
+    pCaret.Attach(selection.range);
+    com_ptr<ITfRange> pStart;
+    if (FAILED(_pContext->GetStart(ec, &pStart))) {
+      TSFDbgLog(L"CtxProbe[%d top=%d base=%d] no-start", idx_, (int)isTop_,
+                (int)isBase_);
+      return S_OK;
+    }
+    com_ptr<ITfRange> pRange;
+    if (FAILED(pStart->Clone(&pRange)) ||
+        FAILED(pRange->ShiftEndToRange(ec, pCaret.p, TF_ANCHOR_END))) {
+      TSFDbgLog(L"CtxProbe[%d top=%d base=%d] range-fail", idx_, (int)isTop_,
+                (int)isBase_);
+      return S_OK;
+    }
+    // 简化读取: 16 块 x 8192 字符上限 (探针不需要与主路径同级的防御)
+    std::wstring text;
+    WCHAR chunk[8192];
+    for (int i = 0; i < 16; ++i) {
+      ULONG got = 0;
+      if (FAILED(pRange->GetText(ec, TF_TF_MOVESTART, chunk, 8192, &got)))
+        break;
+      if (got == 0)
+        break;
+      text.append(chunk, got);
+      if (got < 8192)
+        break;
+    }
+    int total = (int)text.size();
+    if (text.size() > 64)
+      text = text.substr(text.size() - 64);
+    TSFDbgLog(L"CtxProbe[%d top=%d base=%d] chars=%d tail=[%.24s]", idx_,
+              (int)isTop_, (int)isBase_, total, text.c_str());
+    return S_OK;
+  }
+
+ private:
+  int idx_;
+  bool isTop_, isBase_;
+};
+
+void WeaselTSF::_ProbeAllContexts(ITfContext* pTopContext) {
+  // 2026-08-18 调研结论 (探针 81 次实测): WPS 的 DocumentMgr 仅 1 个
+  // context (top==base), TSF store 只含 composition 区, 无全文; UIA 亦无
+  // 文档正文 (Qt/KProme 树只有功能区控件, 读屏标志也不激活) — WPS 全文
+  // 不可达, 现架构 (TSF + lagging→历史上文标 tsf) 即最优。探针保留但
+  // 默认关闭, 新版 WPS 复查时置 true 重编。
+  constexpr bool kCtxProbeEnabled = false;
+  if (!kCtxProbeEnabled)
+    return;
+  static ULONGLONG s_last = 0;
+  ULONGLONG now = GetTickCount64();
+  if (s_last && now - s_last < 2000)
+    return;  // 限流: WPS 焦点风暴下防刷屏
+  s_last = now;
+  com_ptr<ITfDocumentMgr> pMgr;
+  if (FAILED(pTopContext->GetDocumentMgr(&pMgr)) || !pMgr)
+    return;
+  com_ptr<ITfContext> pTop, pBase;
+  pMgr->GetTop(&pTop);
+  pMgr->GetBase(&pBase);
+  com_ptr<IEnumTfContexts> pEnum;
+  if (FAILED(pMgr->EnumContexts(&pEnum)) || !pEnum) {
+    TSFDbgLog(L"CtxProbe: EnumContexts failed");
+    return;
+  }
+  TSFDbgLog(L"CtxProbe: begin enumeration");
+  com_ptr<ITfContext> pCtx;
+  int idx = 0;
+  while (pEnum->Next(1, &pCtx, nullptr) == S_OK) {
+    bool isTop = (pCtx.p == pTop.p);
+    bool isBase = (pCtx.p == pBase.p);
+    com_ptr<CProbeContextEditSession> pProbe(new CProbeContextEditSession(
+        this, pCtx, idx, isTop, isBase));
+    HRESULT hr = E_FAIL;
+    pCtx->RequestEditSession(_tfClientId, pProbe,
+                             TF_ES_READ | TF_ES_ASYNCDONTCARE, &hr);
+    TSFDbgLog(L"CtxProbe[%d top=%d base=%d] requested hr=0x%08X", idx,
+              (int)isTop, (int)isBase, (unsigned)hr);
+    pCtx.Release();
+    idx++;
+    if (idx >= 8)
+      break;  // 防御: 异常应用 context 过多
+  }
+  TSFDbgLog(L"CtxProbe: enumerated %d contexts", idx);
+}
+
+void WeaselTSF::_OnContextReset() {  // Server 端上下文已清空 (RimeResetContextText): 清掉"已发送"标记,
   // 下次采集即使文本相同也会重发, 否则去抖跳过 -> Server 上下文永远空
   std::lock_guard<std::mutex> lock(m_ctx_debounce_mutex);
   m_ctx_last_sent.clear();
@@ -427,58 +559,77 @@ void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate) {
   m_textBeforeCaret = text;
   // 发送移出 TSF 文档锁 (EditSession 回调必须快速返回, 禁同步阻塞 IPC):
   // 独立线程执行管道 Transact (PipeChannel 线程安全, thread_local 管道句柄)。
-  // 去抖: TSF 文档更新可极频繁 (CEF 类应用启动/滚动/歌词, 每次文档
-  // 变化都触发采集), 每次直接发 SetContextText 会形成 IPC + Server 端
-  // prepare 风暴, 拖慢其他应用启动 (QQ 音乐等打不开)。100ms 内合并为
-  // 最新文本, 相同文本不重发, 发送期间的新更新循环补发。
-  // (100ms 权衡: 300ms 时快速打字 [~100ms/键, 4 码 350ms] 下一词重排
-  // 早于上文送达 -> ctx 空不重排 -> 词库顺序顶上屏错词 [试剂->事迹];
-  // Server 端 on_context_changed 另有 300ms 节流 + ctx dedup 防 decode
-  // 风暴, 客户端 100ms 只增轻量 IPC, QQ 音乐启动延迟不受影响)
+  // 去抖: TSF 文档更新可极频繁 (CEF 类应用启动/滚动/歌词, 每次文档变化都
+  // 触发采集), 每次直接发 SetContextText 会形成 IPC + Server 端 prepare
+  // 风暴, 拖慢其他应用启动 (QQ 音乐等打不开)。
+  // 规则 (2026-08-18 重设计):
+  //   非空 + 提交路径 (immediate): 0ms — 下一词首键前上文已到位;
+  //   非空 + 普通文档变化: 100ms 合并 (自入队起算, 期间新更新不重置计时
+  //     → 保证发送进度, 风暴下至多每 100ms 发一条);
+  //   空文本: 一律 800ms (immediate 不绕过 — 提交后瞬间是 transient 空
+  //     高发时刻)。空的后果由 librime 侧兜底: 受限应用 (WPS, lagging
+  //     粘性降级) 整窗不采用 TSF 文本; 好应用本就极少送空 (2026-08-18
+  //     八轮架构简化, 原 2s 活跃时钟抑制机制已删)。
+  // (Server 端 on_context_changed 另有 300ms 节流 + ctx dedup 防 decode
+  // 风暴, 客户端去抖只增轻量 IPC)
   std::string utf8 = _Utf8FromWide(text);
   bool spawn = false;
   {
     std::lock_guard<std::mutex> lock(m_ctx_debounce_mutex);
     if (utf8 == m_ctx_last_sent)
       return;  // 相同文本不重发
+    if (m_ctx_pending == m_ctx_last_sent)
+      m_ctx_pending_since = GetTickCount64();  // 队列从空到有才起算
     m_ctx_pending = utf8;
-    if (m_ctx_flush_running)
-      return;  // 已有合并线程, 它会发送最新值
-    m_ctx_flush_running = true;
-    spawn = true;
+    if (immediate)
+      m_ctx_pending_immediate = true;
+    ++m_ctx_seq;
+    if (!m_ctx_flush_running) {
+      m_ctx_flush_running = true;
+      spawn = true;
+    }
   }
+  m_ctx_cv.notify_all();
   if (spawn) {
-    std::thread([this, immediate, utf8]() {
-      // 提交路径 (immediate): 提交后立即发送, 下一词首键前上文已到位
-      // (第二词重排用 TSF 上文而非历史回退); 普通文档变化保持 100ms
-      // 合并 (CEF 类应用启动/滚动风暴防护)。
-      // 空文本 (光标前无字符) 延长到 800ms: 打字期间 TSF 的 selection-change
-      // 会频繁触发采集且瞬间 selection 未稳定 → 拿到 transient 空 (chars=0)
-      // → 立即发送会覆盖服务端正常文本 (实测词 2 变历史/词 3 无标记)。
-      // 800ms 窗口内新文本 (提交/文档变化采集) 会覆盖 pending, 真空
-      // (光标真在开头) 800ms 后仍空才送达 (WPS 的 transient 空窗口
-      // 比记事本更长, 2026-08-14 实测 TSF/历史交叉, 延长窗口减少误送达)。
-      int delay = immediate ? 0 : (utf8.empty() ? 800 : 100);
-      std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    std::thread([this]() {
       for (;;) {
         std::string send;
         {
-          std::lock_guard<std::mutex> lock(m_ctx_debounce_mutex);
+          std::unique_lock<std::mutex> lock(m_ctx_debounce_mutex);
           send = m_ctx_pending;
-          m_ctx_last_sent = send;
+          // 简化去抖 (2026-08-18 八轮架构简化): 非空 immediate 0ms /
+          // 普通 100ms 合并 (自入队起算, 期间更新不重置计时保证进度);
+          // 空一律 800ms (immediate 不绕过 — 提交后瞬间是 transient 空
+          // 高发时刻)。二~七轮的空送达抑制整套机制 (绝对截止时间/
+          // 活跃时钟/按键时钟) 已删除: WPS 类受限应用在 librime 侧
+          // lagging 粘性降级到历史上文后, 空送达不再有杀伤力; 好应用
+          // 本就极少送空。等待结束 (超时或新 pending) 无条件回循环头
+          // 重算 (六轮教训保留: 超时≠无变化)
+          ULONGLONG quota =
+              send.empty() ? 800 : (m_ctx_pending_immediate ? 0 : 100);
+          ULONGLONG waited = GetTickCount64() - m_ctx_pending_since;
+          int delay = waited >= quota ? 0 : (int)(quota - waited);
+          if (delay > 0) {
+            uint64_t seq = m_ctx_seq;
+            m_ctx_cv.wait_for(lock, std::chrono::milliseconds(delay),
+                              [&] { return m_ctx_seq != seq; });
+            continue;  // 重读 pending 重算 (可能已更新)
+          }
         }
-        // 空文本有语义 ("光标前无文本"): 必须发送, 否则服务端缓存
-        // 保持旧文本 → 光标移到开头仍用旧上文重排 (2026-08-13 实测)。
-        // SetContextText 空 body 服务端转 set_context_text("")
-        // → 清缓存 + gen++ (librime 侧), 去重靠服务端 t==g_context_text。
+        // 空文本有语义 ("光标前无文本"): 必须发送, 否则服务端缓存保持旧
+        // 文本 → 光标移到开头仍用旧上文重排 (2026-08-13 实测)。
+        // SetContextText 空 body 服务端转 set_context_text("");
+        // 去重靠服务端 t==g_context_text (不清 fallback, 2026-08-13 撤回)。
         m_client.SetContextText(send);
         {
           std::lock_guard<std::mutex> lock(m_ctx_debounce_mutex);
-          if (m_ctx_pending == m_ctx_last_sent) {
+          m_ctx_last_sent = send;
+          if (m_ctx_pending == send) {
+            m_ctx_pending_immediate = false;  // 标记随该内容一起消费
             m_ctx_flush_running = false;
             break;  // 发送期间无新更新, 收尾
           }
-          // 发送期间又有新文本 → 循环补发最新值
+          // 发送期间又有新文本 → 循环补发最新值 (immediate 标记属新 pending)
         }
       }
     }).detach();

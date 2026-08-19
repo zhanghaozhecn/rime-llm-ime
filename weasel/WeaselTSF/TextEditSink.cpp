@@ -64,6 +64,8 @@ STDAPI WeaselTSF::OnEndEdit(ITfContext* pContext,
       // 不刷新会一直用旧上文 (或 ResetContext 后无文本 → 不推理);
       // 去抖在 _OnContextTextReady 内 (300ms 合并 + 相同不重发)。
       _RequestContextText(pContext);
+      // 架构调研 A 探针 (实验): 文本变化时也枚举全部 context 试读
+      _ProbeAllContexts(pContext);
     }
     pEnumTextChanges->Release();
   }

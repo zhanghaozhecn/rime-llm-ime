@@ -1,12 +1,24 @@
 @echo off
 REM ============================================
-REM  rime-llm-ime one-click deploy script (2026-08-14)
-REM  Full build incl. 4 TSF modules + WPS lag detection:
-REM    rime.dll       B9D9F983  librime + llm_filter (lag detection)
-REM    WeaselServer.exe         server + SET_CONTEXT_TEXT/RESET_CONTEXT IPC
-REM    weaselx64.dll  DF476ACE  64-bit TSF: 0.17.4 + LLM ctx + 4 modules
-REM    weasel32.dll             32-bit TSF: same features, Win32 build
-REM  Behavior: WPS=commit history rerank (AI-hist), others=TSF ctx (AI-TSF)
+REM  rime-llm-ime one-click deploy script (2026-08-18)
+REM  TSF ctx acquisition fixes (WPS tsf/hist per-word alternation):
+REM    1. neg-shift main path was dead code (cloned doc start, never moved,
+REM       20379/20379 log hits neg_shift=0) - now clones caret range, O(1)
+REM    2. empty-text 800ms debounce no longer bypassed on commit path
+REM       (immediate empty was the direct cause of per-word alternation)
+REM    3. focus:switch reset storm coalesced to 1/s (WPS internal docmgr churn)
+REM    4. lagging detection now marks AI-TSF (channel works, exposure limited;
+REM       AI-hist kept for real fallback: transient empty / stale residue)
+REM    5. RimeSetContextText dedup refreshes timestamp; denied edit sessions
+REM       now logged; GetSelection range leak fixed
+REM  Binaries (bin\, built 2026-08-18 round 2):
+REM    rime.dll         56ADE261  librime + llm_filter (sticky degrade to history)
+REM    WeaselServer.exe 646DF11D  server + SET_CONTEXT_TEXT/RESET_CONTEXT IPC
+REM    weaselx64.dll    8C19C79F  64-bit TSF: simplified debounce (sticky-degrade arch)
+
+REM    weasel32.dll               32-bit TSF: official (no ctx collection)
+REM  Behavior: WPS=fuller commit-hist rerank marked AI-TSF (exposure limited),
+REM            others=TSF caret text (AI-TSF). AI-hist = real fallback only.
 REM  Place this file in bin\ and double-click it on the TARGET machine.
 REM  Prereq: official weasel 0.17.4 installed (provides registry/TSF
 REM  registration, installer dir, tray app, data\)
@@ -76,6 +88,9 @@ echo 2. Tray icon - Redeploy (rebuilds dict build with LLM librime - REQUIRED,
 echo    official redeploy overwrites it with official format and 1-code chars
 echo    come up empty)
 echo 3. Run verify_deploy.bat to check all md5
-echo 4. Verify: WPS = AI-hist mark, others = AI-TSF mark
+echo 4. Verify after reboot: all marks should be AI-TSF (WPS included - it
+echo    uses fuller commit-hist context but the TSF channel is working);
+echo    AI-hist should be rare (only transient empty / stale residue)
 echo    Log: %%APPDATA%%\Rime\rime_llm_filter_log.txt
+echo     TSF: %%TEMP%%\weasel_tsf_dbg.log  (expect neg_shift=1 in full-TSF apps)
 pause

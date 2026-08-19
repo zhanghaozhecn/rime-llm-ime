@@ -78,6 +78,13 @@ static int g_max_candidates = 5;   // candidates participating in scoring
 static std::string g_fallback_buffer;  // session committed texts
 static int g_fallback_gen_seen = 0;    // consumed reset generation
 
+// 受限窗口粘性降级 (2026-08-18 八轮, 用户决策): lagging 命中一次即标记本
+// 窗口"受限" (WPS 类应用 TSF 只暴露最近 composition), 之后整窗直接用
+// 历史上文 (标 AI·历史), 直到编辑键/切窗 reset (代次变) 才清除重评。
+// engine thread only (同上)。
+static bool g_ctx_limited = false;
+static int g_limited_gen_seen = 0;
+
 // ============================================================
 // prepare pre-decode state: after commit, asynchronously run
 // Step 1 (ctx decode -> save logits) so the next score call can
@@ -340,7 +347,8 @@ namespace ctx_logic {
 
 // 滞后检测 (2026-08-14, WPS): WPS 的 TSF 文本访问只暴露最近 composition
 // 相关文本 (实测连续打 N 个"测试"只采到 2 字符), 此时 TSF 文本是上屏历史
-// 的尾部子串且明显更短 → 用更全的历史 (标 AI·历史, 重排质量反而不降)。
+// 的尾部子串且明显更短 → 粘性降级到历史 (2026-08-18 用户最终决策, 标
+// AI·历史; 判据取舍见 GetContextTextPair 头注释)。
 inline bool lagging(const std::string &tsf, const std::string &hist) {
   if (tsf.empty() || hist.empty())
     return false;  // 空文本不在滞后检测范围内 (调用侧已排除非空 TSF)
@@ -1072,14 +1080,40 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
 
 std::pair<std::string, std::string> LlmFilter::GetContextTextPair() const {
   const RimeApi *api = rime_get_api();
+
+  // 受限窗口粘性降级 (2026-08-18 八轮, 用户决策): 见 g_ctx_limited 声明处
+  // 注释。判据只有 lagging 一条, 其余信号刻意不粘:
+  //  - 空文本/transient 空: 好应用提交后也会瞬时采空, 粘了会误降级;
+  //  - stale (新鲜度过期): 好应用鼠标移动光标后必然出现 (设计上已知
+  //    误判, 靠 fresh 窗口绕过), 粘了会在好应用误降级;
+  //  - 中途出现的"全会话文本"不解除降级: 其内容 ≈ 本会话上屏历史 (七轮
+  //    日志实证), 解除无质量收益, 只会重新引入徽章闪烁。
+  if (api && api->context_reset_generation) {
+    int gen = api->context_reset_generation();
+    if (gen != g_limited_gen_seen) {
+      g_limited_gen_seen = gen;
+      g_ctx_limited = false;  // 编辑键/切窗 → 新窗口重新评估
+    }
+  }
+  if (g_ctx_limited) {
+    std::string hist = CommitHistoryText();
+    if (!hist.empty())
+      return {hist, "rime"};
+  }
+
   if (api && api->get_context_text) {
     const char *text = api->get_context_text();
     if (text && *text) {
       std::string hist = CommitHistoryText();
       if (!hist.empty()) {
-        // 滞后检测 (WPS): TSF 文本是历史尾部子串且明显更短 → 用更全的历史
-        if (ctx_logic::lagging(text, hist))
+        // 滞后检测 (WPS): TSF 文本是历史尾部子串且明显更短 → 应用只暴露
+        // 最近 composition (实测连续打 N 个"测试"只采到 2 字符) → 粘性降
+        // 级: 本窗口后续全部直接用历史上文, 标 AI·历史 (2026-08-18 用户
+        // 最终决策, 取代此前"标 tsf"的过渡方案)
+        if (ctx_logic::lagging(text, hist)) {
+          g_ctx_limited = true;
           return {hist, "rime"};
+        }
         // 新鲜度判定: 5s 内送达的 TSF 文本直接可信——"fallback 尾部须在
         // TSF 文本中"的重合判据在光标移动后打词时必然误判 (新词在光标后,
         // 不在打词前采集的文本中)。新鲜送达 = 采集链路工作正常。

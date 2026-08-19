@@ -3,6 +3,8 @@
 #include "Globals.h"
 #include <WeaselIPC.h>
 #include <WeaselIPCData.h>
+#include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <string>
 
@@ -177,12 +179,24 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   friend class CEndCompositionEditSession;  // 提交后立即采集 (下一词 TSF 上文)
   void _RequestContextText(ITfContext* pContext, bool immediate = false);
   void _OnContextTextReady(const std::wstring& text, bool immediate = false);
+  // 架构调研 A 探针 (2026-08-18, 实验代码): 枚举 DocumentMgr 全部 context
+  // 逐个试读光标前文本, 仅写日志不发送 — 验证 WPS 全文是否藏在非顶层
+  // context (顶层只暴露 composition)。结论出来后移除或产品化
+  void _ProbeAllContexts(ITfContext* pTopContext);
   // 上文采集去抖 (CEF 类应用文档更新极频繁, 限流 SetContextText 避免
-  // IPC + Server 端 prepare 风暴): 300ms 内合并为最新文本, 相同不重发
+  // IPC + Server 端 prepare 风暴): 非空 100ms 合并, 相同不重发, 空文本
+  // 一律 800ms (WPS 提交后 transient 空高发, 详见 _OnContextTextReady)
   std::mutex m_ctx_debounce_mutex;
+  std::condition_variable m_ctx_cv;  // 新 pending 唤醒等待中的 flush 线程 (空等待被真文本打断)
   std::string m_ctx_pending;        // 待发送的最新文本 (UTF-8)
   std::string m_ctx_last_sent;      // 已发送的文本
   bool m_ctx_flush_running = false;  // 合并发送线程是否在跑
+  ULONGLONG m_ctx_pending_since = 0;  // pending 入队 tick (期间更新不重置, 保证发送进度)
+  bool m_ctx_pending_immediate = false;  // pending 由提交路径产生 (非空 0ms 发送)
+  uint64_t m_ctx_seq = 0;  // pending 更新计数 (等待谓词: 有新内容则唤醒重算)
+  // focus:switch reset 1s 合并节流 (新版 WPS 内部 DocumentMgr 频繁 A↔B
+  // 切换, 每次全清上下文+fallback → 风暴期词无重排; 见 ThreadMgrEventSink)
+  ULONGLONG m_last_focus_reset_tick = 0;
   // ResetContext (编辑键/切窗) 后调用: 清空已发送标记, 强制下次采集重发
   // (否则 Server 端上下文被清空后, 相同文本因去抖被跳过永不重发 -> 无推理)
   void _OnContextReset();

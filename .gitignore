@@ -3,8 +3,9 @@ build/
 output/
 msbuild/
 
-# 本地私有（不发布）：ZCode 工作区指令文件
+# 本地私有（不发布）：ZCode 工作区指令文件与本地记忆
 AGENTS.md
+memory/
 
 # 第三方依赖（submodule 引用，clone 后 git submodule update --init）
 deps/

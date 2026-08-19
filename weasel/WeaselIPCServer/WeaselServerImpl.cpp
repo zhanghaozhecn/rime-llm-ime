@@ -369,8 +369,9 @@ DWORD ServerImpl::OnSetContextText(WEASEL_IPC_COMMAND uMsg,
                           &text[0], ulen, NULL, NULL);
     }
     // len==0 = 空文本送达 ("光标前无文本", 文档开头/删空): 仍需传递
-    // set_context_text("") → librime 清缓存 + 递增 reset 代次清 fallback
-    // (2026-08-13: 客户端 flush 空过滤已移除, 空文本现在会送达)
+    // set_context_text("") → librime 清缓存文本 (注意: 不清 fallback、
+    // 不递增 reset 代次 — 2026-08-13 撤回, 真空由 llm_filter 判定层用
+    // 送达年龄区分; 2026-08-13: 客户端 flush 空过滤已移除, 空文本会送达)
     RimeApi* api = rime_get_api();
     if (api && api->set_context_text)
       api->set_context_text(text.c_str());
