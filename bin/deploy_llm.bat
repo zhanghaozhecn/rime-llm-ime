@@ -12,9 +12,9 @@ REM       AI-hist kept for real fallback: transient empty / stale residue)
 REM    5. RimeSetContextText dedup refreshes timestamp; denied edit sessions
 REM       now logged; GetSelection range leak fixed
 REM  Binaries (bin\, built 2026-08-18 round 2):
-REM    rime.dll         56ADE261  librime + llm_filter (sticky degrade to history)
-REM    WeaselServer.exe 646DF11D  server + SET_CONTEXT_TEXT/RESET_CONTEXT IPC
-REM    weaselx64.dll    8C19C79F  64-bit TSF: simplified debounce (sticky-degrade arch)
+REM    rime.dll         BC5A654A  librime + llm_filter (sticky degrade + freq fusion)
+REM    WeaselServer.exe BBBCDED9  server + SET_CONTEXT_TEXT/RESET_CONTEXT IPC
+REM    weaselx64.dll    8C19C79F  64-bit TSF (unchanged this round)
 
 REM    weasel32.dll               32-bit TSF: official (no ctx collection)
 REM  Behavior: WPS=fuller commit-hist rerank marked AI-TSF (exposure limited),

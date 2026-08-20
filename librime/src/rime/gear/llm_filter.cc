@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -57,6 +58,10 @@ static bool g_enabled = false;  // CPU only; GPU build retired (not published)
 static int g_min_code_len = 4;
 static int g_max_code_len = 0;  // 0 = no upper limit (plugin-version parity)
 static bool g_long_word_first = false;
+// 用户词频融合 (2026-08-19): total = (1-w)·LLM + w·count/(count+k),
+// 默认 w=0.25/k=5 (真实候选窗回放实证, 见 Collect 融合段注释)
+static double g_freq_weight = 0.25;
+static int g_freq_k = 5;
 static int g_min_tokens = 1;
 static int g_max_ctx_tokens = 10;  // tok=10: 93.4% acc, 10->17 gains only +1.1pp
 static int g_n_threads = 4;        // default = GGML_DEFAULT_N_THREADS; override via cpu_cores
@@ -109,7 +114,17 @@ static bool                      s_cache_valid = false;
 static std::string               s_cache_ctx;
 static std::string               s_cache_input;
 static std::vector<std::string>  s_cache_ranked;  // 评分后的候选文本顺序
+static std::vector<double>       s_cache_scores;  // 与 ranked 对齐的原始分 (词频融合重放用)
 static int                       s_cache_gen = -1; // 缓存建立时的 reset 代次
+
+// ============================================================
+// 用户词频 (freq_weight 融合, 2026-08-19): OnCommit 累计 (仅含中文的词),
+// RIME 用户目录 user_freq.tsv 持久化 (每 20 词落盘, 崩溃最多丢 19 次)。
+// engine thread only (OnCommit/Collect 均在引擎线程), 无锁。
+// ============================================================
+static std::map<std::string, int> g_user_freq;
+static bool g_user_freq_loaded = false;
+static int  g_user_freq_dirty = 0;
 
 // Log file: RIME user data dir, single file rime_llm_filter_log.txt
 // (performance lines + per-inference event lines); falls back to %TEMP%.
@@ -134,8 +149,73 @@ static FILE *open_log_file(const char *filename) {
 #endif
 }
 
-static void log_msg(const char *fmt, ...) {
-  char buf[512];
+// user_freq.tsv 路径 (RIME 用户目录; 与日志同目录解析)
+static bool user_freq_file(char *path, size_t n) {
+  const RimeApi *api = rime_get_api();
+  if (api && api->get_user_data_dir) {
+    const char *ud = api->get_user_data_dir();
+    if (ud && *ud) {
+      snprintf(path, n, "%s\\user_freq.tsv", ud);
+      return true;
+    }
+  }
+  return false;
+}
+
+static void user_freq_ensure_loaded() {
+  if (g_user_freq_loaded)
+    return;
+  g_user_freq_loaded = true;
+  char path[MAX_PATH];
+  if (!user_freq_file(path, sizeof(path)))
+    return;
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return;
+  char line[512];
+  while (fgets(line, sizeof(line), f)) {
+    char *tab = strchr(line, '\t');
+    if (!tab)
+      continue;
+    *tab = 0;
+    int n = atoi(tab + 1);
+    if (n > 0)
+      g_user_freq[std::string(line)] = n;
+  }
+  fclose(f);
+}
+
+static void user_freq_save() {
+  char path[MAX_PATH];
+  if (!user_freq_file(path, sizeof(path)))
+    return;
+  FILE *f = fopen(path, "w");
+  if (!f)
+    return;
+  for (auto &kv : g_user_freq)
+    fprintf(f, "%s\t%d\n", kv.first.c_str(), kv.second);
+  fclose(f);
+}
+
+static void user_freq_bump(const std::string &w) {
+  // 仅计含中文的词 (与插件版训练语料同语义; 候选词均为中文词)
+  bool has_cjk = false;
+  for (unsigned char ch : w)
+    if (ch >= 0x80) {
+      has_cjk = true;
+      break;
+    }
+  if (!has_cjk)
+    return;
+  user_freq_ensure_loaded();
+  g_user_freq[w] += 1;
+  if (++g_user_freq_dirty >= 20) {
+    user_freq_save();
+    g_user_freq_dirty = 0;
+  }
+}
+
+static void log_msg(const char *fmt, ...) {  char buf[512];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -785,17 +865,23 @@ void LlmRerankTranslation::Collect() {
 
     bool did_score = false;
     double ev_ms = 0;
-    std::vector<int> order;  // candidate indices, score desc
+    std::vector<int> order;                     // candidate indices, score desc
+    std::vector<double> score_of(candidates_.size(), 0.0);  // 词频融合重放用
+    std::vector<char> has_score(candidates_.size(), 0);
 
     if (s_cache_valid && ctx == s_cache_ctx && input_ == s_cache_input &&
         !s_cache_ranked.empty()) {
       // cache hit: 同一 (ctx, input) 的评分结果复用 — 翻页/候选窗重建
-      // 不再跑 S2/S3 (~36ms/次)。缓存只存评分顺序, 多字词分组与徽章按
+      // 不再跑 S2/S3 (~36ms/次)。缓存存评分顺序+原始分, 词频融合与徽章按
       // 当前配置重放; 候选集变化时新候选未命中 → 落到尾部 (与插件版一致)。
-      for (auto &t : s_cache_ranked)
+      for (size_t k = 0; k < s_cache_ranked.size(); k++)
         for (size_t i = 0; i < candidates_.size(); i++)
-          if (candidates_[i]->text() == t) {
+          if (candidates_[i]->text() == s_cache_ranked[k]) {
             order.push_back((int)i);
+            if (k < s_cache_scores.size()) {
+              score_of[i] = s_cache_scores[k];
+              has_score[i] = s_cache_scores[k] > -1e9;
+            }
             break;
           }
     } else {
@@ -823,21 +909,70 @@ void LlmRerankTranslation::Collect() {
             std::chrono::duration<double, std::milli>(ev_t1 - ev_t0).count();
 
         if (scores.size() == candidates_.size()) {
+          for (size_t i = 0; i < scores.size(); i++) {
+            score_of[i] = scores[i];
+            has_score[i] = scores[i] > -1e9;
+          }
           std::vector<int> ord(scores.size());
           for (size_t i = 0; i < ord.size(); i++)
             ord[i] = (int)i;
           std::sort(ord.begin(), ord.end(),
                     [&](int a, int b) { return scores[a] > scores[b]; });
           order = std::move(ord);
-          // store cache: 评分顺序 (候选文本), 命中时按文本重放
+          // store cache: 评分顺序+原始分 (候选文本), 命中时按文本重放
           s_cache_valid = true;
           s_cache_ctx = ctx;
           s_cache_input = input_;
           s_cache_ranked.clear();
-          for (int i : order)
+          s_cache_scores.clear();
+          for (int i : order) {
             s_cache_ranked.push_back(candidates_[i]->text());
+            s_cache_scores.push_back(scores[i]);
+          }
           did_score = true;
         }
+      }
+    }
+
+    // 用户词频融合 (freq_weight, 2026-08-19): total = (1-w)·LLM_minmax +
+    // w·count/(count+k)。实证与默认值依据: 17258 真实候选窗回放 (6000 抽样),
+    // w=0.25/k=5 首选率 97.08%→98.20%; 纯 LLM 排错事件 87% 的选中词用户
+    // 词频 ≥2 —— 个性化高频词是纯 LLM 排序的盲区。曲线到 w=0.5 仍单调升
+    // 但边际递减且评估标签自带高频偏好, 默认取膝点保留 75% LLM 权重。
+    // 应用于评分/缓存顺序之上、long_word_first 之前 (与插件版一致);
+    // 缓存只存分数序, 融合每次按当前词频重放。稳定排序保同分原序 (CE 序)。
+    if (g_freq_weight > 0 && order.size() > 1) {
+      user_freq_ensure_loaded();
+      double lo = 1e300, hi = -1e300;
+      for (int i : order)
+        if (has_score[i]) {
+          if (score_of[i] < lo)
+            lo = score_of[i];
+          if (score_of[i] > hi)
+            hi = score_of[i];
+        }
+      if (hi - lo > 1e-9) {
+        double span = hi - lo;
+        std::vector<std::pair<double, int>> fused;  // (total, idx)
+        fused.reserve(order.size());
+        for (int i : order) {
+          // 失败哨兵/缺分 → s_l=0 (排尾部, 词频仍可救)
+          double sl = has_score[i] ? (score_of[i] - lo) / span : 0.0;
+          auto it = g_user_freq.find(candidates_[i]->text());
+          double n = (double)(it != g_user_freq.end() ? it->second : 0);
+          fused.emplace_back(
+              (1.0 - g_freq_weight) * sl +
+                  g_freq_weight * (n / (n + (double)g_freq_k)),
+              i);
+        }
+        std::stable_sort(fused.begin(), fused.end(),
+                         [](const std::pair<double, int> &a,
+                            const std::pair<double, int> &b) {
+                           return a.first > b.first;
+                         });
+        order.clear();
+        for (auto &x : fused)
+          order.push_back(x.second);
       }
     }
 
@@ -920,6 +1055,13 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     if (config->GetInt("llm_rerank/max_code_len", &v))
       g_max_code_len = v;
     config->GetBool("llm_rerank/long_word_first", &g_long_word_first);
+    {
+      double dw = 0.0;
+      if (config->GetDouble("llm_rerank/freq_weight", &dw) && dw >= 0)
+        g_freq_weight = dw;
+    }
+    if (config->GetInt("llm_rerank/freq_k", &v) && v >= 1)
+      g_freq_k = v;
     if (config->GetInt("llm_rerank/min_tokens", &v))
       g_min_tokens = v;
     if (config->GetInt("llm_rerank/max_tokens", &v))
@@ -936,11 +1078,11 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     if (hw > 0 && (unsigned)g_n_threads > hw)
       g_n_threads = (int)hw;
     log_msg("config: enabled=%d min_code_len=%d max_code_len=%d "
-            "long_word_first=%d min_tokens=%d "
+            "long_word_first=%d freq_weight=%.2f freq_k=%d min_tokens=%d "
             "max_tokens=%d max_candidates=%d cpu_cores=%d "
             "min_free_mem_mb=%d model=%s",
             g_enabled ? 1 : 0, g_min_code_len, g_max_code_len,
-            g_long_word_first ? 1 : 0, g_min_tokens,
+            g_long_word_first ? 1 : 0, g_freq_weight, g_freq_k, g_min_tokens,
             g_max_ctx_tokens, g_max_candidates, g_n_threads,
             g_min_free_mem_mb, g_model_path.c_str());
   }
@@ -1029,6 +1171,8 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
     }
   }
   g_fallback_buffer += commit_text;
+  // 用户词频累计 (freq_weight 融合; 仅含中文的词, 每 20 词落盘)
+  user_freq_bump(commit_text);
   // bound the fallback buffer: LLM context is at most ~20 tokens
   // (1-2 chars/token = 40 chars), keep only the most recent 64 UTF-8
   // bytes, aligned to character boundaries

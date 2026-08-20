@@ -92,6 +92,8 @@ llm_rerank:
   min_code_len: 4       # 输入编码长度小于此值时不重排
   max_code_len: 0       # 编码长度上限（0=不限制）；超出不推理，与 min_code_len 组成触发区间
   long_word_first: false # true=long-word-first: 候选算完 CE 后按词长降序, 同词长按 CE 评分序
+  freq_weight: 0.25  # 用户词频融合权重 (0=关闭): total=(1-w)·LLM(窗内min-max)+w·count/(count+k)
+  freq_k: 5          # 词频饱和常数; 词频由 OnCommit 自动统计 (RIME 用户目录 user_freq.tsv)
   min_tokens: 1         # 上文 token 数小于此值时不推理
   max_tokens: 10        # 上文 token 上限
   max_candidates: 5     # 参与打分的候选数上限
@@ -127,6 +129,7 @@ librime 侧（`gear/llm_filter.cc`，新增组件）：
 - 上文来源自适应（`GetContextTextPair`）：TSF 文本优先；TSF 文本空/滞后 → commit history 兜底（提交后同步累积，必有最近上屏词）；**残留检测**——TSF 文本不含 commit history 尾部（最近上屏词）时判为其他应用残留，改用历史
 - 预解码（`prepare`）：commit/上下文变化后异步 decode 上文，score 命中复用 KV
 - 触发区间 `[min_code_len, max_code_len]`（0=不限制）+ 重排后 `long_word_first` long-word-first 排序（与插件版参数对齐）
+- 用户词频融合 `freq_weight`/`freq_k`（默认 0.25/5）：`total=(1-w)·LLM评分(窗内min-max归一) + w·count/(count+k)`，词频由 OnCommit 自动统计并持久化（user_freq.tsv）。实证（真实候选窗回放 6000 抽样）：w=0.25 首选率 97.08%→98.20%，纯 LLM 排错事件 87% 的选中词用户词频≥2。融合应用于评分序之上、long_word_first 之前（与插件版一致）
 
 ### 构建步骤
 

@@ -7,8 +7,8 @@ REM  Expected values are auto-compared against the SOURCE files in this
 REM  script's own directory (the deploy package) -- always in sync with
 REM  the latest bin. Reference md5 (2026-08-18 round 2 build):
 REM    weaselx64.dll    8C19C79F
-REM    WeaselServer.exe 646DF11D
-REM    rime.dll         56ADE261
+REM    WeaselServer.exe BBBCDED9
+REM    rime.dll         BC5A654A
 REM ============================================
 
 set CLSID={A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}
