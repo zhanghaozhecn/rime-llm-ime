@@ -11,8 +11,9 @@ REM    4. lagging detection now marks AI-TSF (channel works, exposure limited;
 REM       AI-hist kept for real fallback: transient empty / stale residue)
 REM    5. RimeSetContextText dedup refreshes timestamp; denied edit sessions
 REM       now logged; GetSelection range leak fixed
-REM  Binaries (bin\, built 2026-08-18 round 2):
-REM    rime.dll         BC5A654A  librime + llm_filter (sticky degrade + freq fusion)
+REM  Binaries (bin\, built 2026-08-21 formula_d decay):
+REM    rime.dll         C7F05CEF  librime + llm_filter (freq fusion w/ rime
+REM                                 formula_d time-decay + before-log fix)
 REM    WeaselServer.exe BBBCDED9  server + SET_CONTEXT_TEXT/RESET_CONTEXT IPC
 REM    weaselx64.dll    8C19C79F  64-bit TSF (unchanged this round)
 

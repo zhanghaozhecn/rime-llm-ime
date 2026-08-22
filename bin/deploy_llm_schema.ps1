@@ -92,7 +92,7 @@ if (-not $hasCfg) {
     "  min_code_len: 4       # 输入编码长度小于此值时不重排",
     "  # max_code_len: 0     # 编码长度上限（0=不限制）；超出不推理，与 min_code_len 组成触发区间",
     "  # long_word_first: false  # true=long-word-first: 按词长降序, 同词长按 CE 评分序",
-    "  # freq_weight: 0.25  # 用户词频融合权重 (0=关闭); freq_k: 5 饱和常数",
+    "  # freq_weight: 0.25  # 用户词频融合权重 (0=关闭); 词频为 rime formula_d 时间衰减计数",
     "  # freq_k: 5",
     "  # min_tokens: 1       # 上文 token 数小于此值时不推理（0 = 空上文也推理）",
     "  # max_tokens: 10      # 上文 token 上限，超出时从末尾截断",

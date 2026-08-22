@@ -118,13 +118,27 @@ static std::vector<double>       s_cache_scores;  // 与 ranked 对齐的原始�
 static int                       s_cache_gen = -1; // 缓存建立时的 reset 代次
 
 // ============================================================
-// 用户词频 (freq_weight 融合, 2026-08-19): OnCommit 累计 (仅含中文的词),
-// RIME 用户目录 user_freq.tsv 持久化 (每 20 词落盘, 崩溃最多丢 19 次)。
-// engine thread only (OnCommit/Collect 均在引擎线程), 无锁。
+// 用户词频 (freq_weight 融合, 2026-08-19; 2026-08-21 改 Rime 时间衰减):
+// OnCommit 累计 (仅含中文的词), RIME 用户目录 user_freq.tsv 持久化
+// (每 20 词落盘, 崩溃最多丢 19 次)。engine thread only, 无锁。
+// 衰减 = librime algo::formula_d (引擎调频同源):
+//   提交: dee = 1 + dee·exp((t_old - t_now)/τ)
+//   查询: eff = dee·exp((t_word - t_now)/τ)   未提交期间持续衰减
+//   τ=200 tick; tick 每词提交 +1 (同 userdb UpdateTickCount)。
+// 近期常打的词权重高, 久未使用的自动消退 (半衰期 ≈ 139 次提交)。
+// 格式: 首行 "#tick=N"; 数据行 "词\t累计\tdee\ttick"; 兼容旧版 "词\t次数"
+// (迁移: dee=次数, tick=当前 — 视为刚提交过)。
 // ============================================================
-static std::map<std::string, int> g_user_freq;
+struct UserFreqEntry {
+  long long commits = 0;  // 累计提交次数 (记录/诊断用, 不参与评分)
+  double dee = 0;         // 衰减计数 (formula_d 的 dee)
+  long long tick = 0;     // 最后提交 tick
+};
+static std::map<std::string, UserFreqEntry> g_user_freq;
+static long long g_user_tick = 0;
 static bool g_user_freq_loaded = false;
 static int  g_user_freq_dirty = 0;
+static constexpr double kFreqTau = 200.0;  // rime formula_d 时间常数
 
 // Log file: RIME user data dir, single file rime_llm_filter_log.txt
 // (performance lines + per-inference event lines); falls back to %TEMP%.
@@ -172,17 +186,57 @@ static void user_freq_ensure_loaded() {
   FILE *f = fopen(path, "r");
   if (!f)
     return;
+  long long max_tick = 0;
+  std::vector<std::pair<std::string, long long>> legacy;
   char line[512];
   while (fgets(line, sizeof(line), f)) {
-    char *tab = strchr(line, '\t');
-    if (!tab)
+    size_t len = strlen(line);
+    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len] = 0;
+    if (strncmp(line, "#tick=", 6) == 0) {
+      g_user_tick = atoll(line + 6);
       continue;
-    *tab = 0;
-    int n = atoi(tab + 1);
-    if (n > 0)
-      g_user_freq[std::string(line)] = n;
+    }
+    char *t1 = strchr(line, '\t');
+    if (!t1)
+      continue;
+    *t1 = 0;
+    char *t2 = strchr(t1 + 1, '\t');
+    if (!t2) {  // 旧版 2 字段: 词\t次数
+      long long n = atoll(t1 + 1);
+      if (n > 0)
+        legacy.emplace_back(std::string(line), n);
+      continue;
+    }
+    *t2 = 0;
+    char *t3 = strchr(t2 + 1, '\t');
+    if (!t3)
+      continue;
+    *t3 = 0;
+    UserFreqEntry e;
+    e.commits = atoll(t1 + 1);
+    e.dee = atof(t2 + 1);
+    e.tick = atoll(t3 + 1);
+    if (e.dee > 0) {
+      g_user_freq[std::string(line)] = e;
+      if (e.tick > max_tick)
+        max_tick = e.tick;
+    }
   }
   fclose(f);
+  if (g_user_tick <= 0)
+    g_user_tick = max_tick;
+  for (auto &kv : legacy)  // 旧计数视为刚提交过
+    g_user_freq[kv.first] = UserFreqEntry{kv.second, (double)kv.second, g_user_tick};
+}
+
+// 衰减有效计数 (融合用): rime formula_d 查询式
+static double user_freq_eff(const std::string &w) {
+  auto it = g_user_freq.find(w);
+  if (it == g_user_freq.end() || it->second.dee <= 0)
+    return 0;
+  return it->second.dee *
+         exp((double)(it->second.tick - g_user_tick) / kFreqTau);
 }
 
 static void user_freq_save() {
@@ -192,8 +246,10 @@ static void user_freq_save() {
   FILE *f = fopen(path, "w");
   if (!f)
     return;
+  fprintf(f, "#tick=%lld\n", g_user_tick);
   for (auto &kv : g_user_freq)
-    fprintf(f, "%s\t%d\n", kv.first.c_str(), kv.second);
+    fprintf(f, "%s\t%lld\t%.3f\t%lld\n", kv.first.c_str(), kv.second.commits,
+            kv.second.dee, kv.second.tick);
   fclose(f);
 }
 
@@ -208,7 +264,11 @@ static void user_freq_bump(const std::string &w) {
   if (!has_cjk)
     return;
   user_freq_ensure_loaded();
-  g_user_freq[w] += 1;
+  ++g_user_tick;
+  UserFreqEntry &e = g_user_freq[w];
+  e.dee = 1 + e.dee * exp((double)(e.tick - g_user_tick) / kFreqTau);
+  e.commits += 1;
+  e.tick = g_user_tick;
   if (++g_user_freq_dirty >= 20) {
     user_freq_save();
     g_user_freq_dirty = 0;
@@ -934,13 +994,14 @@ void LlmRerankTranslation::Collect() {
       }
     }
 
-    // 用户词频融合 (freq_weight, 2026-08-19): total = (1-w)·LLM_minmax +
-    // w·count/(count+k)。实证与默认值依据: 17258 真实候选窗回放 (6000 抽样),
-    // w=0.25/k=5 首选率 97.08%→98.20%; 纯 LLM 排错事件 87% 的选中词用户
-    // 词频 ≥2 —— 个性化高频词是纯 LLM 排序的盲区。曲线到 w=0.5 仍单调升
-    // 但边际递减且评估标签自带高频偏好, 默认取膝点保留 75% LLM 权重。
+    // 用户词频融合 (freq_weight, 2026-08-19; 2026-08-21 词频改 Rime 时间衰减):
+    // total = (1-w)·LLM_minmax + w·eff/(eff+k)。eff = librime algo::formula_d
+    // 指数衰减计数 (τ=200 tick, tick=每词提交+1, 引擎调频同源) — 近期常打
+    // 的词权重高, 久未使用的自动消退。实证 (17258 真实候选窗, 6000 抽样,
+    // 事前计数口径): 纯 LLM 97.08%, 衰减融合约 +0.4pp; 融合的意义在个性化
+    // 高频词 (纯 LLM 排错事件 87% 选中词词频 ≥2)。
     // 应用于评分/缓存顺序之上、long_word_first 之前 (与插件版一致);
-    // 缓存只存分数序, 融合每次按当前词频重放。稳定排序保同分原序 (CE 序)。
+    // 缓存只存分数序, 融合每次按当前衰减重放。稳定排序保同分原序 (CE 序)。
     if (g_freq_weight > 0 && order.size() > 1) {
       user_freq_ensure_loaded();
       double lo = 1e300, hi = -1e300;
@@ -958,8 +1019,7 @@ void LlmRerankTranslation::Collect() {
         for (int i : order) {
           // 失败哨兵/缺分 → s_l=0 (排尾部, 词频仍可救)
           double sl = has_score[i] ? (score_of[i] - lo) / span : 0.0;
-          auto it = g_user_freq.find(candidates_[i]->text());
-          double n = (double)(it != g_user_freq.end() ? it->second : 0);
+          double n = user_freq_eff(candidates_[i]->text());
           fused.emplace_back(
               (1.0 - g_freq_weight) * sl +
                   g_freq_weight * (n / (n + (double)g_freq_k)),
@@ -978,6 +1038,13 @@ void LlmRerankTranslation::Collect() {
 
     if (!order.empty()) {
       // 应用顺序 (缓存命中与真实评分共用): 未匹配候选(新候选)落尾部
+      std::string before;  // 原始候选序 — 必须在重排前捕获 (原先构建于
+      // 重排后, 恒等于 after, 日志失去对比意义, 2026-08-21 修复)
+      for (auto &c : candidates_) {
+        if (!before.empty())
+          before += ",";
+        before += c->text();
+      }
       std::vector<an<Candidate>> reranked;
       std::vector<bool> used(candidates_.size(), false);
       for (int i : order)
@@ -1012,12 +1079,7 @@ void LlmRerankTranslation::Collect() {
       }
       // 事件日志仅在真实推理时写 (缓存命中不重复推理, 也省日志 IO)
       if (did_score) {
-        std::string before, after;
-        for (auto &c : candidates_) {
-          if (!before.empty())
-            before += ",";
-          before += c->text();
-        }
+        std::string after;
         for (auto &c : candidates_) {
           if (!after.empty())
             after += ",";
@@ -1078,11 +1140,13 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     if (hw > 0 && (unsigned)g_n_threads > hw)
       g_n_threads = (int)hw;
     log_msg("config: enabled=%d min_code_len=%d max_code_len=%d "
-            "long_word_first=%d freq_weight=%.2f freq_k=%d min_tokens=%d "
+            "long_word_first=%d freq_weight=%.2f freq_k=%d "
+            "min_tokens=%d "
             "max_tokens=%d max_candidates=%d cpu_cores=%d "
             "min_free_mem_mb=%d model=%s",
             g_enabled ? 1 : 0, g_min_code_len, g_max_code_len,
-            g_long_word_first ? 1 : 0, g_freq_weight, g_freq_k, g_min_tokens,
+            g_long_word_first ? 1 : 0, g_freq_weight, g_freq_k,
+            g_min_tokens,
             g_max_ctx_tokens, g_max_candidates, g_n_threads,
             g_min_free_mem_mb, g_model_path.c_str());
   }

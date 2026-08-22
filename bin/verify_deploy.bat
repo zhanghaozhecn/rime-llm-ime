@@ -5,10 +5,10 @@ REM  rime-llm-ime deploy verification (run on the TARGET machine)
 REM  Checks install dir components + System32 TSF + registry + server
 REM  Expected values are auto-compared against the SOURCE files in this
 REM  script's own directory (the deploy package) -- always in sync with
-REM  the latest bin. Reference md5 (2026-08-18 round 2 build):
+REM  the latest bin. Reference md5 (2026-08-21 formula_d decay build):
 REM    weaselx64.dll    8C19C79F
 REM    WeaselServer.exe BBBCDED9
-REM    rime.dll         BC5A654A
+REM    rime.dll         C7F05CEF
 REM ============================================
 
 set CLSID={A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}
