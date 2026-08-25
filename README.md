@@ -50,14 +50,14 @@ rime-llm-ime/
 使用 **GUI 安装器**（插件版/源码版二选一安装；**只做文件操作**——停服务 → 复制/替换，不碰配置与注册表）：
 
 1. `git clone` [rime-llm-rerank](https://github.com/zhanghaozhecn/rime-llm-rerank) 仓库（或下载其仓库 zip 解压；含两版文件：插件版 `user\`、源码版 `installer\source\`）
-2. **双击 `installer\install_llm_gui.bat`**（自动请求管理员权限）→ 点击 **安装源码版**：
-   停算法服务 → 7 个二进制复制到安装目录（占用自动改名腾位）→ **System32 / SysWOW64 的 weasel.dll 原位替换**（不碰注册表；被锁时延迟替换）→ 重启服务
-3. **重启系统**（System32 TSF DLL 替换生效）
-4. **托盘右键 → 重新部署**（重建词典 build，必须；方案配置需已含 `- llm_filter` 与 `llm_rerank:` 节）
+2. **双击 `installer\install_source.bat`**（自动请求管理员权限）→ 选择方案文件 → 点击 **安装**：
+   停算法服务 → 7 个二进制复制到安装目录（占用自动改名腾位）→ **System32 / SysWOW64 的 weasel.dll 原位替换**（不碰注册表；被锁时延迟替换）→ schema 幂等插入 `- llm_filter` 与 `llm_rerank:` 节 → 重启服务 + 自动重新部署
+3. **重启系统**（若日志提示延迟替换）
+4. **托盘右键 → 重新部署**（重建词典 build，必须——安装器已自动触发一次）
 
 > **托盘重新部署必须执行**：词典 build 必须由 LLM 版 librime 编译（官方部署会覆盖为官方格式，LLM librime 读不了 → 一码字词全部为空）。
 
-**切换版本**：重装官方小狼毫 → 恢复原始（不含 LLM 组件行）的方案配置 → 安装器点另一按钮。**输入法图标消失**时运行 `installer\repair_tsf.ps1`。
+**切换版本**：重装官方小狼毫 → 恢复原始（不含 LLM 组件行）的方案配置 → 运行另一版安装器（`install_plugin.bat`）。**输入法图标消失**时运行 `installer\repair_tsf.ps1`。
 
 ### 手动步骤（脚本不可用时）
 
