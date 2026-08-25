@@ -63,15 +63,15 @@ rime-llm-ime/
    - `rime.dll` / `weaselx64.dll` / `weasel32.dll`（复制为 `weasel.dll`）/ `WeaselServer.exe` / `WeaselDeployer.exe` — 本方案产物
    - `opencc.dll` — rime.dll 的动态依赖（缺失会报"找不到 opencc.dll"）
    - `vcomp140.dll` — VC OpenMP 运行时（无 VS 运行库的机器必需）
-3. 运行 `WeaselSetup.exe /u + /i`（官方部署流程：安装目录 `weasel.dll` → SysWOW64、`weaselx64.dll` → System32，并注册；32 位视图注册缺失时用 `SysWOW64\regsvr32.exe /s C:\Windows\SysWOW64\weasel.dll` + `TEXTSERVICE_PROFILE=hans` 补注册）；System32 被占用时用延迟替换（**切勿重命名替换**，会导致 TSF 注销、语言栏图标消失）
+3. 原位替换系统 TSF 组件（官方安装时已注册，**不碰注册表**）：`weaselx64.dll` → `C:\Windows\System32\weasel.dll`，`weasel32.dll` → `C:\Windows\SysWOW64\weasel.dll`。被占用时先停 `WeaselServer.exe` / `WeaselDeployer.exe`；仍被占（TSF 常驻加载）则改名腾位（`weasel.dll` → `weasel.dll.llm_old` 后复制新文件）。**切勿运行 `WeaselSetup /u`**——它删除 TSF 注册且 `/i` 在 System32 被占用时静默失败，输入法图标直接消失（应急恢复：rime-llm-rerank `installer\repair_tsf.ps1`）
 4. 方案配置插入（二选一）：
-   - 或用 rime-llm-rerank 仓库 `installer\install_source.ps1 -CliAction install -SchemaName <方案>.schema.yaml`（幂等）
+   - 用 rime-llm-rerank 仓库 `installer\install_source.ps1 -CliAction install -SchemaName <方案>.schema.yaml`（幂等；有该仓库时直接运行其 `install_source.bat` 即可完成以上全部步骤，无需手动操作）
    - 手动在 `%APPDATA%\Rime\pdsp.schema.yaml` 的 filters 块 uniquifier 之后加 `- llm_filter`，并添加 `llm_rerank:` 配置节
 5. 托盘右键 → **重新部署** → **重启系统**
 
 ### 部署验证
 
-验证：打满 4 码首选候选带 AI 标记；日志 `%APPDATA%\Rimeime_llm_filter_log.txt`。
+验证：打满 4 码首选候选带 AI 标记；日志 `%APPDATA%\Rime\rime_llm_filter_log.txt`。
 
 ### 常见问题
 
