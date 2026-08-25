@@ -47,16 +47,20 @@ rime-llm-ime/
 
 ### 一键部署（推荐）
 
-1. 从 [Releases](../../releases) 下载部署包 zip（`rime-llm-deploy-*.zip`），解压到任意目录
+使用 **GUI 安装器**（推荐；插件版/源码版二选一安装，含还原功能）：
+
+1. 下载 `rime-llm-installer.zip`（[Releases](../../releases) 附件；由 rime-llm-rerank 仓库 `installer\make_installer.ps1` 生成，含两版文件）
    > 仓库 zip / `git clone` **不含**预编译二进制（bin 二进制不进 git）。源码构建见文末"从源码构建"节。
-2. 双击 `deploy_llm.bat`（自动请求管理员权限），流程：
-   - **[1/7] 模型检查**：默认路径 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf` 已有则跳过；缺失则询问是否下载（约 500MB，ModelScope，断点续传；跳过则 LLM 不工作但输入法正常）
-   - **[2/7] 停止 WeaselServer → [3/7] 复制 7 个组件到安装目录（含 32 位 TSF）→ [4/7] WeaselSetup /u+/i 官方部署（SysWOW64 + System32 双 TSF）→ [5/7] 32 位视图注册兜底 → [6/7] 重启 Server**
-   - **[7/7] 方案配置插入**：在 RIME 用户目录的 `pdsp.schema.yaml` 中幂等插入 `- llm_filter`（uniquifier 后、pin_fix 前，位置校验）与 `llm_rerank:` 配置节
-3. **重启系统**（System32/SysWOW64 TSF 组件生效）
-4. **托盘右键 → 重新部署**（重建词典 build，必须）
+2. 解压后**双击 `install_llm_gui.bat`**（自动请求管理员权限）
+3. 选择**方案文件**（RIME 用户目录的 `*.schema.yaml`）与**模型路径**（留空=默认 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`，缺失时询问下载，断点续传）→ 点击 **安装源码版**：预检 → 停 server → 复制 7 组件 → WeaselSetup /u+/i（SysWOW64 + System32 双 TSF + 32 位注册兜底）→ 重启 Server → schema 幂等插入 `- llm_filter` 与 `llm_rerank:` 节 → 自动触发重新部署
+4. **重启系统**（System32/SysWOW64 TSF 组件生效）
+5. **托盘右键 → 重新部署**（重建词典 build，必须）
 
 > **托盘重新部署必须执行**：词典 build 必须由 LLM 版 librime 编译（官方部署会覆盖为官方格式，LLM librime 读不了 → 一码字词全部为空）。
+
+**还原**：GUI 点击"还原源码版"——仅剥离 schema 配置并自动重新部署（不删文件不恢复二进制）；二进制回官方基线需**重装官方小狼毫 0.17.4**（覆盖安装）后托盘重新部署。
+
+命令行部署（无界面）：部署包 zip（`rime-llm-deploy-*.zip`）中的 `deploy_llm.bat`（模型检查 → 组件复制 → WeaselSetup 官方部署 → 注册兜底 → schema 插入）。
 
 ### 手动步骤（脚本不可用时）
 
