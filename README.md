@@ -49,7 +49,7 @@ rime-llm-ime/
 
 使用 **GUI 安装器**（推荐；插件版/源码版二选一安装，含还原功能）：
 
-1. 下载 `rime-llm-installer.zip`（[Releases](../../releases) 附件；由 rime-llm-rerank 仓库 `installer\make_installer.ps1` 生成，含两版文件）
+1. `git clone` [rime-llm-rerank](https://github.com/zhanghaozhecn/rime-llm-rerank) 仓库（或下载其仓库 zip 解压；含两版文件：插件版 `user\`、源码版 `installer\source\`）
    > 仓库 zip / `git clone` **不含**预编译二进制（bin 二进制不进 git）。源码构建见文末"从源码构建"节。
 2. 解压后**双击 `install_llm_gui.bat`**（自动请求管理员权限）
 3. 选择**方案文件**（RIME 用户目录的 `*.schema.yaml`）与**模型路径**（留空=默认 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`，缺失时询问下载，断点续传）→ 点击 **安装源码版**：预检 → 停 server → 复制 7 组件 → WeaselSetup /u+/i（SysWOW64 + System32 双 TSF + 32 位注册兜底）→ 重启 Server → schema 幂等插入 `- llm_filter` 与 `llm_rerank:` 节 → 自动触发重新部署
