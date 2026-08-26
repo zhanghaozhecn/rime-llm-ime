@@ -59,7 +59,7 @@ rime-llm-ime/
 
 > **托盘重新部署必须执行**：词典 build 必须由 LLM 版 librime 编译（官方部署会覆盖为官方格式，LLM librime 读不了 → 一码字词全部为空）。
 
-**切换版本**：重装官方小狼毫 → 恢复原始（不含 LLM 组件行）的方案配置 → 运行另一版安装器（插件版安装器在 [rime-llm-rerank](https://github.com/zhanghaozhecn/rime-llm-rerank) 仓库）。**输入法图标消失**时运行 `installer\repair_tsf.ps1`。
+**切换版本**：重装官方小狼毫 → 运行另一版安装器（插件版安装器在 [rime-llm-rerank](https://github.com/zhanghaozhecn/rime-llm-rerank) 仓库）——其**方案配置加 LLM** 先剥离本版组件再插入（跨版自动转换），无需恢复原始方案配置。**输入法图标消失**时运行 `installer\repair_tsf.ps1`。
 
 ### 手动步骤（脚本不可用时）
 
