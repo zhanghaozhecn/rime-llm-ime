@@ -44,13 +44,12 @@ rime-llm-ime/
 
 ### 一键部署（推荐）
 
-使用 **GUI 安装器**（插件版/源码版二选一安装；**只做文件操作**——停服务 → 复制/替换，不碰配置与注册表）：
+使用 **GUI 安装器**（插件版/源码版二选一安装；**只做文件操作 + 方案加 LLM 组件行**——不碰注册表）：
 
 1. `git clone` [rime-llm-rerank](https://github.com/zhanghaozhecn/rime-llm-rerank) 仓库（或下载其仓库 zip 解压；含两版文件：插件版 `user\`、源码版 `installer\source\`）
 2. **双击 `installer\install_source.bat`**（自动请求管理员权限）→ 选择方案文件 → 点击 **安装**：
-   停算法服务 → 7 个二进制复制到安装目录（占用自动改名腾位）→ **System32 / SysWOW64 的 weasel.dll 原位替换**（不碰注册表；被锁时延迟替换）→ schema 幂等插入 `- llm_filter` 与 `llm_rerank:` 节 → 重启服务 + 自动重新部署
-3. **重启系统**（若日志提示延迟替换）
-4. **托盘右键 → 重新部署**（重建词典 build，必须——安装器已自动触发一次）
+   停算法服务 + 清理上次安装残留 → 7 个二进制替换到安装目录（一律改名腾位 `*.llm_old`，下次安装时清理）→ **System32 / SysWOW64 的 weasel.dll 原位替换**（不碰注册表）→ schema 幂等插入 `- llm_filter` 与 `llm_rerank:` 节 → 重启服务 + 自动重新部署
+3. **托盘右键 → 重新部署**（重建词典 build，必须——安装器已自动触发一次）
 
 > **托盘重新部署必须执行**：词典 build 必须由 LLM 版 librime 编译（官方部署会覆盖为官方格式，LLM librime 读不了 → 一码字词全部为空）。
 
@@ -63,11 +62,11 @@ rime-llm-ime/
    - `rime.dll` / `weaselx64.dll` / `weasel32.dll`（复制为 `weasel.dll`）/ `WeaselServer.exe` / `WeaselDeployer.exe` — 本方案产物
    - `opencc.dll` — rime.dll 的动态依赖（缺失会报"找不到 opencc.dll"）
    - `vcomp140.dll` — VC OpenMP 运行时（无 VS 运行库的机器必需）
-3. 原位替换系统 TSF 组件（官方安装时已注册，**不碰注册表**）：`weaselx64.dll` → `C:\Windows\System32\weasel.dll`，`weasel32.dll` → `C:\Windows\SysWOW64\weasel.dll`。被占用时先停 `WeaselServer.exe` / `WeaselDeployer.exe`；仍被占（TSF 常驻加载）则改名腾位（`weasel.dll` → `weasel.dll.llm_old` 后复制新文件）。**切勿运行 `WeaselSetup /u`**——它删除 TSF 注册且 `/i` 在 System32 被占用时静默失败，输入法图标直接消失（应急恢复：rime-llm-rerank `installer\repair_tsf.ps1`）
+3. 原位替换系统 TSF 组件（官方安装时已注册，**不碰注册表**）：`weaselx64.dll` → `C:\Windows\System32\weasel.dll`，`weasel32.dll` → `C:\Windows\SysWOW64\weasel.dll`。先停 `WeaselServer.exe` / `WeaselDeployer.exe`，再一律改名腾位（`weasel.dll` → `weasel.dll.llm_old` 后复制新文件，旧文件事后可删）。**切勿运行 `WeaselSetup /u`**——它删除 TSF 注册且 `/i` 在 System32 被占用时静默失败，输入法图标直接消失（应急恢复：rime-llm-rerank `installer\repair_tsf.ps1`）
 4. 方案配置插入（二选一）：
    - 用 rime-llm-rerank 仓库 `installer\install_source.ps1 -CliAction install -SchemaName <方案>.schema.yaml`（幂等；有该仓库时直接运行其 `install_source.bat` 即可完成以上全部步骤，无需手动操作）
    - 手动在 `%APPDATA%\Rime\pdsp.schema.yaml` 的 filters 块 uniquifier 之后加 `- llm_filter`，并添加 `llm_rerank:` 配置节
-5. 托盘右键 → **重新部署** → **重启系统**
+5. 托盘右键 → **重新部署**（新拉起的 TSF 宿主即用新 DLL，无需重启；可选重启让存量宿主一次性换新）
 
 ### 部署验证
 
