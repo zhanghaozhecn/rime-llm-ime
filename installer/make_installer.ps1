@@ -1,4 +1,4 @@
-# make_installer.ps1 — 二进制与共用脚本同步（源码版仓库内，2026-08-26 分仓版）
+﻿# make_installer.ps1 — 二进制与共用脚本同步（源码版仓库内，2026-08-26 分仓版）
 # 1) 仓库根 bin\ → installer\source\（7 个二进制；clone 本仓库即得安装载荷）
 # 2) 平行插件版仓库的 installer\common.ps1 → 本目录（共用文件，两仓库保持一致）
 # 同步后手动 commit 推送即发布（分发 = git clone 对应仓库，无 zip / Release）。
