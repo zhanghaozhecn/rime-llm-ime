@@ -29,10 +29,13 @@ rime-llm-ime/
 │   ├── WeaselIPC/     # SET_CONTEXT_TEXT / RESET_CONTEXT IPC（枚举尾部追加，前缀兼容官方）
 │   ├── WeaselIPCServer/  # OnSetContextText / OnResetContext handler
 │   └── librime/       # 仅补丁头文件（rime_api.h，LLM 版含 set_context_text 等扩展 API）
-├── bin/               # 预编译产物（rime.dll / weaselx64.dll / weasel32.dll /
-│                      # WeaselServer.exe / WeaselDeployer.exe / opencc.dll /
-│                      # vcomp140.dll / bench_threads.exe；部署走 rime-llm-rerank
-│                      # 的 installer\install_source.bat，本仓库不再带部署脚本）
+├── bin/               # 构建产物（gitignore；发布前同步到 installer\source\）
+├── installer/         # 源码版安装器（2026-08-26 分仓：与插件版仓库各自只带本版）
+│   ├── install_source.bat/.ps1  # 入口（GUI 三按钮 / CLI copy-files|schema-add|schema-remove）
+│   ├── common.ps1     #   共用逻辑（与 rime-llm-rerank 仓库保持一致，make_installer 同步）
+│   ├── repair_tsf.ps1 #   TSF 注册应急修复（图标消失时）
+│   ├── make_installer.ps1  # bin\ → source\ 同步 + common.ps1 跨仓同步
+│   └── source/        #   7 个安装二进制（入库；clone 本仓库即得完整安装载荷）
 └── scripts/           # 构建/部署/测试脚本（发布清单，见"从源码构建"）
 ```
 
@@ -44,16 +47,17 @@ rime-llm-ime/
 
 ### 一键部署（推荐）
 
-使用 **GUI 安装器**（插件版/源码版二选一安装；**只做文件操作 + 方案加 LLM 组件行**——不碰注册表）：
+使用 **GUI 安装器**（插件版/源码版二选一；**只做文件操作 + 方案配置加/去 LLM**——不碰注册表）：
 
-1. `git clone` [rime-llm-rerank](https://github.com/zhanghaozhecn/rime-llm-rerank) 仓库（或下载其仓库 zip 解压；含两版文件：插件版 `user\`、源码版 `installer\source\`）
-2. **双击 `installer\install_source.bat`**（自动请求管理员权限）→ 选择方案文件 → 点击 **安装**：
-   停算法服务 + 清理上次安装残留 → 7 个二进制替换到安装目录（一律改名腾位 `*.llm_old`，下次安装时清理）→ **System32 / SysWOW64 的 weasel.dll 原位替换**（不碰注册表）→ schema 幂等插入 `- llm_filter` 与 `llm_rerank:` 节 → 重启服务 + 自动重新部署
-3. **托盘右键 → 重新部署**（重建词典 build，必须——安装器已自动触发一次）
+1. `git clone` 本仓库（[rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime)）到目标电脑（或下载仓库 zip 解压；源码版安装载荷 `installer\source\` 已入库）
+2. **双击 `installer\install_source.bat`**（自动请求管理员权限）→ 选择方案文件（模型路径留空 = 默认）→ 点击 **复制文件**：
+   停算法服务 + 清理上次安装残留 → 7 个二进制替换到安装目录（一律改名腾位 `*.llm_old`，下次安装时清理）→ **System32 / SysWOW64 的 weasel.dll 原位替换**（不碰注册表）→ 重启服务 + 自动重新部署
+3. 点击 **方案配置加 LLM**：schema 幂等插入 `- llm_filter` 与 `llm_rerank:` 节 → 自动重新部署（**方案配置去 LLM** 按钮为逆操作，剥离组件行与配置节）
+4. **托盘右键 → 重新部署**（重建词典 build，必须——安装器已自动触发一次）
 
 > **托盘重新部署必须执行**：词典 build 必须由 LLM 版 librime 编译（官方部署会覆盖为官方格式，LLM librime 读不了 → 一码字词全部为空）。
 
-**切换版本**：重装官方小狼毫 → 恢复原始（不含 LLM 组件行）的方案配置 → 运行另一版安装器（`install_plugin.bat`）。**输入法图标消失**时运行 `installer\repair_tsf.ps1`。
+**切换版本**：重装官方小狼毫 → 恢复原始（不含 LLM 组件行）的方案配置 → 运行另一版安装器（插件版安装器在 [rime-llm-rerank](https://github.com/zhanghaozhecn/rime-llm-rerank) 仓库）。**输入法图标消失**时运行 `installer\repair_tsf.ps1`。
 
 ### 手动步骤（脚本不可用时）
 
@@ -62,9 +66,9 @@ rime-llm-ime/
    - `rime.dll` / `weaselx64.dll` / `weasel32.dll`（复制为 `weasel.dll`）/ `WeaselServer.exe` / `WeaselDeployer.exe` — 本方案产物
    - `opencc.dll` — rime.dll 的动态依赖（缺失会报"找不到 opencc.dll"）
    - `vcomp140.dll` — VC OpenMP 运行时（无 VS 运行库的机器必需）
-3. 原位替换系统 TSF 组件（官方安装时已注册，**不碰注册表**）：`weaselx64.dll` → `C:\Windows\System32\weasel.dll`，`weasel32.dll` → `C:\Windows\SysWOW64\weasel.dll`。先停 `WeaselServer.exe` / `WeaselDeployer.exe`，再一律改名腾位（`weasel.dll` → `weasel.dll.llm_old` 后复制新文件，旧文件事后可删）。**切勿运行 `WeaselSetup /u`**——它删除 TSF 注册且 `/i` 在 System32 被占用时静默失败，输入法图标直接消失（应急恢复：rime-llm-rerank `installer\repair_tsf.ps1`）
+3. 原位替换系统 TSF 组件（官方安装时已注册，**不碰注册表**）：`weaselx64.dll` → `C:\Windows\System32\weasel.dll`，`weasel32.dll` → `C:\Windows\SysWOW64\weasel.dll`。先停 `WeaselServer.exe` / `WeaselDeployer.exe`，再一律改名腾位（`weasel.dll` → `weasel.dll.llm_old` 后复制新文件，旧文件事后可删）。**切勿运行 `WeaselSetup /u`**——它删除 TSF 注册且 `/i` 在 System32 被占用时静默失败，输入法图标直接消失（应急恢复：本仓库 `installer\repair_tsf.ps1`）
 4. 方案配置插入（二选一）：
-   - 用 rime-llm-rerank 仓库 `installer\install_source.ps1 -CliAction install -SchemaName <方案>.schema.yaml`（幂等；有该仓库时直接运行其 `install_source.bat` 即可完成以上全部步骤，无需手动操作）
+   - 用本仓库 `installer\install_source.ps1 -CliAction install -SchemaName <方案>.schema.yaml`（幂等；直接运行其 `install_source.bat` 即可完成以上全部步骤，无需手动操作）
    - 手动在 `%APPDATA%\Rime\pdsp.schema.yaml` 的 filters 块 uniquifier 之后加 `- llm_filter`，并添加 `llm_rerank:` 配置节
 5. 托盘右键 → **重新部署**（新拉起的 TSF 宿主即用新 DLL，无需重启；可选重启让存量宿主一次性换新）
 
@@ -178,7 +182,7 @@ scripts\build_tsf32.bat         :: Win32 TSF → weasel\output\weasel.dll（官�
 
 ### 替换安装文件
 
-产物齐后，把 `librime\build\bin\Release\rime.dll`、`weasel\output\weaselx64.dll`、`weasel\output\weasel.dll`（32 位）、`weasel\output\WeaselServer.exe` 放进 `bin\`（连同 opencc.dll / vcomp140.dll），然后运行 rime-llm-rerank 仓库的 `installer\install_source.bat` 部署，重启系统（TSF 注册表缓存），最后**托盘重新部署**（LLM librime 重建词典 build）。
+产物齐后，把 `librime\build\bin\Release\rime.dll`、`weasel\output\weaselx64.dll`、`weasel\output\weasel.dll`（32 位）、`weasel\output\WeaselServer.exe` 放进 `bin\`（连同 opencc.dll / vcomp140.dll），运行 `installer\make_installer.ps1`（bin\ → installer\source\，并同步插件版仓库的 common.ps1），再运行本仓库 `installer\install_source.bat` 部署，最后**托盘重新部署**（LLM librime 重建词典 build）。
 
 ## 候选窗 AI 标记
 
