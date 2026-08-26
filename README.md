@@ -50,10 +50,12 @@ rime-llm-ime/
 使用 **GUI 安装器**（插件版/源码版二选一；**只做文件操作 + 方案配置加/去 LLM**——不碰注册表）：
 
 1. `git clone` 本仓库（[rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime)）到目标电脑（或下载仓库 zip 解压；源码版安装载荷 `installer\source\` 已入库）
-2. **双击 `installer\install_source.bat`**（自动请求管理员权限）→ 选择方案文件（模型路径留空 = 默认）→ 点击 **复制文件**：
+2. **双击 `installer\install_source.bat`**（自动请求管理员权限）→ 选择方案文件（模型路径留空 = 默认）
+3. 缺模型时点击 **下载模型**：从 ModelScope 下载（约 500MB，断点续传——中断/失败后重新点击自动续传；目标 = 模型路径框，留空 = 默认）
+4. 点击 **复制文件**：
    停算法服务 + 清理上次安装残留 → 7 个二进制替换到安装目录（一律改名腾位 `*.llm_old`，下次安装时清理）→ **System32 / SysWOW64 的 weasel.dll 原位替换**（不碰注册表）→ 重启服务 + 自动重新部署
-3. 点击 **方案配置加 LLM**：schema 幂等插入 `- llm_filter` 与 `llm_rerank:` 节 → 自动重新部署（**方案配置去 LLM** 按钮为逆操作，剥离组件行与配置节）
-4. **托盘右键 → 重新部署**（重建词典 build，必须——安装器已自动触发一次）
+5. 点击 **方案配置加 LLM**：schema 幂等插入 `- llm_filter` 与 `llm_rerank:` 节 → 自动重新部署（**方案配置去 LLM** 按钮为逆操作，剥离组件行与配置节）
+6. **托盘右键 → 重新部署**（重建词典 build，必须——安装器已自动触发一次）
 
 > **托盘重新部署必须执行**：词典 build 必须由 LLM 版 librime 编译（官方部署会覆盖为官方格式，LLM librime 读不了 → 一码字词全部为空）。
 
