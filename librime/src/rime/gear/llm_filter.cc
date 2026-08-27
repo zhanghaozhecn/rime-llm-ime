@@ -57,7 +57,15 @@ static std::atomic<bool> g_loading{false};
 // 写入, 平面 key: value, Apply 时按 mtime|size 热重载）; 优先级 schema 节 >
 // 全局 yaml > 内置默认。engine.cc 全局挂载使任何方案零修改获得 llm_filter
 //（enabled 默认 false 纯透传）。
-static std::string g_model_path = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
+// 默认模型路径 = %USERPROFILE%\gguf_models\（2026-08-27 用户定案：不假设
+// 存在 D: 分区；本机/有 D 盘的机器用 llm_rerank model_path 显式指向）
+static std::string default_model_path() {
+  const char *up = getenv("USERPROFILE");
+  if (up && *up)
+    return std::string(up) + "\\gguf_models\\Qwen3.5-0.8B-Q4_K_M.gguf";
+  return "gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
+}
+static std::string g_model_path = default_model_path();
 static bool g_enabled = false;  // CPU only; GPU build retired (not published)
 static int g_min_code_len = 4;
 static int g_max_code_len = 0;  // 0 = no upper limit (plugin-version parity)
@@ -129,9 +137,8 @@ static void llm_apply_params() {
     g_n_threads = (int)hw;
   g_model_path = s.has_model_path
                      ? s.model_path
-                     : (y.has_model_path
-                            ? y.model_path
-                            : "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf");
+                     : (y.has_model_path ? y.model_path
+                                         : default_model_path());
 }
 
 // 全局 llm_rerank.yaml 路径（与 user_freq.tsv 同目录解析）

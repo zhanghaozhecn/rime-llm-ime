@@ -1,4 +1,4 @@
-# rime-llm-ime — 基于 LLM 候选重排的输入法
+﻿# rime-llm-ime — 基于 LLM 候选重排的输入法
 
 将 LLM 候选重排**源码级集成**进 RIME 小狼毫（weasel + librime）的中文输入方案：不需要外挂进程或 lua 插件，`llm_filter` 作为 librime 原生 filter 组件（C++）编译进 `rime.dll`，TSF 原生采集光标上文。
 
@@ -43,11 +43,17 @@ rime-llm-ime/
 
 ## 快速开始（普通用户）
 
-前置：已安装官方小狼毫 0.17.x（x64）。
+### 直接安装（推荐，2026-08-27 起）
 
-### 一键部署（推荐）
+1. 下载安装包 `weasel-llm-setup-<日期>.exe`（约 9MB，[GitHub Release](https://github.com/zhanghaozhecn/rime-llm-ime/releases)）并双击——支持全新机器（无需先装官方小狼毫，自动完成 TSF 注册）与已有小狼毫（原地升级，不动注册）
+2. 装完**托盘右键小狼毫 → “LLM 重排设置”**：首次会提示下载模型（约 500MB，断点续传，默认 `%USERPROFILE%\gguf_models\`）→ 勾选“启用 LLM 重排”→ **保存并生效**（立即热重载，无需重新部署；参数随时可改，保存即生效）
+3. **任何方案零配置**——llm_filter 全局自动挂载；参数优先级：方案内 `llm_rerank:` 节 > 全局 `%APPDATA%\Rime\llm_rerank.yaml`（GUI 写的就是它）> 内置默认
 
-使用 **GUI 安装器**（插件版/源码版二选一；**只做文件操作 + 方案配置加/去 LLM**——不碰注册表）：
+> 已运行的应用需重启（或注销/重启系统）后托盘菜单与 TSF 行为才统一到新版（TSF DLL 按进程加载）；输入法本体不受影响。
+
+### clone 仓库安装（进阶/维修）
+
+前置：已安装官方小狼毫 0.17.x（x64）。使用 **GUI 安装器**（插件版/源码版二选一；**只做文件操作 + 方案配置加/去 LLM**——不碰注册表）：
 
 1. `git clone` 本仓库（[rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime)）到目标电脑（或下载仓库 zip 解压；源码版安装载荷 `installer\source\` 已入库）
 2. **双击 `installer\install_source.bat`**（自动请求管理员权限）→ 选择方案文件（模型路径留空 = 默认）
@@ -63,7 +69,7 @@ rime-llm-ime/
 
 ### 手动步骤（脚本不可用时）
 
-1. 下载 GGUF 模型（本机验证使用 `Qwen3.5-0.8B-Q4_K_M.gguf`，任意小模型均可，建议 ≤2B Q4）放到 `d:\gguf_models\`
+1. 下载 GGUF 模型（本机验证使用 `Qwen3.5-0.8B-Q4_K_M.gguf`，任意小模型均可，建议 ≤2B Q4）放到 `%USERPROFILE%\gguf_models\`（默认路径；其他位置用 `model_path` 指定）
 2. 将 `bin/` 下 **7 个文件**复制到小狼毫安装目录（`C:\Program Files\Rime\weasel-0.17.4`）：
    - `rime.dll` / `weaselx64.dll` / `weasel32.dll`（复制为 `weasel.dll`）/ `WeaselServer.exe` / `WeaselDeployer.exe` — 本方案产物
    - `opencc.dll` — rime.dll 的动态依赖（缺失会报"找不到 opencc.dll"）
@@ -89,6 +95,8 @@ rime-llm-ime/
 
 ### llm_rerank 配置节（全部可选）
 
+**三级优先级：方案内 `llm_rerank:` 节 > 全局 `%APPDATA%\Rime\llm_rerank.yaml` > 内置默认**。全局文件由托盘“LLM 重排设置”GUI 读写（平面 `key: value`，与下列键名相同），**保存即热重载生效**（enabled 关→开自动加载模型；model_path 热改需重启会话）。方案内的节仍优先生效（老方案文件零破坏）。
+
 ```yaml
 llm_rerank:
   enabled: true         # true=启用 LLM 重排 | false=关闭（组件透传，不推理）
@@ -101,7 +109,7 @@ llm_rerank:
   max_tokens: 10        # 上文 token 上限
   max_candidates: 5     # 参与打分的候选数上限
   cpu_cores: 4          # 默认线程数（=GGML 默认，适用旧设备；用发布包内 bench_threads.exe 实测后自行修改）
-  model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
+  model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf  # 示例（默认 = %USERPROFILE%/gguf_models/ 同名文件）
 ```
 
 ## 构建（开发者）

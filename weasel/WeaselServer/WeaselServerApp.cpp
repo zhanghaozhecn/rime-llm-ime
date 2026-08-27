@@ -61,6 +61,10 @@ void WeaselServerApp::SetupMenuHandlers() {
   m_server.AddMenuHandler(
       ID_WEASELTRAY_SYNC,
       std::bind(execute, dir / L"WeaselDeployer.exe", std::wstring(L"/sync")));
+  // LLM 重排设置（直接安装版）: 全局 llm_rerank.yaml GUI，保存即热重载生效
+  m_server.AddMenuHandler(
+      ID_WEASELTRAY_LLM_SETUP,
+      std::bind(execute, dir / L"WeaselLLMSetup.exe", std::wstring()));
   m_server.AddMenuHandler(ID_WEASELTRAY_WIKI,
                           std::bind(open, L"https://rime.im/docs/"));
   m_server.AddMenuHandler(ID_WEASELTRAY_HOMEPAGE,

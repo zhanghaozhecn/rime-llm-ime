@@ -54,7 +54,12 @@ bin/*.exe
 bin/data/
 bin/test_rime.exe
 
-# 测试临时输出
+# 安装包产物（分发走 Release）
+installer/dist/
+
+# 测试临时输出（test_rime 在 bin 产生的运行时文件）
+bin/rime_llm_filter_log.txt
+bin/user.yaml
 test_new.txt
 test_old.txt
 server_out.log

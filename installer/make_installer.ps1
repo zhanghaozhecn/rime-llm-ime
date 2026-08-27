@@ -16,7 +16,8 @@ if (-not (Test-Path (Join-Path $SourceBin "rime.dll"))) {
 $dst = Join-Path $here "source"
 New-Item -ItemType Directory -Path $dst -Force | Out-Null
 foreach ($f in @("rime.dll", "WeaselServer.exe", "WeaselDeployer.exe",
-                 "weaselx64.dll", "weasel32.dll", "opencc.dll", "vcomp140.dll")) {
+                 "weaselx64.dll", "weasel32.dll", "opencc.dll", "vcomp140.dll",
+                 "WeaselLLMSetup.exe")) {
   $s = Join-Path $SourceBin $f
   if (Test-Path $s) { Copy-Item $s $dst -Force; Write-Host "+ $f" }
   else { Write-Host "MISS $f" -ForegroundColor Yellow }

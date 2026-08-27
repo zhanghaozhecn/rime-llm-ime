@@ -309,6 +309,18 @@ void WeaselTSF::_HandleLangBarMenuSelect(UINT wID) {
           open(dir);
       }
       break;
+    case ID_WEASELTRAY_LLM_SETUP:
+      // LLM 重排设置 GUI（直接安装版）：从安装目录启动 WeaselLLMSetup.exe，
+      // 读写全局 llm_rerank.yaml（llm_filter 热重载即时生效）
+      if (RegGetStringValue(HKEY_LOCAL_MACHINE, GetWeaselRegName(),
+                            L"WeaselRoot", dir) == ERROR_SUCCESS) {
+        std::thread th([dir]() {
+          ShellExecuteW(NULL, L"open", (dir + L"\\WeaselLLMSetup.exe").c_str(),
+                        NULL, dir.c_str(), SW_SHOWNORMAL);
+        });
+        th.detach();
+      }
+      break;
     case ID_WEASELTRAY_USERCONFIG:
       if (FAILED(RegGetStringValue(HKEY_CURRENT_USER, L"Software\\Rime\\Weasel",
                                    L"RimeUserDir", dir)) ||
