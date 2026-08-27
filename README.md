@@ -82,7 +82,7 @@ rime-llm-ime/
 
 - **Win+Space 无小狼毫**：设置 → 时间和语言 → 中文 → 键盘 → 添加键盘 → 小狼毫
 - **32 位应用（QQ 音乐、WPS 等）**：加载 32 位 LLM TSF（SysWOW64\weasel.dll，部署包 `weasel32.dll`）；32 位视图注册缺失时输入英文，用部署脚本 [5/7] 兜底（`SysWOW64\regsvr32.exe /s` + `TEXTSERVICE_PROFILE=hans`）
-- **内存 ≤4GB**：`enabled: false` 或调小 `min_free_mem_mb`（0.8B Q4 模型加载后 WeaselServer 约占 2GB）
+- **内存 ≤4GB**：`enabled: false`（0.8B Q4 模型加载后 WeaselServer 约占 2GB；原 `min_free_mem_mb` 低内存守卫已删——2026-08-27 两版参数统一）
 - **语言栏图标消失**：多为 System32 DLL 被重命名替换导致，恢复方式：重装官方包 → 设置添加键盘 → 重新部署
 
 > 使用其他方案：安装器界面直接选择该方案文件（或 CLI 传 `-SchemaName`），或手动加 `llm_rerank` 配置节 + filters 链 uniquifier 后的 `- llm_filter`。配置节仅依赖四码输入编码，与具体方案无关。
@@ -94,14 +94,13 @@ llm_rerank:
   enabled: true         # true=启用 LLM 重排 | false=关闭（组件透传，不推理）
   min_code_len: 4       # 输入编码长度小于此值时不重排
   max_code_len: 0       # 编码长度上限（0=不限制）；超出不推理，与 min_code_len 组成触发区间
-  long_word_first: false # true=long-word-first: 候选算完 CE 后按词长降序, 同词长按 CE 评分序
+  expected_length_weight: 0.20 # >0=预期词长加权: 词长==floor(码长/2) 的候选获得 分数跨度×权重 加成（两码一字方案）
   freq_weight: 0.25  # 用户词频融合权重 (0=关闭): total=(1-w)·LLM(窗内min-max)+w·count/(count+k)
   freq_k: 5          # 词频饱和常数; 词频由 OnCommit 自动统计 (RIME 用户目录 user_freq.tsv)
   min_tokens: 1         # 上文 token 数小于此值时不推理
   max_tokens: 10        # 上文 token 上限
   max_candidates: 5     # 参与打分的候选数上限
   cpu_cores: 4          # 默认线程数（=GGML 默认，适用旧设备；用发布包内 bench_threads.exe 实测后自行修改）
-  min_free_mem_mb: 2560 # 可用内存低于此值时不加载模型（防小内存机器系统卡死）
   model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
 ```
 
@@ -131,8 +130,8 @@ llm_rerank:
 librime 侧（`gear/llm_filter.cc`，新增组件）：
 - 上文来源自适应（`GetContextTextPair`）：TSF 文本优先；TSF 文本空/滞后 → commit history 兜底（提交后同步累积，必有最近上屏词）；**残留检测**——TSF 文本不含 commit history 尾部（最近上屏词）时判为其他应用残留，改用历史
 - 预解码（`prepare`）：commit/上下文变化后异步 decode 上文，score 命中复用 KV
-- 触发区间 `[min_code_len, max_code_len]`（0=不限制）+ 重排后 `long_word_first` long-word-first 排序（与插件版参数对齐）
-- 用户词频融合 `freq_weight`/`freq_k`（默认 0.25/5）：`total=(1-w)·LLM评分(窗内min-max归一) + w·count/(count+k)`，词频由 OnCommit 自动统计并持久化（user_freq.tsv）。实证（真实候选窗回放 6000 抽样）：w=0.25 首选率 97.08%→98.20%，纯 LLM 排错事件 87% 的选中词用户词频≥2。融合应用于评分序之上、long_word_first 之前（与插件版一致）
+- 触发区间 `[min_code_len, max_code_len]`（0=不限制）+ 重排后 `expected_length_weight` 预期词长加权（与插件版参数统一，2026-08-27；`long_word_first` 已删）
+- 用户词频融合 `freq_weight`/`freq_k`（默认 0.25/5）：`total=(1-w)·LLM评分(窗内min-max归一) + w·count/(count+k)`，词频由 OnCommit 自动统计并持久化（user_freq.tsv）。实证（真实候选窗回放 6000 抽样）：w=0.25 首选率 97.08%→98.20%，纯 LLM 排错事件 87% 的选中词用户词频≥2。融合应用于评分序之上、expected_length 加权之前（与插件版一致）
 
 ### 构建步骤
 
@@ -206,7 +205,7 @@ score: wait=12ms S1=48ms KV=3ms S2=9ms total=72ms prep=1 ctx_tok=9 cand=5
 ctx: [上文]              # 推理时用的上文（normalize 后）
 ctx raw: [原始上文]       # normalize 前后不一致时记录原始值
 RESET: context cleared (gen=N reason=...)   # TSF 上下文被清空（编辑键/切窗）
-config: enabled=1 min_code_len=4 max_code_len=0 long_word_first=0 ...   # 部署/会话启动时的配置
+config: enabled=1 min_code_len=4 max_code_len=0 expected_length_weight=0.20 ...   # 部署/会话启动时的配置
 ```
 
 事件日志（`时间|计数|编码|候选|上文|排序后候选|延迟|来源`）用于选词质量排查。
