@@ -11,6 +11,7 @@
 #include <rime/engine.h>
 #include <rime/filter.h>
 #include <rime/formatter.h>
+#include <rime/gear/llm_filter.h>
 #include <rime/key_event.h>
 #include <rime/menu.h>
 #include <rime/processor.h>
@@ -355,6 +356,24 @@ void ConcreteEngine::InitializeComponents() {
                                        "translator", translators_);
   CreateComponentsFromList<Filter>(this, config, "engine/filters", "filter",
                                    filters_);
+  // LLM 重排全局挂载（源码版专属补丁）：schema 的 filters 未显式列出
+  // llm_filter 时追加到链尾（uniquifier 之后的等价位置）。enabled 默认
+  // false → 未启用纯透传；参数优先级 schema llm_rerank 节 > 全局
+  // llm_rerank.yaml（%APPDATA%\Rime，GUI 写入热重载）。
+  {
+    bool has_llm = false;
+    for (auto& f : filters_) {
+      if (dynamic_cast<LlmFilter*>(f.get())) {
+        has_llm = true;
+        break;
+      }
+    }
+    if (!has_llm) {
+      if (auto c = Filter::Require("llm_filter")) {
+        filters_.push_back(an<Filter>(c->Create(Ticket(this))));
+      }
+    }
+  }
   // create formatters
   auto c_formatter = Formatter::Require("shape_formatter");
   if (c_formatter) {

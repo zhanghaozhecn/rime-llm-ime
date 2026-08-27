@@ -51,13 +51,17 @@ static std::atomic<bool> g_loading{false};
 //   min_code_len: input code length below this -> no rerank
 //   max_code_len: input code length above this -> no rerank (0 = unlimited);
 //                 [min, max] = rerank trigger window
-//   long_word_first: true = after rerank, sort by word length desc
-//                      (same length keeps CE order)
+//   expected_length_weight: >0 = bonus candidates whose word length equals
+//                 floor(code_len/2) (两码一字), weighted by current score span
+// 全局配置（2026-08-27 直接安装版）: %APPDATA%\Rime\llm_rerank.yaml（GUI
+// 写入, 平面 key: value, Apply 时按 mtime|size 热重载）; 优先级 schema 节 >
+// 全局 yaml > 内置默认。engine.cc 全局挂载使任何方案零修改获得 llm_filter
+//（enabled 默认 false 纯透传）。
 static std::string g_model_path = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static bool g_enabled = false;  // CPU only; GPU build retired (not published)
 static int g_min_code_len = 4;
 static int g_max_code_len = 0;  // 0 = no upper limit (plugin-version parity)
-static bool g_long_word_first = false;
+static double g_expected_length_weight = 0.0;  // 预期词长加权 (两版统一 2026-08-27)
 // 用户词频融合 (2026-08-19): total = (1-w)·LLM + w·count/(count+k),
 // 默认 w=0.25/k=5 (真实候选窗回放实证, 见 Collect 融合段注释)
 static double g_freq_weight = 0.25;
@@ -70,11 +74,159 @@ static void log_msg(const char *fmt, ...);  // defined below (fwd decl)
 static std::vector<llama_token> tokenize(const char *text);  // fwd decl
 static double cross_entropy(float *logits, int vs, int target_id);  // fwd decl
 
-static int g_min_free_mem_mb = 2560;  // skip model load when free RAM below this
-                                       // (0.8B Q4 needs ~2GB: freeze beats no rerank)
 static int g_n_ctx = 128;          // KV: 11 seqs x (ctx 10 + cand 2) = 132, 64 overflows
 static int g_n_seq_max = 12;       // template seq 0 + up to 11 worker seqs
 static int g_max_candidates = 5;   // candidates participating in scoring
+
+// ==== 参数三级合并（2026-08-27 直接安装版）: schema llm_rerank 节 > 全局
+// llm_rerank.yaml（%APPDATA%\Rime，GUI 写入）> 内置默认。全局文件热重载
+//（Apply 时 stat mtime|size 指纹，变了重读合并；enabled 关→开触发模型异步
+// 加载；model_path 热改不重载模型，需重启会话）。engine 线程调用。 ====
+struct LlmParamSet {
+  bool has_enabled = false;      bool enabled = false;
+  bool has_min_code_len = false; int min_code_len = 4;
+  bool has_max_code_len = false; int max_code_len = 0;
+  bool has_elw = false;          double elw = 0.0;
+  bool has_freq_weight = false;  double freq_weight = 0.25;
+  bool has_freq_k = false;       int freq_k = 5;
+  bool has_min_tokens = false;   int min_tokens = 1;
+  bool has_max_tokens = false;   int max_tokens = 10;
+  bool has_max_cand = false;     int max_cand = 5;
+  bool has_cpu_cores = false;    int cpu_cores = 4;
+  bool has_model_path = false;   std::string model_path;
+};
+static LlmParamSet g_schema_params;  // Initialize 时快照（部署期固定）
+static LlmParamSet g_yaml_params;    // 全局 yaml（热重载）
+static unsigned long long g_yaml_stamp = 0;  // mtime|size 变更指纹
+static void load_model_async();      // fwd decl（定义在下方）
+
+static void llm_apply_params() {
+  const LlmParamSet &s = g_schema_params, &y = g_yaml_params;
+  g_enabled = s.has_enabled ? s.enabled : (y.has_enabled ? y.enabled : false);
+  g_min_code_len = s.has_min_code_len
+                       ? s.min_code_len
+                       : (y.has_min_code_len ? y.min_code_len : 4);
+  g_max_code_len = s.has_max_code_len
+                       ? s.max_code_len
+                       : (y.has_max_code_len ? y.max_code_len : 0);
+  g_expected_length_weight =
+      s.has_elw ? s.elw : (y.has_elw ? y.elw : 0.0);
+  g_freq_weight = s.has_freq_weight ? s.freq_weight
+                                    : (y.has_freq_weight ? y.freq_weight : 0.25);
+  g_freq_k = s.has_freq_k ? s.freq_k : (y.has_freq_k ? y.freq_k : 5);
+  g_min_tokens =
+      s.has_min_tokens ? s.min_tokens : (y.has_min_tokens ? y.min_tokens : 1);
+  g_max_ctx_tokens = s.has_max_tokens
+                         ? s.max_tokens
+                         : (y.has_max_tokens ? y.max_tokens : 10);
+  g_max_candidates =
+      s.has_max_cand ? s.max_cand : (y.has_max_cand ? y.max_cand : 5);
+  g_n_threads =
+      s.has_cpu_cores ? s.cpu_cores : (y.has_cpu_cores ? y.cpu_cores : 4);
+  // cap threads at hardware cores: 低核机器不应超订（变慢 + 每线程额外内存）
+  unsigned hw = std::thread::hardware_concurrency();
+  if (hw > 0 && (unsigned)g_n_threads > hw)
+    g_n_threads = (int)hw;
+  g_model_path = s.has_model_path
+                     ? s.model_path
+                     : (y.has_model_path
+                            ? y.model_path
+                            : "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf");
+}
+
+// 全局 llm_rerank.yaml 路径（与 user_freq.tsv 同目录解析）
+static bool llm_global_file(char *path, size_t n) {
+  const RimeApi *api = rime_get_api();
+  if (api && api->get_user_data_dir) {
+    const char *ud = api->get_user_data_dir();
+    if (ud && *ud) {
+      snprintf(path, n, "%s\\llm_rerank.yaml", ud);
+      return true;
+    }
+  }
+  return false;
+}
+
+static std::string llm_trim(const std::string &s) {
+  size_t a = s.find_first_not_of(" \t");
+  size_t b = s.find_last_not_of(" \t\r\n");
+  return (a == std::string::npos) ? std::string() : s.substr(a, b - a + 1);
+}
+
+// 扁平 key: value 解析（GUI 生成的平面 yaml；坏行跳过；值支持行内 # 注释
+// 与成对引号）
+static void llm_load_global_params() {
+  g_yaml_params = LlmParamSet();
+  char path[MAX_PATH];
+  if (!llm_global_file(path, sizeof(path)))
+    return;
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return;
+  char line[512];
+  while (fgets(line, sizeof(line), f)) {
+    std::string ln = llm_trim(line);
+    if (ln.empty() || ln[0] == '#')
+      continue;
+    size_t c = ln.find(':');
+    if (c == std::string::npos)
+      continue;
+    std::string key = llm_trim(ln.substr(0, c));
+    std::string val = llm_trim(ln.substr(c + 1));
+    if (!val.empty() && val[0] == '"') {  // 引号值: 取到闭引号
+      size_t e = val.find('"', 1);
+      val = (e == std::string::npos) ? val.substr(1) : val.substr(1, e - 1);
+    } else {  // 行内注释
+      size_t h = val.find('#');
+      if (h != std::string::npos)
+        val = llm_trim(val.substr(0, h));
+    }
+    LlmParamSet &p = g_yaml_params;
+    if (key == "enabled") { p.has_enabled = true; p.enabled = (val == "true"); }
+    else if (key == "min_code_len") { p.has_min_code_len = true; p.min_code_len = atoi(val.c_str()); }
+    else if (key == "max_code_len") { p.has_max_code_len = true; p.max_code_len = atoi(val.c_str()); }
+    else if (key == "expected_length_weight") { p.has_elw = true; p.elw = atof(val.c_str()); }
+    else if (key == "freq_weight") { p.has_freq_weight = true; p.freq_weight = atof(val.c_str()); }
+    else if (key == "freq_k") { p.has_freq_k = true; p.freq_k = atoi(val.c_str()); }
+    else if (key == "min_tokens") { p.has_min_tokens = true; p.min_tokens = atoi(val.c_str()); }
+    else if (key == "max_tokens") { p.has_max_tokens = true; p.max_tokens = atoi(val.c_str()); }
+    else if (key == "max_candidates") { p.has_max_cand = true; p.max_cand = atoi(val.c_str()); }
+    else if (key == "cpu_cores") { p.has_cpu_cores = true; p.cpu_cores = atoi(val.c_str()); }
+    else if (key == "model_path") { p.has_model_path = true; p.model_path = val; }
+  }
+  fclose(f);
+}
+
+static unsigned long long llm_yaml_stamp() {
+  char path[MAX_PATH];
+  if (!llm_global_file(path, sizeof(path)))
+    return 0;
+  WIN32_FILE_ATTRIBUTE_DATA fa;
+  if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fa))
+    return 0;  // 文件不存在 = 空指纹（删除全局配置 → 回退 schema/默认）
+  unsigned long long st =
+      ((unsigned long long)fa.ftLastWriteTime.dwHighDateTime << 32) |
+      (unsigned long long)fa.ftLastWriteTime.dwLowDateTime;
+  return st ^ ((unsigned long long)fa.nFileSizeLow << 1);
+}
+
+// 热重载: 指纹变化 → 重读合并; enabled 关→开且模型未载 → 异步加载。
+static void llm_reload_global_if_changed() {
+  unsigned long long stamp = llm_yaml_stamp();
+  if (stamp == g_yaml_stamp)
+    return;
+  g_yaml_stamp = stamp;  // 先记指纹（坏文件不反复重试）
+  bool was_enabled = g_enabled;
+  llm_load_global_params();
+  llm_apply_params();
+  log_msg("llm_rerank.yaml reloaded: enabled=%d elw=%.2f freq=%.2f/%d "
+          "tok=%d/%d cand=%d cores=%d model=%s",
+          g_enabled ? 1 : 0, g_expected_length_weight, g_freq_weight, g_freq_k,
+          g_min_tokens, g_max_ctx_tokens, g_max_candidates, g_n_threads,
+          g_model_path.c_str());
+  if (!was_enabled && g_enabled && !g_loaded.load() && !g_loading.load())
+    load_model_async();
+}
 
 // ============================================================
 // commit-history fallback state (engine thread only: OnCommit sink
@@ -105,8 +257,8 @@ static long                     g_prep_gen = 0; // generation at which prep was 
 // ============================================================
 // score result cache: same (ctx, input) reuses the previous rerank
 // (翻页/候选窗重建不重复推理 — 对齐插件版 _G.llm_filter_cache)。
-// 只存评分顺序（候选文本），long_word_first 排序与 AI 徽章每次按当前
-// 配置重放，改 long_word_first 后重新部署缓存仍正确。reset 代次变
+// 只存评分顺序（候选文本），词频融合/expected_length 排序与 AI 徽章每次
+// 按当前配置重放，改参数后重新部署缓存仍正确。reset 代次变
 // （编辑键/窗口切换）→ 失效；ctx/input 变 → key 不匹配自然失效。
 // engine 线程专用（Apply/Collect 均在引擎线程），无锁。
 // ============================================================
@@ -352,17 +504,6 @@ static void event_log(const std::string &input, const std::string &before,
 static void load_model_async() {
   if (g_loaded.load() || g_loading.load())
     return;
-  // low-memory guard: LLM needs ~2GB (model + KV + compute buffers); on
-  // small machines loading can swap the system to a freeze — skip instead
-  MEMORYSTATUSEX ms;
-  ms.dwLength = sizeof(ms);
-  if (GlobalMemoryStatusEx(&ms) &&
-      ms.ullAvailPhys < (DWORD64)g_min_free_mem_mb * 1024 * 1024) {
-    log_msg("WARN: free RAM %llu MB < %d MB, LLM rerank disabled",
-            (unsigned long long)(ms.ullAvailPhys / (1024 * 1024)),
-            g_min_free_mem_mb);
-    return;
-  }
   g_loading.store(true);
 
   std::thread([]() {
@@ -1000,7 +1141,7 @@ void LlmRerankTranslation::Collect() {
     // 的词权重高, 久未使用的自动消退。实证 (17258 真实候选窗, 6000 抽样,
     // 事前计数口径): 纯 LLM 97.08%, 衰减融合约 +0.4pp; 融合的意义在个性化
     // 高频词 (纯 LLM 排错事件 87% 选中词词频 ≥2)。
-    // 应用于评分/缓存顺序之上、long_word_first 之前 (与插件版一致);
+    // 应用于评分/缓存顺序之上、expected_length 之前 (与插件版一致);
     // 缓存只存分数序, 融合每次按当前衰减重放。稳定排序保同分原序 (CE 序)。
     if (g_freq_weight > 0 && order.size() > 1) {
       user_freq_ensure_loaded();
@@ -1036,6 +1177,45 @@ void LlmRerankTranslation::Collect() {
       }
     }
 
+    // expected-length weighting (expected_length_weight, 2026-08-27 两版统一,
+    // 移植自插件版 lua): 两码一字方案 L 码对应 floor(L/2) 字 — 词长等于期望
+    // 词长的候选加 weight·span (span = 本次有效分数跨度, 保留分差明显时的
+    // 语义排序); 失败哨兵/缺分候选不得奖励、不参与 min/max, 任一候选分数非
+    // 有限则整体跳过 (与插件版一致)。稳定排序: 加权分降序 → 匹配词长优先,
+    // 全同分保持原序 (词频融合序)。
+    if (g_expected_length_weight > 0 && order.size() > 1) {
+      int expected_len = (int)(input_.length() / 2);
+      double lo = 1e300, hi = -1e300;
+      bool all_finite = true;
+      for (int i : order) {
+        if (!std::isfinite(score_of[i])) { all_finite = false; break; }
+        if (has_score[i]) {
+          if (score_of[i] < lo) lo = score_of[i];
+          if (score_of[i] > hi) hi = score_of[i];
+        }
+      }
+      double span = hi - lo;
+      if (all_finite && expected_len >= 1 && span > 1e-9) {
+        struct ELItem { double score; bool match; int idx; };
+        std::vector<ELItem> items;
+        items.reserve(order.size());
+        for (int i : order) {
+          bool match =
+              has_score[i] && utf8_len(candidates_[i]->text()) == expected_len;
+          double s =
+              score_of[i] + (match ? g_expected_length_weight * span : 0.0);
+          items.push_back({s, match, i});
+        }
+        std::stable_sort(items.begin(), items.end(),
+                         [](const ELItem &a, const ELItem &b) {
+                           if (a.score != b.score) return a.score > b.score;
+                           return (int)a.match > (int)b.match;
+                         });
+        order.clear();
+        for (auto &it : items) order.push_back(it.idx);
+      }
+    }
+
     if (!order.empty()) {
       // 应用顺序 (缓存命中与真实评分共用): 未匹配候选(新候选)落尾部
       std::string before;  // 原始候选序 — 必须在重排前捕获 (原先构建于
@@ -1056,17 +1236,6 @@ void LlmRerankTranslation::Collect() {
         if (!used[i])
           reranked.push_back(candidates_[i]);
       candidates_ = std::move(reranked);
-      // long-word-first (long_word_first): 候选算完 CE 后按词长降序排序,
-      // 同词长保持 CE 评分序。改为"完整按词长降序"(不再只分>2字/单字两组)——
-      // 用稳定排序, 键=词长降序, 同词长因 stable_sort 保持原(CE 序)。
-      // 真实评分与缓存命中共用: 此处 candidates_ 已是 CE 序 (reranked 由
-      // order 应用而来), 稳定排序保证同词长按 CE 序。徽章加在最终首候选上。
-      if (g_long_word_first && candidates_.size() > 1) {
-        std::stable_sort(candidates_.begin(), candidates_.end(),
-                         [](const an<Candidate> &a, const an<Candidate> &b) {
-                           return utf8_len(a->text()) > utf8_len(b->text());
-                         });
-      }
       // AI 首选徽章: 重排后首候选 comment 追加来源标记 (与已有 comment 合并,
       // ShadowCandidate 包装避免污染原候选; weasel 端识别 "AI·" 用强调色渲染)
       if (!candidates_.empty()) {
@@ -1107,48 +1276,44 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
   // config lives in the scheme: the LLM-enabled scheme is maintained in the
   // rime-llm-ime project, while the published generic scheme stays clean.
   if (Config *config = engine_->schema()->config()) {
+    // schema llm_rerank 节快照（部署期固定）；三级合并与热重载见
+    // LlmParamSet 注释（schema > 全局 llm_rerank.yaml > 内置默认）
+    LlmParamSet &p = g_schema_params;
+    p = LlmParamSet();
     string s;
-    if (config->GetString("llm_rerank/model_path", &s) && !s.empty())
-      g_model_path = s;
-    config->GetBool("llm_rerank/enabled", &g_enabled);
-    int v = 0;
-    if (config->GetInt("llm_rerank/min_code_len", &v))
-      g_min_code_len = v;
-    if (config->GetInt("llm_rerank/max_code_len", &v))
-      g_max_code_len = v;
-    config->GetBool("llm_rerank/long_word_first", &g_long_word_first);
-    {
-      double dw = 0.0;
-      if (config->GetDouble("llm_rerank/freq_weight", &dw) && dw >= 0)
-        g_freq_weight = dw;
+    if (config->GetString("llm_rerank/model_path", &s) && !s.empty()) {
+      p.has_model_path = true;
+      p.model_path = s;
     }
-    if (config->GetInt("llm_rerank/freq_k", &v) && v >= 1)
-      g_freq_k = v;
-    if (config->GetInt("llm_rerank/min_tokens", &v))
-      g_min_tokens = v;
-    if (config->GetInt("llm_rerank/max_tokens", &v))
-      g_max_ctx_tokens = v;
-    if (config->GetInt("llm_rerank/max_candidates", &v))
-      g_max_candidates = v;
-    if (config->GetInt("llm_rerank/cpu_cores", &v))
-      g_n_threads = v;
-    if (config->GetInt("llm_rerank/min_free_mem_mb", &v))
-      g_min_free_mem_mb = v;
-    // cap threads at hardware cores: low-core machines shouldn't
-    // oversubscribe (slowdown + extra per-thread memory)
-    unsigned hw = std::thread::hardware_concurrency();
-    if (hw > 0 && (unsigned)g_n_threads > hw)
-      g_n_threads = (int)hw;
+    bool b = false;
+    if (config->GetBool("llm_rerank/enabled", &b)) {
+      p.has_enabled = true;
+      p.enabled = b;
+    }
+    int v = 0;
+    if (config->GetInt("llm_rerank/min_code_len", &v)) { p.has_min_code_len = true; p.min_code_len = v; }
+    if (config->GetInt("llm_rerank/max_code_len", &v)) { p.has_max_code_len = true; p.max_code_len = v; }
+    double dw = 0.0;
+    if (config->GetDouble("llm_rerank/expected_length_weight", &dw) && dw >= 0) { p.has_elw = true; p.elw = dw; }
+    if (config->GetDouble("llm_rerank/freq_weight", &dw) && dw >= 0) { p.has_freq_weight = true; p.freq_weight = dw; }
+    if (config->GetInt("llm_rerank/freq_k", &v) && v >= 1) { p.has_freq_k = true; p.freq_k = v; }
+    if (config->GetInt("llm_rerank/min_tokens", &v)) { p.has_min_tokens = true; p.min_tokens = v; }
+    if (config->GetInt("llm_rerank/max_tokens", &v)) { p.has_max_tokens = true; p.max_tokens = v; }
+    if (config->GetInt("llm_rerank/max_candidates", &v)) { p.has_max_cand = true; p.max_cand = v; }
+    if (config->GetInt("llm_rerank/cpu_cores", &v)) { p.has_cpu_cores = true; p.cpu_cores = v; }
+    llm_load_global_params();
+    g_yaml_stamp = llm_yaml_stamp();
+    llm_apply_params();
     log_msg("config: enabled=%d min_code_len=%d max_code_len=%d "
-            "long_word_first=%d freq_weight=%.2f freq_k=%d "
+            "expected_length_weight=%.2f freq_weight=%.2f freq_k=%d "
             "min_tokens=%d "
             "max_tokens=%d max_candidates=%d cpu_cores=%d "
-            "min_free_mem_mb=%d model=%s",
+            "model=%s",
             g_enabled ? 1 : 0, g_min_code_len, g_max_code_len,
-            g_long_word_first ? 1 : 0, g_freq_weight, g_freq_k,
+            g_expected_length_weight, g_freq_weight, g_freq_k,
             g_min_tokens,
             g_max_ctx_tokens, g_max_candidates, g_n_threads,
-            g_min_free_mem_mb, g_model_path.c_str());
+            g_model_path.c_str());
   }
   // hook engine commit sink: pre-decode the upcoming context after commit
   commit_conn_ = engine_->sink().connect(
@@ -1387,6 +1552,8 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
                                  CandidateList *candidates) {
   if (!translation)
     return translation;
+
+  llm_reload_global_if_changed();  // llm_rerank.yaml 热重载（GUI 保存即生效）
 
   if (!g_enabled)
     return translation;  // enabled=false -> pass-through
