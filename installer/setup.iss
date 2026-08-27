@@ -46,10 +46,11 @@ Root: HKLM; Subkey: "Software\Rime\Weasel"; ValueType: string; ValueName: "Wease
 Root: HKLM; Subkey: "Software\WOW6432Node\Rime\Weasel"; ValueType: string; ValueName: "WeaselRoot"; ValueData: "{app}"; Flags: uninsdeletevalue
 
 [Files]
-; 应用目录：9 个 LLM 组件 + 注册工具 + 数据目录 + TSF 应急修复
+; 应用目录：source\* = 10 个载荷（8 个 LLM 组件 + WinSparkle.dll 依赖 +
+; WeaselSetup.exe 注册工具——2026-08-27 起统一由 make_installer.ps1 同步入
+; source\，不再从 weasel\output 单独引用）+ 数据目录 + TSF 应急修复
 Source: "source\*"; DestDir: "{app}"; Flags: ignoreversion
 Source: "repair_tsf.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\weasel\output\WeaselSetup.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\bin\data\*"; DestDir: "{app}\data"; Flags: recursesubdirs ignoreversion
 ; 升级路径：系统位 TSF DLL 原位替换（改名腾位在 PrepareToInstall 完成；
 ; 全新路径由 WeaselSetup /s 自己部署系统文件，跳过两条。

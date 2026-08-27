@@ -3,7 +3,7 @@
 将 LLM 候选重排**源码级集成**进 RIME 小狼毫（weasel + librime）的中文输入方案：不需要外挂进程或 lua 插件，`llm_filter` 作为 librime 原生 filter 组件（C++）编译进 `rime.dll`，TSF 原生采集光标上文。
 
 - **开发者**：仓库含修改后的完整 weasel + librime 源码树，可按本 README 构建
-- **普通用户**：`bin/` 提供预编译产物 + 一键部署脚本，替换小狼毫安装文件即可使用（模型由部署脚本自动检查/下载）
+- **普通用户**：直接用安装包（见下"快速开始"），双击安装、托盘 GUI 里下载模型并启用
 
 ## 特性
 
@@ -35,7 +35,7 @@ rime-llm-ime/
 │   ├── Languages/     #   ChineseSimplified.isl（官方 6.4.3 起不捆绑，入库）
 │   ├── repair_tsf.ps1 #   TSF 注册应急修复（随安装包装入 {app}，图标消失时用）
 │   ├── make_installer.ps1  # bin\ → source\ 载荷同步（开发工具）
-│   └── source/        #   9 个安装二进制（入库；setup.iss 的载荷来源）
+│   └── source/        #   10 个载荷文件（入库；setup.iss 的载荷来源）
 └── scripts/           # 构建/部署/测试脚本（发布清单，见"从源码构建"）
 ```
 
@@ -45,7 +45,7 @@ rime-llm-ime/
 
 **唯一安装入口 = 安装包**（2026-08-27 定案；旧 clone + PowerShell 安装器已退役）：
 
-1. 下载安装包 `weasel-llm-setup-<日期>.exe`（约 9MB，[GitHub Release](https://github.com/zhanghaozhecn/rime-llm-ime/releases)）并双击——支持全新机器（无需先装官方小狼毫，自动完成 TSF 注册）与已有小狼毫（原地升级，不动注册）
+1. 下载安装包（约 9MB，最新版 [v2026.08.27](https://github.com/zhanghaozhecn/rime-llm-ime/releases/download/v2026.08.27/weasel-llm-setup-2026.08.27.exe)，全部版本见 [Releases](https://github.com/zhanghaozhecn/rime-llm-ime/releases)）并双击——支持全新机器（无需先装官方小狼毫，自动完成 TSF 注册）与已有小狼毫（原地升级，不动注册）
 2. 装完**托盘右键小狼毫 → “LLM 重排设置”**：首次会提示下载模型（约 500MB，断点续传，默认 `%USERPROFILE%\gguf_models\`）→ 勾选“启用 LLM 重排”→ **保存并生效**（立即热重载，无需重新部署；参数随时可改，保存即生效）
 3. **任何方案零配置**——llm_filter 全局自动挂载；参数优先级：方案内 `llm_rerank:` 节 > 全局 `%APPDATA%\Rime\llm_rerank.yaml`（GUI 写的就是它）> 内置默认
 
@@ -57,10 +57,11 @@ rime-llm-ime/
 ### 手动步骤（无法运行安装包时）
 
 1. 下载 GGUF 模型（本机验证使用 `Qwen3.5-0.8B-Q4_K_M.gguf`，任意小模型均可，建议 ≤2B Q4）放到 `%USERPROFILE%\gguf_models\`（默认路径；其他位置用 `model_path` 指定）
-2. 将 `bin/` 下 **7 个文件**复制到小狼毫安装目录（`C:\Program Files\Rime\weasel-0.17.4`）：
-   - `rime.dll` / `weaselx64.dll` / `weasel32.dll`（复制为 `weasel.dll`）/ `WeaselServer.exe` / `WeaselDeployer.exe` — 本方案产物
+2. 将 `bin/` 下 **9 个文件**复制到小狼毫安装目录（`C:\Program Files\Rime\weasel-0.17.4`）：
+   - `rime.dll` / `weaselx64.dll` / `weasel32.dll`（复制为 `weasel.dll`）/ `WeaselServer.exe` / `WeaselDeployer.exe` / `WeaselLLMSetup.exe` — 本方案产物
    - `opencc.dll` — rime.dll 的动态依赖（缺失会报"找不到 opencc.dll"）
    - `vcomp140.dll` — VC OpenMP 运行时（无 VS 运行库的机器必需）
+   - `WinSparkle.dll` — WeaselServer.exe 的静态导入依赖（从官方小狼毫安装目录拷贝；缺它服务起不来）
 3. 原位替换系统 TSF 组件（官方安装时已注册，**不碰注册表**）：`weaselx64.dll` → `C:\Windows\System32\weasel.dll`，`weasel32.dll` → `C:\Windows\SysWOW64\weasel.dll`。先停 `WeaselServer.exe` / `WeaselDeployer.exe`，再一律改名腾位（`weasel.dll` → `weasel.dll.llm_old` 后复制新文件，旧文件事后可删）。**切勿运行 `WeaselSetup /u`**——它删除 TSF 注册且 `/i` 在 System32 被占用时静默失败，输入法图标直接消失（应急恢复：本仓库 `installer\repair_tsf.ps1`）
 4. 方案配置（可选——默认无需任何方案修改，llm_filter 全局自动挂载）：如想改用方案内显式配置，在 `%APPDATA%\Rime\<方案>.schema.yaml` 的 filters 块 uniquifier 之后加 `- llm_filter`，并添加 `llm_rerank:` 配置节（优先级高于全局 yaml）
 5. 托盘右键 → **重新部署**（新拉起的 TSF 宿主即用新 DLL，无需重启；可选重启让存量宿主一次性换新）
@@ -72,11 +73,9 @@ rime-llm-ime/
 ### 常见问题
 
 - **Win+Space 无小狼毫**：设置 → 时间和语言 → 中文 → 键盘 → 添加键盘 → 小狼毫
-- **32 位应用（QQ 音乐、WPS 等）**：加载 32 位 LLM TSF（SysWOW64\weasel.dll，部署包 `weasel32.dll`）；32 位视图注册缺失时输入英文，用部署脚本 [5/7] 兜底（`SysWOW64\regsvr32.exe /s` + `TEXTSERVICE_PROFILE=hans`）
+- **32 位应用（QQ 音乐、WPS 等）**：加载 32 位 LLM TSF（SysWOW64\weasel.dll，部署包 `weasel32.dll`）；32 位视图注册缺失时输入英文，用安装目录的 `repair_tsf.ps1` 兜底（含 SysWOW64 注册）
 - **内存 ≤4GB**：`enabled: false`（0.8B Q4 模型加载后 WeaselServer 约占 2GB；原 `min_free_mem_mb` 低内存守卫已删——2026-08-27 两版参数统一）
 - **语言栏图标消失**：多为 System32 DLL 被重命名替换导致，恢复方式：重装官方包 → 设置添加键盘 → 重新部署
-
-> 使用其他方案：安装器界面直接选择该方案文件（或 CLI 传 `-SchemaName`），或手动加 `llm_rerank` 配置节 + filters 链 uniquifier 后的 `- llm_filter`。配置节仅依赖四码输入编码，与具体方案无关。
 
 ### llm_rerank 配置节（全部可选）
 
@@ -93,7 +92,7 @@ llm_rerank:
   min_tokens: 1         # 上文 token 数小于此值时不推理
   max_tokens: 10        # 上文 token 上限
   max_candidates: 5     # 参与打分的候选数上限
-  cpu_cores: 4          # 默认线程数（=GGML 默认，适用旧设备；用发布包内 bench_threads.exe 实测后自行修改）
+  cpu_cores: 4          # 默认线程数（=GGML 默认，适用旧设备；可参考插件版仓库 bin/bench_threads.exe 实测后调整）
   model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf  # 示例（默认 = %USERPROFILE%/gguf_models/ 同名文件）
 ```
 
@@ -176,7 +175,7 @@ scripts\build_tsf32.bat         :: Win32 TSF → weasel\output\weasel.dll（官�
 
 ### 替换安装文件
 
-产物齐后，把 `librime\build\bin\Release\rime.dll`、`weasel\output\weaselx64.dll`、`weasel\output\weasel.dll`（32 位，入 bin 改名 `weasel32.dll`）、`weasel\output\WeaselServer.exe` 放进 `bin\`（连同 opencc.dll / vcomp140.dll），运行 `installer\make_installer.ps1`（bin\ → installer\source\）→ `scripts\build_pkg.bat` 编译安装包 → 跑 `installer\dist\` 下的 setup.exe 部署。
+产物齐后，把 `librime\build\bin\Release\rime.dll`、`weasel\output\weaselx64.dll`、`weasel\output\weasel.dll`（32 位，入 bin 改名 `weasel32.dll`）、`weasel\output\WeaselServer.exe`、`weasel\output\WeaselSetup.exe` 放进 `bin\`（连同 opencc.dll / vcomp140.dll / WinSparkle.dll——后两者从官方小狼毫安装目录拷入），运行 `installer\make_installer.ps1`（bin\ → installer\source\）→ `scripts\build_pkg.bat` 编译安装包 → 跑 `installer\dist\` 下的 setup.exe 部署。
 
 ## 候选窗 AI 标记
 

@@ -47,8 +47,12 @@ scripts/*
 !scripts/build_test_llm_context.bat
 !scripts/bench_threads.cpp
 !scripts/build_bench_threads.bat
+!scripts/build_llm_setup.bat
+!scripts/build_setup.bat
+!scripts/build_pkg.bat
 
-# bin 目录中的构建产物 (脚本/配置保留跟踪)
+# bin/ = 本地构建产物与运行数据（全部不入库；WeaselServer 运行需 bin\data，
+# 从官方小狼毫安装目录拷入；发布载荷走 installer\source\）
 bin/*.dll
 bin/*.exe
 bin/data/
