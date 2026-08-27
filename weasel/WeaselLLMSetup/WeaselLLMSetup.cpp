@@ -7,6 +7,8 @@
 // 与安装器 download-model 同源设计。全程用户态，无需管理员。
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
+#include <objbase.h>
 #include <string>
 #include <cstdio>
 #include <cstring>
@@ -17,6 +19,10 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "shell32.lib")
+// 视觉样式（Common Controls v6）：否则按钮/勾选框呈 Win2000 经典浮雕样式
+#pragma comment(linker, "\"/manifestdependency:type='win32' \
+name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
+processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // ---- 控件 ID ----
 #define IDC_ENABLED      1001
@@ -188,14 +194,40 @@ static void set_status(HWND ctrl, const wchar_t* fmt, ...) {
   SetWindowTextW(ctrl, buf);
 }
 
+// 逐级建目录（接受 / 或 \ 分隔；SDK 的 SHCreateDirectoryExW 在部分宏组合下不声明）
+static bool ensure_parent_dir(const std::wstring& model) {
+  std::wstring dir = model;
+  size_t p = dir.find_last_of(L"/\\");
+  if (p == std::wstring::npos) return true;
+  dir.resize(p);
+  if (dir.size() < 3) return true;  // 盘根 C:\ 无需创建
+  // 规范为反斜杠逐级尝试
+  for (auto& c : dir)
+    if (c == L'/') c = L'\\';
+  for (size_t i = 3; i <= dir.size(); ++i) {
+    if (i != dir.size() && dir[i] != L'\\') continue;
+    std::wstring part = dir.substr(0, i);
+    DWORD attr = GetFileAttributesW(part.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES) {
+      if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) return false;
+      continue;  // 已存在
+    }
+    if (!CreateDirectoryW(part.c_str(), NULL) &&
+        GetLastError() != ERROR_ALREADY_EXISTS)
+      return false;
+  }
+  return true;
+}
+
 static void start_download() {
   if (g_curl) return;
   std::wstring model = shown_model();
   g_dl_tmp = model + L".download";
-  wchar_t dir[MAX_PATH];
-  wcscpy_s(dir, model.c_str());
-  wchar_t* slash = wcsrchr(dir, L'\\');
-  if (slash) { *slash = 0; CreateDirectoryW(dir, NULL); }
+  if (!ensure_parent_dir(model)) {
+    set_status(GetDlgItem(g_hwnd, IDC_DLSTATUS),
+               L"无法创建模型目录，请检查模型路径是否可用");
+    return;
+  }
   wchar_t cmd[2048];
   _snwprintf_s(cmd, _TRUNCATE,
                L"curl.exe -L -C - -s -S -o \"%s\" \"%s\"", g_dl_tmp.c_str(),
@@ -292,55 +324,76 @@ static HWND mk(int cls, const wchar_t* text, DWORD style, int x, int y, int w,
 }
 
 struct Lbl { const wchar_t* t; int x, y; };
+// 布局铁律：任何控件的矩形不得与其他控件相交——不透明子控件按 z 序
+// 覆盖先画者，会把被覆盖控件的文字"局部擦除"成叠字残片（2026-08-27
+// 叠字事故根因：勾选框 w430 与下行标签矩形相交 + 空 DLSTATUS 静态框横贯
+// 首行）。每行独占一个水平带，互不入侵。
 static void make_ui() {
   g_font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
                        CLEARTYPE_QUALITY, 0, L"Segoe UI");
   mk(0, L"启用 LLM 重排（保存后立即生效，无需重新部署）",
-     BS_AUTOCHECKBOX | WS_TABSTOP, 15, 12, 430, 22, IDC_ENABLED);
-  mk(1, L"模型路径:", 0, 46, 15, 68, 20, 0);
-  mk(2, L"", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 88, 43, 268, 22, IDC_MODEL);
-  mk(0, L"浏览…", WS_TABSTOP, 362, 42, 55, 24, IDC_BROWSE);
-  mk(0, L"下载", WS_TABSTOP, 422, 42, 40, 24, IDC_DOWNLOAD);
-  mk(1, L"", 0, 72, 15, 440, 18, IDC_DLSTATUS);
-  // 参数两列（短标签防截断；键名与 llm_rerank.yaml 相同，见下方说明）
-  Lbl c1[] = {{L"最小编码长度", 15, 108},
-              {L"最大编码长度（0=不限）", 15, 138},
-              {L"最少上文 token", 15, 168},
-              {L"上文 token 上限", 15, 198},
-              {L"CPU 线程数", 15, 228}};
+     BS_AUTOCHECKBOX | WS_TABSTOP, 15, 12, 470, 22, IDC_ENABLED);
+  // 第 2 行：模型路径（编辑框足够宽，默认完整路径含扩展名不再截尾）
+  mk(1, L"模型路径:", 0, 15, 46, 68, 20, 0);
+  mk(2, L"", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 86, 43, 356, 24,
+     IDC_MODEL);
+  mk(0, L"浏览…", WS_TABSTOP, 447, 42, 56, 25, IDC_BROWSE);
+  mk(0, L"下载", WS_TABSTOP, 507, 42, 47, 25, IDC_DOWNLOAD);
+  // 第 3 行：下载状态独立一行（此前横贯首行造成叠字）
+  mk(1, L"", 0, 15, 74, 539, 18, IDC_DLSTATUS);
+  // 参数两列（键名与 llm_rerank.yaml 相同，见下方说明）
+  Lbl c1[] = {{L"最小编码长度", 15, 106},
+              {L"最大编码长度（0=不限）", 15, 136},
+              {L"最少上文 token", 15, 166},
+              {L"上文 token 上限", 15, 196},
+              {L"CPU 线程数", 15, 226}};
   int i1[] = {IDC_MIN_CODE, IDC_MAX_CODE, IDC_MIN_TOK, IDC_MAX_TOK, IDC_CORES};
   for (int i = 0; i < 5; i++) {
-    mk(1, c1[i].t, 0, c1[i].x, c1[i].y, 165, 20, 0);
-    mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 185, c1[i].y - 3, 56, 22, i1[i]);
+    mk(1, c1[i].t, 0, c1[i].x, c1[i].y, 168, 20, 0);
+    mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 186, c1[i].y - 3, 60, 22,
+       i1[i]);
   }
   struct { const wchar_t* t; int y; int id; } col2[] = {
-      {L"预期词长权重", 108, IDC_ELW}, {L"词频权重", 138, IDC_FREQ_W},
-      {L"词频饱和常数", 168, IDC_FREQ_K}, {L"候选数上限", 198, IDC_MAX_CAND}};
+      {L"预期词长权重", 106, IDC_ELW}, {L"词频权重", 136, IDC_FREQ_W},
+      {L"词频饱和常数", 166, IDC_FREQ_K}, {L"候选数上限", 196, IDC_MAX_CAND}};
   for (auto& r : col2) {
-    mk(1, r.t, 0, 260, r.y, 110, 20, 0);
-    mk(2, L"", WS_BORDER | WS_TABSTOP, 375, r.y - 3, 56, 22, r.id);
+    mk(1, r.t, 0, 302, r.y, 126, 20, 0);
+    mk(2, L"", WS_BORDER | WS_TABSTOP, 430, r.y - 3, 60, 22, r.id);
   }
   mk(1, L"说明：预期词长权重适用于两码一字方案（词长 = 码长/2 加分）",
-     0, 15, 262, 455, 20, 0);
+     0, 15, 262, 539, 20, 0);
   mk(1, L"参数键名与 llm_rerank.yaml 相同；修改保存后立即生效",
-     0, 15, 282, 455, 20, 0);
-  mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, 15, 300, 110, 30, IDC_SAVE);
-  mk(0, L"关闭", WS_TABSTOP, 133, 300, 70, 30, IDC_CLOSE);
-  mk(1, L"", 0, 215, 306, 250, 18, IDC_STATUS);
+     0, 15, 282, 539, 20, 0);
+  mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, 15, 302, 110, 30,
+     IDC_SAVE);
+  mk(0, L"关闭", WS_TABSTOP, 133, 302, 70, 30, IDC_CLOSE);
+  mk(1, L"", 0, 215, 308, 339, 18, IDC_STATUS);
 }
 
 static void on_browse() {
   wchar_t buf[512];
   GetDlgItemTextW(g_hwnd, IDC_MODEL, buf, 512);
+  // 打开对话框对正斜杠初始路径报 FNERR_INVALIDFILENAME(0x3002) 静默失败——
+  // 统一为反斜杠（显示/保存/yaml 随之一致，Windows API 两者都接受）
+  for (wchar_t* c = buf; *c; ++c)
+    if (*c == L'/') *c = L'\\';
+  SetDlgItemTextW(g_hwnd, IDC_MODEL, buf);
   OPENFILENAMEW ofn = {sizeof(ofn)};
   ofn.hwndOwner = g_hwnd;
   ofn.lpstrFilter = L"GGUF 模型 (*.gguf)\0*.gguf\0所有文件 (*.*)\0*.*\0";
   ofn.lpstrFile = buf;
   ofn.nMaxFile = 512;
-  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
-  ofn.lpstrDefExt = L"gguf";
-  if (GetSaveFileNameW(&ofn))
+  // 选已有模型文件用打开对话框（原 Save 对话框选现有文件会弹覆盖确认）
+  ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+  if (GetOpenFileNameW(&ofn)) {
     SetDlgItemTextW(g_hwnd, IDC_MODEL, buf);
+    return;
+  }
+  // 打开失败：状态行给出 CommDlg 错误码，便于用户机排查
+  wchar_t msg[64];
+  swprintf_s(msg, L"打开对话框失败（CommDlg 错误码 %lu）",
+             CommDlgExtendedError());
+  set_status(GetDlgItem(g_hwnd, IDC_STATUS), msg);
 }
 
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -375,6 +428,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           return 0;
         }
         case IDC_CLOSE: DestroyWindow(h); return 0;
+        case IDCANCEL:            // IsDialogMessage 把 ESC 映射为 IDCANCEL
+          DestroyWindow(h);
+          return 0;
       }
       break;
     case WM_TIMER:
@@ -389,6 +445,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
+  // 主线程 STA：Vista+ 打开/保存对话框内部走 COM，缺初始化会静默失败
+  CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
   WNDCLASSW wc = {0};
   wc.lpfnWndProc = WndProc;
   wc.hInstance = inst;
@@ -399,7 +457,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   HWND h = CreateWindowExW(WS_EX_APPWINDOW, L"WeaselLLMSetup",
                            L"LLM 重排设置 — 小狼毫", WS_OVERLAPPEDWINDOW &
                                ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 505, 400, NULL, NULL,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 585, 384, NULL, NULL,
                            inst, NULL);
   ShowWindow(h, show);
   UpdateWindow(h);
@@ -410,5 +468,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
       DispatchMessageW(&m);
     }
   }
+  CoUninitialize();
   return 0;
 }

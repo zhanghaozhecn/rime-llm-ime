@@ -53,6 +53,14 @@ static std::atomic<bool> g_loading{false};
 //                 [min, max] = rerank trigger window
 //   expected_length_weight: >0 = bonus candidates whose word length equals
 //                 floor(code_len/2) (两码一字), weighted by current score span
+//   freq_weight/freq_k: 用户词频融合 total=(1-w)·LLM(窗内min-max归一)
+//                 + w·eff/(eff+k)，eff=Rime formula_d 时间衰减计数
+//                 （tick 每词提交+1，与引擎调频同源；user_freq.tsv 持久化）
+// 排序管线（顺序固定，与插件版一致）: CE 评分序 → 词频融合（融合应用于
+//   评分序之上）→ expected_length 加权 → 稳定排序（失败哨兵不参与
+//   min-max 与加成；非有限分整块跳过）。
+// 长候选外推: 4+ token 候选按尾部 CE 外推（λ=0.6，语料模拟调参），
+//   不增加 decode 次数，3-token 词不受长词挤压。
 // 全局配置（2026-08-27 直接安装版）: %APPDATA%\Rime\llm_rerank.yaml（GUI
 // 写入, 平面 key: value, Apply 时按 mtime|size 热重载）; 优先级 schema 节 >
 // 全局 yaml > 内置默认。engine.cc 全局挂载使任何方案零修改获得 llm_filter
