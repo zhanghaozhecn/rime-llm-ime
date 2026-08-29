@@ -6,6 +6,13 @@
 // Core algorithm ported from llm_rerank project (rime_llm.cpp):
 //   ctx decode once -> KV copy -> parallel candidate decode -> CE score
 //
+// 挂载语义（2026-08-29 定案，显式组件）：方案须在 engine/filters 显式
+// 列出 llm_filter 才参与重排——位置由方案与其他 filter 的先后关系决定
+//（如需在 simplifier/uniquifier 之后，由方案作者自行安排）。未列出 =
+// 该方案无 LLM 重排。enabled 仍为运行时开关（默认 false 纯透传），
+// 参数优先级 schema llm_rerank 节 > 全局 %APPDATA%\Rime\llm_rerank.yaml
+//（GUI 写入，Apply 按 mtime|size 指纹热重载）。
+//
 #include <rime/gear/llm_filter.h>
 #include <rime/candidate.h>
 #include <rime/config.h>
@@ -63,8 +70,8 @@ static std::atomic<bool> g_loading{false};
 //   不增加 decode 次数，3-token 词不受长词挤压。
 // 全局配置（2026-08-27 直接安装版）: %APPDATA%\Rime\llm_rerank.yaml（GUI
 // 写入, 平面 key: value, Apply 时按 mtime|size 热重载）; 优先级 schema 节 >
-// 全局 yaml > 内置默认。engine.cc 全局挂载使任何方案零修改获得 llm_filter
-//（enabled 默认 false 纯透传）。
+// 全局 yaml > 内置默认。2026-08-29 起为显式组件：方案 engine/filters 列出
+// llm_filter 才参与重排（enabled 默认 false 纯透传）。
 // 默认模型路径 = %USERPROFILE%\gguf_models\（2026-08-27 用户定案：不假设
 // 存在 D: 分区；本机/有 D 盘的机器用 llm_rerank model_path 显式指向）
 static std::string default_model_path() {
