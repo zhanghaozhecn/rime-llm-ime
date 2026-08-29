@@ -19,7 +19,7 @@ LLM 候选重排**源码级集成**进 RIME 小狼毫：本地小语言模型（
 
 ### 安装包（推荐）
 
-1. 下载 `weasel-llm-setup-<日期>.exe`（约 10MB：[v2026.08.27](https://github.com/zhanghaozhecn/rime-llm-ime/releases/download/v2026.08.27/weasel-llm-setup-2026.08.27.exe)｜[全部版本](https://github.com/zhanghaozhecn/rime-llm-ime/releases)）双击。全新机器无需先装官方小狼毫；已有官方小狼毫则原地升级、不动注册
+1. 下载 `weasel-llm-setup-<日期>.exe`（约 10MB：[v2026.08.29](https://github.com/zhanghaozhecn/rime-llm-ime/releases/download/v2026.08.29/weasel-llm-setup-2026.08.29.exe)｜[全部版本](https://github.com/zhanghaozhecn/rime-llm-ime/releases)）双击。全新机器无需先装官方小狼毫；已有官方小狼毫则原地升级、不动注册
 2. **在要启用的方案里加组件**（一次性，见下"方案接入"），托盘右键 → **重新部署**
 3. 托盘右键小狼毫 → **"LLM 重排设置"**：首次打开提示下载模型（约 500MB，ModelScope 断点续传，中断重试自动续传）→ 勾选**启用 LLM 重排** → **保存并生效**（立即热重载）
 4. 验证：打满 4 码，首选候选出现 `AI·TSF` / `AI·历史` 标记即已生效
