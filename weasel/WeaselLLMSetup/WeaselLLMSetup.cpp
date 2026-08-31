@@ -368,6 +368,10 @@ static void make_ui() {
      IDC_SAVE);
   mk(0, L"关闭", WS_TABSTOP, 133, 302, 70, 30, IDC_CLOSE);
   mk(1, L"", 0, 215, 308, 339, 18, IDC_STATUS);
+  // llm_filter 为显式组件：GUI 只管参数，方案未列出则不参与重排（防"开了
+  // 却没效果"的静默困惑）——窗口为此加高 26px，本行与状态行不相交
+  mk(1, L"方案需在 engine/filters 列出 llm_filter 并重新部署才生效（详见 README）",
+     0, 15, 336, 539, 18, 0);
 }
 
 static void on_browse() {
@@ -457,7 +461,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   HWND h = CreateWindowExW(WS_EX_APPWINDOW, L"WeaselLLMSetup",
                            L"LLM 重排设置 — 小狼毫", WS_OVERLAPPEDWINDOW &
                                ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 585, 384, NULL, NULL,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 585, 410, NULL, NULL,
                            inst, NULL);
   ShowWindow(h, show);
   UpdateWindow(h);

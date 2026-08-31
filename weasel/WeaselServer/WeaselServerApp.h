@@ -34,19 +34,9 @@ class WeaselServerApp {
   }
 
   static bool check_update() {
-    // when checked manually, show testing versions too
-    std::string feed_url = GetCustomResource("ManualUpdateFeedURL", "APPCAST");
-    std::wstring channel{};
-    auto ret = RegGetStringValue(HKEY_CURRENT_USER, L"Software\\Rime\\Weasel",
-                                 L"UpdateChannel", channel);
-    if (!ret && channel == L"testing") {
-      feed_url = GetCustomResource("TestingManualUpdateFeedURL", "APPCAST");
-    }
-    if (!feed_url.empty()) {
-      win_sparkle_set_appcast_url(feed_url.c_str());
-    }
-    win_sparkle_check_update_with_ui();
-    return true;
+    // LLM 版禁用（2026-08-29）：官方 feed 的"更新"是官方小狼毫安装包，
+    // 会覆盖 LLM 版。升级请用本项目的 weasel-llm-setup 安装包。
+    return false;
   }
 
   static fs::path install_dir() {

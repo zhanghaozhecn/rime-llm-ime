@@ -26,7 +26,10 @@ int WeaselServerApp::Run() {
     win_sparkle_set_lang("zh-CN");
   else
     win_sparkle_set_lang("en");
-  win_sparkle_init();
+  // LLM 版禁用在线更新（2026-08-29）：官方 appcast 提供的是官方小狼毫
+  // 安装包，弹窗引导升级会原地覆盖 LLM 版（rime.dll/TSF 换回官方）。
+  // WinSparkle.dll 仍随载荷分发——静态导入必须满足，仅不启动检查线程。
+  // win_sparkle_init();
   m_ui.Create(m_server.GetHWnd());
 
   m_handler->Initialize();
