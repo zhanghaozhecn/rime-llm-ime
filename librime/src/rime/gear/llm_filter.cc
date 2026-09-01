@@ -19,6 +19,7 @@
 #include <rime/context.h>
 #include <rime/engine.h>
 #include <rime/schema.h>
+#include <rime/service.h>
 #include <rime_api.h>
 
 #include <algorithm>
@@ -72,15 +73,24 @@ static std::atomic<bool> g_loading{false};
 // 写入, 平面 key: value, Apply 时按 mtime|size 热重载）; 优先级 schema 节 >
 // 全局 yaml > 内置默认。2026-08-29 起为显式组件：方案 engine/filters 列出
 // llm_filter 才参与重排（enabled 默认 false 纯透传）。
-// 默认模型路径 = %USERPROFILE%\gguf_models\（2026-08-27 用户定案：不假设
-// 存在 D: 分区；本机/有 D 盘的机器用 llm_rerank model_path 显式指向）
+// 默认模型路径 = RIME 用户目录根\Qwen...gguf（2026-08-31 用户澄清定案：
+// "用户文件夹"= 小狼毫右键的用户文件夹——方案配置所在处，模型直接放根
+// 目录、不套子文件夹，与 simplifier 取 user_data_dir 同源；8-27 曾误用
+// %USERPROFILE%\gguf_models\）。
+// 自定义位置用 llm_rerank model_path 显式指向。
+// 注意 Service.deployer().user_data_dir 在引擎启动后才就绪，故不能在
+// 静态初始化求值——g_model_path 留空，加载时懒取默认。
 static std::string default_model_path() {
-  const char *up = getenv("USERPROFILE");
-  if (up && *up)
-    return std::string(up) + "\\gguf_models\\Qwen3.5-0.8B-Q4_K_M.gguf";
-  return "gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
+  try {
+    return (Service::instance().deployer().user_data_dir /
+            "Qwen3.5-0.8B-Q4_K_M.gguf")
+        .string();
+  } catch (...) {
+    return "Qwen3.5-0.8B-Q4_K_M.gguf";
+  }
 }
-static std::string g_model_path = default_model_path();
+static std::string g_model_path;  // 空 = 未配置，load_model 时按默认兜底
+static std::string g_loaded_from; // 当前已加载模型来自的路径（变更检测）
 static bool g_enabled = false;  // CPU only; GPU build retired (not published)
 static int g_min_code_len = 4;
 static int g_max_code_len = 0;  // 0 = no upper limit (plugin-version parity)
@@ -232,13 +242,17 @@ static unsigned long long llm_yaml_stamp() {
   return st ^ ((unsigned long long)fa.nFileSizeLow << 1);
 }
 
-// 热重载: 指纹变化 → 重读合并; enabled 关→开且模型未载 → 异步加载。
+static void unload_model();  // 定义在后（enabled 关闭/路径变更时卸载，前置声明）
+
+// 热重载: 指纹变化 → 重读合并; enabled 开关与路径变更即时生效
+// （开 → 加载/重载；关 → 卸载释放内存。2026-09-01 修复：热路径此前
+// 只处理"关→开加载"，"开→关卸载"漏了——GUI 开关不重新部署时模型
+// 永远驻留，推理看起来"关不掉"）。
 static void llm_reload_global_if_changed() {
   unsigned long long stamp = llm_yaml_stamp();
   if (stamp == g_yaml_stamp)
     return;
   g_yaml_stamp = stamp;  // 先记指纹（坏文件不反复重试）
-  bool was_enabled = g_enabled;
   llm_load_global_params();
   llm_apply_params();
   log_msg("llm_rerank.yaml reloaded: enabled=%d elw=%.2f freq=%.2f/%d "
@@ -246,8 +260,10 @@ static void llm_reload_global_if_changed() {
           g_enabled ? 1 : 0, g_expected_length_weight, g_freq_weight, g_freq_k,
           g_min_tokens, g_max_ctx_tokens, g_max_candidates, g_n_threads,
           g_model_path.c_str());
-  if (!was_enabled && g_enabled && !g_loaded.load() && !g_loading.load())
-    load_model_async();
+  if (g_enabled)
+    load_model_async();  // 路径变更时内部自动卸载重载；同路径已载为 no-op
+  else if (g_loaded.load() || g_loading.load())
+    unload_model();
 }
 
 // ============================================================
@@ -524,6 +540,14 @@ static void event_log(const std::string &input, const std::string &before,
 // async model loading (non-blocking for the IME)
 // ============================================================
 static void load_model_async() {
+  // 路径变更自动重载（2026-09-01）：GUI/schema 改 model_path 而模型已
+  // 加载时，旧模型驻留内存、新路径被无视——此处检测变更即卸载，随后
+  // 走正常加载。检测收敛在本函数，Apply 与 yaml 热路径调用点自动受益。
+  if (g_loaded.load() && g_loaded_from != g_model_path) {
+    log_msg("model path changed: %s -> %s (reload)",
+            g_loaded_from.c_str(), g_model_path.c_str());
+    unload_model();
+  }
   if (g_loaded.load() || g_loading.load())
     return;
   g_loading.store(true);
@@ -536,6 +560,8 @@ static void load_model_async() {
     // 加载完成后恢复
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 #endif
+    if (g_model_path.empty())
+      g_model_path = default_model_path();  // 此刻 Service 目录已就绪
     log_msg("loading model: %s", g_model_path.c_str());
 
     llama_backend_init();
@@ -584,6 +610,7 @@ static void load_model_async() {
       }
     }
 
+    g_loaded_from = g_model_path;  // 供路径变更检测（load_model_async 头部）
     g_loaded.store(true);
     g_loading.store(false);
     log_msg("model ready (n_ctx=%d threads=%d)",
@@ -593,8 +620,8 @@ static void load_model_async() {
 
 // release the loaded model (2GB) when rerank is disabled via schema
 // re-deploy. The filter is rebuilt on every deploy; the constructor's
-// enabled=false branch calls this so toggling enabled off actually frees
-// the RAM instead of keeping it resident until process exit.
+// enabled=false（Apply 与 yaml 热路径）及路径变更重载（load_model_async）
+// 都会调用——关开关真正释放内存而不是驻留到进程退出。
 static void unload_model() {
   // filter rebuild can race an in-flight load (async thread); wait for it
   // to finish before freeing under the lock
@@ -616,7 +643,7 @@ static void unload_model() {
     g_prep_ctx.clear();
     g_prep_logits.clear();
     s_cache_valid = false;  // 模型已卸载, 评分结果缓存一并作废
-    log_msg("model unloaded (enabled=false)");
+    log_msg("model unloaded");
   }
 }
 

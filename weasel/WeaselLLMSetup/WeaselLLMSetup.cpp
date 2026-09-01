@@ -71,12 +71,13 @@ static std::wstring yaml_path() {
 }
 
 static std::wstring default_model_path() {
-  // 默认 = 用户文件夹（2026-08-27 用户定案：不假设存在 D: 分区；
-  // 有 D 盘模型的机器在 GUI/schema 里显式填 D:\gguf_models\...）
-  wchar_t up[MAX_PATH];
-  if (GetEnvironmentVariableW(L"USERPROFILE", up, MAX_PATH))
-    return std::wstring(up) + L"\\gguf_models\\Qwen3.5-0.8B-Q4_K_M.gguf";
-  return L"C:\\gguf_models\\Qwen3.5-0.8B-Q4_K_M.gguf";
+  // 默认 = RIME 用户文件夹根（2026-08-31 用户澄清：指小狼毫右键的用户
+  // 文件夹——方案配置所在处，模型直接放根、不套子文件夹；8-27 曾误用
+  // %USERPROFILE%\gguf_models\。自定义位置在 GUI/schema 里显式填）
+  wchar_t dir[MAX_PATH];
+  if (GetEnvironmentVariableW(L"APPDATA", dir, MAX_PATH))
+    return std::wstring(dir) + L"\\Rime\\Qwen3.5-0.8B-Q4_K_M.gguf";
+  return L"Qwen3.5-0.8B-Q4_K_M.gguf";
 }
 
 static std::wstring shown_model() {

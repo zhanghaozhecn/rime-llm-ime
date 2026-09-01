@@ -33,7 +33,7 @@ LLM 候选重排**源码级集成**进 RIME 小狼毫：本地小语言模型（
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | 启用 LLM 重排 | 关 | 总开关，保存即热生效 |
-| 模型路径 | `%USERPROFILE%\gguf_models\` | "浏览…"选已有文件，或"下载"从 ModelScope 断点续传到该路径 |
+| 模型路径 | `%APPDATA%\Rime\` | "浏览…"选已有文件，或"下载"从 ModelScope 断点续传到该路径 |
 | 最小/最大编码长度 | 4 / 0 | 编码长度触发区间（最大 0=不限）；四码定长方案用默认 |
 | 预期词长权重 | 0 | 两码一字方案：词长==码长/2 的候选获得"分数跨度×权重"加成，推荐 0.20 起调 |
 | 词频权重 / 词频饱和常数 | 0.25 / 5 | 用户词频融合——越常上屏的词越靠前；权重 0 关闭 |
@@ -60,7 +60,7 @@ engine:
 
 ### 手动安装（无法运行安装包时）
 
-1. 下载 GGUF 模型（建议 ≤2B Q4；本机验证用 `Qwen3.5-0.8B-Q4_K_M.gguf`）放到 `%USERPROFILE%\gguf_models\`
+1. 下载 GGUF 模型（建议 ≤2B Q4；本机验证用 `Qwen3.5-0.8B-Q4_K_M.gguf`）放到 `%APPDATA%\Rime\`（RIME 用户文件夹根，模型直接放根）
 2. 将 `bin/` 下 **9 个文件**复制到小狼毫安装目录（`C:\Program Files\Rime\weasel-0.17.4`）：`rime.dll`、`weaselx64.dll`、`weasel32.dll`（改名为 `weasel.dll`）、`WeaselServer.exe`、`WeaselDeployer.exe`、`WeaselLLMSetup.exe`、`opencc.dll`、`vcomp140.dll`、`WinSparkle.dll`（后三个是运行依赖，官方安装目录有前例可拷）
 3. 原位替换系统 TSF 组件（不碰注册表）：`weaselx64.dll` → `C:\Windows\System32\weasel.dll`，`weasel32.dll` → `C:\Windows\SysWOW64\weasel.dll`。先停 `WeaselServer.exe`/`WeaselDeployer.exe`，旧文件改名 `*.llm_old` 腾位后复制。**切勿运行 `WeaselSetup /u`**——它会删 TSF 注册且难以恢复（应急：`installer\repair_tsf.ps1`）
 4. 托盘右键 → **重新部署**（词典 build 必须由本版 librime 编译）
