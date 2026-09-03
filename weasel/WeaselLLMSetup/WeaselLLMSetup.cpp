@@ -52,8 +52,8 @@ struct Params {
   bool enabled = false;
   int min_code_len = 4, max_code_len = 0;
   int min_tokens = 1, max_tokens = 10, cpu_cores = 4;
-  double elw = 0.0, freq_weight = 0.25;
-  int freq_k = 5, max_candidates = 5;
+  double elw = 0.2, freq_beta = 1.5;
+  int max_candidates = 5;
   std::wstring model_path;  // 显示值（空 = 默认路径）
 };
 static Params g_p;
@@ -131,8 +131,7 @@ static void load_params() {
     else if (key == "min_code_len") g_p.min_code_len = atoi(val.c_str());
     else if (key == "max_code_len") g_p.max_code_len = atoi(val.c_str());
     else if (key == "expected_length_weight") g_p.elw = atof(val.c_str());
-    else if (key == "freq_weight") g_p.freq_weight = atof(val.c_str());
-    else if (key == "freq_k") g_p.freq_k = atoi(val.c_str());
+    else if (key == "freq_beta") g_p.freq_beta = atof(val.c_str());
     else if (key == "min_tokens") g_p.min_tokens = atoi(val.c_str());
     else if (key == "max_tokens") g_p.max_tokens = atoi(val.c_str());
     else if (key == "max_candidates") g_p.max_candidates = atoi(val.c_str());
@@ -155,8 +154,7 @@ static bool save_params() {
   sprintf_s(buf, "min_code_len: %d\n", g_p.min_code_len); out += buf;
   sprintf_s(buf, "max_code_len: %d # 0=不限制\n", g_p.max_code_len); out += buf;
   sprintf_s(buf, "expected_length_weight: %.2f\n", g_p.elw); out += buf;
-  sprintf_s(buf, "freq_weight: %.2f\n", g_p.freq_weight); out += buf;
-  sprintf_s(buf, "freq_k: %d\n", g_p.freq_k); out += buf;
+  sprintf_s(buf, "freq_beta: %.2f\n", g_p.freq_beta); out += buf;
   sprintf_s(buf, "min_tokens: %d\n", g_p.min_tokens); out += buf;
   sprintf_s(buf, "max_tokens: %d\n", g_p.max_tokens); out += buf;
   sprintf_s(buf, "max_candidates: %d\n", g_p.max_candidates); out += buf;
@@ -277,14 +275,14 @@ static void ui_to_params() {
   struct { int id; int* v; } ints[] = {
       {IDC_MIN_CODE, &g_p.min_code_len}, {IDC_MAX_CODE, &g_p.max_code_len},
       {IDC_MIN_TOK, &g_p.min_tokens},   {IDC_MAX_TOK, &g_p.max_tokens},
-      {IDC_CORES, &g_p.cpu_cores},      {IDC_FREQ_K, &g_p.freq_k},
+      {IDC_CORES, &g_p.cpu_cores},
       {IDC_MAX_CAND, &g_p.max_candidates}};
   for (auto& r : ints) {
     GetDlgItemTextW(g_hwnd, r.id, buf, 64);
     *r.v = (int)wcstol(buf, NULL, 10);
   }
   struct { int id; double* v; } dbls[] = {{IDC_ELW, &g_p.elw},
-                                          {IDC_FREQ_W, &g_p.freq_weight}};
+                                          {IDC_FREQ_W, &g_p.freq_beta}};
   for (auto& r : dbls) {
     GetDlgItemTextW(g_hwnd, r.id, buf, 64);
     *r.v = wcstod(buf, NULL);
@@ -303,12 +301,12 @@ static void params_to_ui() {
       {IDC_MIN_CODE, g_p.min_code_len, L"%d"}, {IDC_MAX_CODE, g_p.max_code_len, L"%d"},
       {IDC_MIN_TOK, g_p.min_tokens, L"%d"},    {IDC_MAX_TOK, g_p.max_tokens, L"%d"},
       {IDC_CORES, g_p.cpu_cores, L"%d"},       {IDC_ELW, 0, L"%.2f"},
-      {IDC_FREQ_W, 0, L"%.2f"},                {IDC_FREQ_K, g_p.freq_k, L"%d"},
+      {IDC_FREQ_W, 0, L"%.2f"},
       {IDC_MAX_CAND, g_p.max_candidates, L"%d"}};
   for (auto& r : rows) {
     if (r.fmt[1] == L'd') swprintf_s(buf, L"%d", r.v);
     else if (r.id == IDC_ELW) swprintf_s(buf, L"%.2f", g_p.elw);
-    else swprintf_s(buf, L"%.2f", g_p.freq_weight);
+    else swprintf_s(buf, L"%.2f", g_p.freq_beta);
     SetDlgItemTextW(g_hwnd, r.id, buf);
   }
 }
@@ -355,8 +353,8 @@ static void make_ui() {
        i1[i]);
   }
   struct { const wchar_t* t; int y; int id; } col2[] = {
-      {L"预期词长权重", 106, IDC_ELW}, {L"词频权重", 136, IDC_FREQ_W},
-      {L"词频饱和常数", 166, IDC_FREQ_K}, {L"候选数上限", 196, IDC_MAX_CAND}};
+      {L"预期词长权重", 106, IDC_ELW}, {L"词频β", 136, IDC_FREQ_W},
+      {L"候选数上限", 166, IDC_MAX_CAND}};
   for (auto& r : col2) {
     mk(1, r.t, 0, 302, r.y, 126, 20, 0);
     mk(2, L"", WS_BORDER | WS_TABSTOP, 430, r.y - 3, 60, 22, r.id);

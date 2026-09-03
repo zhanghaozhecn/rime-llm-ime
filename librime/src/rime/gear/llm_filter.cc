@@ -61,9 +61,10 @@ static std::atomic<bool> g_loading{false};
 //                 [min, max] = rerank trigger window
 //   expected_length_weight: >0 = bonus candidates whose word length equals
 //                 floor(code_len/2) (两码一字), weighted by current score span
-//   freq_weight/freq_k: 用户词频融合 total=(1-w)·LLM(窗内min-max归一)
-//                 + w·eff/(eff+k)，eff=Rime formula_d 时间衰减计数
-//                 （tick 每词提交+1，与引擎调频同源；user_freq.tsv 持久化）
+//   freq_beta: 用户词频对数融合 fused = score + β·log(1+eff)（score=原始
+//                 LLM 分 −CE；对数域加法=词频无上限可翻盘），eff=Rime
+//                 formula_d 时间衰减计数（tick 每词提交+1，与引擎调频同源；
+//                 user_freq.tsv 持久化）。β=1.5 标定自本机打字真实窗回放
 // 排序管线（顺序固定，与插件版一致）: CE 评分序 → 词频融合（融合应用于
 //   评分序之上）→ expected_length 加权 → 稳定排序（失败哨兵不参与
 //   min-max 与加成；非有限分整块跳过）。
@@ -94,11 +95,10 @@ static std::string g_loaded_from; // 当前已加载模型来自的路径（变�
 static bool g_enabled = false;  // CPU only; GPU build retired (not published)
 static int g_min_code_len = 4;
 static int g_max_code_len = 0;  // 0 = no upper limit (plugin-version parity)
-static double g_expected_length_weight = 0.0;  // 预期词长加权 (两版统一 2026-08-27)
-// 用户词频融合 (2026-08-19): total = (1-w)·LLM + w·count/(count+k),
-// 默认 w=0.25/k=5 (真实候选窗回放实证, 见 Collect 融合段注释)
-static double g_freq_weight = 0.25;
-static int g_freq_k = 5;
+static double g_expected_length_weight = 0.2;  // 预期词长加权 (冷启动标定 2026-09-03; 两版统一)
+// 用户词频对数融合 (2026-09-02): fused = score + β·log(1+eff), 默认 β=1.5
+// (本机打字真实窗回放标定: β∈[1,2] 平台, 大 β 为标签偏好假象; 见 Collect 段)
+static double g_freq_beta = 1.5;
 static int g_min_tokens = 1;
 static int g_max_ctx_tokens = 10;  // tok=10: 93.4% acc, 10->17 gains only +1.1pp
 static int g_n_threads = 4;        // default = GGML_DEFAULT_N_THREADS; override via cpu_cores
@@ -119,9 +119,8 @@ struct LlmParamSet {
   bool has_enabled = false;      bool enabled = false;
   bool has_min_code_len = false; int min_code_len = 4;
   bool has_max_code_len = false; int max_code_len = 0;
-  bool has_elw = false;          double elw = 0.0;
-  bool has_freq_weight = false;  double freq_weight = 0.25;
-  bool has_freq_k = false;       int freq_k = 5;
+  bool has_elw = false;          double elw = 0.2;
+  bool has_freq_beta = false;    double freq_beta = 1.5;
   bool has_min_tokens = false;   int min_tokens = 1;
   bool has_max_tokens = false;   int max_tokens = 10;
   bool has_max_cand = false;     int max_cand = 5;
@@ -143,10 +142,9 @@ static void llm_apply_params() {
                        ? s.max_code_len
                        : (y.has_max_code_len ? y.max_code_len : 0);
   g_expected_length_weight =
-      s.has_elw ? s.elw : (y.has_elw ? y.elw : 0.0);
-  g_freq_weight = s.has_freq_weight ? s.freq_weight
-                                    : (y.has_freq_weight ? y.freq_weight : 0.25);
-  g_freq_k = s.has_freq_k ? s.freq_k : (y.has_freq_k ? y.freq_k : 5);
+      s.has_elw ? s.elw : (y.has_elw ? y.elw : 0.2);
+  g_freq_beta = s.has_freq_beta ? s.freq_beta
+                                : (y.has_freq_beta ? y.freq_beta : 1.5);
   g_min_tokens =
       s.has_min_tokens ? s.min_tokens : (y.has_min_tokens ? y.min_tokens : 1);
   g_max_ctx_tokens = s.has_max_tokens
@@ -218,8 +216,7 @@ static void llm_load_global_params() {
     else if (key == "min_code_len") { p.has_min_code_len = true; p.min_code_len = atoi(val.c_str()); }
     else if (key == "max_code_len") { p.has_max_code_len = true; p.max_code_len = atoi(val.c_str()); }
     else if (key == "expected_length_weight") { p.has_elw = true; p.elw = atof(val.c_str()); }
-    else if (key == "freq_weight") { p.has_freq_weight = true; p.freq_weight = atof(val.c_str()); }
-    else if (key == "freq_k") { p.has_freq_k = true; p.freq_k = atoi(val.c_str()); }
+    else if (key == "freq_beta") { p.has_freq_beta = true; p.freq_beta = atof(val.c_str()); }
     else if (key == "min_tokens") { p.has_min_tokens = true; p.min_tokens = atoi(val.c_str()); }
     else if (key == "max_tokens") { p.has_max_tokens = true; p.max_tokens = atoi(val.c_str()); }
     else if (key == "max_candidates") { p.has_max_cand = true; p.max_cand = atoi(val.c_str()); }
@@ -255,9 +252,9 @@ static void llm_reload_global_if_changed() {
   g_yaml_stamp = stamp;  // 先记指纹（坏文件不反复重试）
   llm_load_global_params();
   llm_apply_params();
-  log_msg("llm_rerank.yaml reloaded: enabled=%d elw=%.2f freq=%.2f/%d "
+  log_msg("llm_rerank.yaml reloaded: enabled=%d elw=%.2f freq_beta=%.2f "
           "tok=%d/%d cand=%d cores=%d model=%s",
-          g_enabled ? 1 : 0, g_expected_length_weight, g_freq_weight, g_freq_k,
+          g_enabled ? 1 : 0, g_expected_length_weight, g_freq_beta,
           g_min_tokens, g_max_ctx_tokens, g_max_candidates, g_n_threads,
           g_model_path.c_str());
   if (g_enabled)
@@ -308,7 +305,7 @@ static std::vector<double>       s_cache_scores;  // 与 ranked 对齐的原始�
 static int                       s_cache_gen = -1; // 缓存建立时的 reset 代次
 
 // ============================================================
-// 用户词频 (freq_weight 融合, 2026-08-19; 2026-08-21 改 Rime 时间衰减):
+// 用户词频 (freq_beta 对数融合, 2026-09-02; 衰减 2026-08-21 起 Rime 时间衰减):
 // OnCommit 累计 (仅含中文的词), RIME 用户目录 user_freq.tsv 持久化
 // (每 20 词落盘, 崩溃最多丢 19 次)。engine thread only, 无锁。
 // 衰减 = librime algo::formula_d (引擎调频同源):
@@ -1184,75 +1181,68 @@ void LlmRerankTranslation::Collect() {
       }
     }
 
-    // 用户词频融合 (freq_weight, 2026-08-19; 2026-08-21 词频改 Rime 时间衰减):
-    // total = (1-w)·LLM_minmax + w·eff/(eff+k)。eff = librime algo::formula_d
-    // 指数衰减计数 (τ=200 tick, tick=每词提交+1, 引擎调频同源) — 近期常打
-    // 的词权重高, 久未使用的自动消退。实证 (17258 真实候选窗, 6000 抽样,
-    // 事前计数口径): 纯 LLM 97.08%, 衰减融合约 +0.4pp; 融合的意义在个性化
-    // 高频词 (纯 LLM 排错事件 87% 选中词词频 ≥2)。
+    // 对数词频融合 (freq_beta, 2026-09-02; 词频 Rime 时间衰减 2026-08-21):
+    // fused = score + β·log(1+eff)。score = 原始 LLM 分 (−CE, 对数概率域),
+    // eff = librime algo::formula_d 指数衰减计数 (τ=200 tick, tick=每词提交
+    // +1, 引擎调频同源) — 近期常打的词权重高, 久未使用的自动消退。
+    // 对数域加法 = 词频无上限: 强个人高频词可翻盘 CE 分差 (工业输入法通行
+    // 结构, 替代旧凸组合 (1-w)·minmax+w·eff/(eff+k) 的结构性封顶)。
+    // β=1.5 标定 (本机打字真实候选窗回放, 事前 eff 口径): 真实窗子集
+    // β∈[1,2] 平台 +0.38pp, 大 β 为标签偏好假象; 改错数随 β 单调下降
+    // (高频首选获自保护)。失败哨兵/缺分不参与融合, 保序排尾。
     // 应用于评分/缓存顺序之上、expected_length 之前 (与插件版一致);
     // 缓存只存分数序, 融合每次按当前衰减重放。稳定排序保同分原序 (CE 序)。
-    if (g_freq_weight > 0 && order.size() > 1) {
+    std::vector<double> fused_of(candidates_.size(), -1e308);
+    if (order.size() > 1) {
       user_freq_ensure_loaded();
-      double lo = 1e300, hi = -1e300;
-      for (int i : order)
-        if (has_score[i]) {
-          if (score_of[i] < lo)
-            lo = score_of[i];
-          if (score_of[i] > hi)
-            hi = score_of[i];
-        }
-      if (hi - lo > 1e-9) {
-        double span = hi - lo;
-        std::vector<std::pair<double, int>> fused;  // (total, idx)
-        fused.reserve(order.size());
-        for (int i : order) {
-          // 失败哨兵/缺分 → s_l=0 (排尾部, 词频仍可救)
-          double sl = has_score[i] ? (score_of[i] - lo) / span : 0.0;
-          double n = user_freq_eff(candidates_[i]->text());
-          fused.emplace_back(
-              (1.0 - g_freq_weight) * sl +
-                  g_freq_weight * (n / (n + (double)g_freq_k)),
-              i);
-        }
-        std::stable_sort(fused.begin(), fused.end(),
-                         [](const std::pair<double, int> &a,
-                            const std::pair<double, int> &b) {
-                           return a.first > b.first;
-                         });
-        order.clear();
-        for (auto &x : fused)
-          order.push_back(x.second);
+      std::vector<std::pair<double, int>> fused;  // (total, idx)
+      fused.reserve(order.size());
+      for (int i : order) {
+        double t = has_score[i]
+                       ? score_of[i] +
+                             g_freq_beta * std::log(1.0 + user_freq_eff(
+                                                 candidates_[i]->text()))
+                       : -1e308;  // 失败哨兵/缺分 → 排尾
+        fused_of[i] = t;
+        fused.emplace_back(t, i);
       }
+      std::stable_sort(fused.begin(), fused.end(),
+                       [](const std::pair<double, int> &a,
+                          const std::pair<double, int> &b) {
+                         return a.first > b.first;
+                       });
+      order.clear();
+      for (auto &x : fused)
+        order.push_back(x.second);
     }
 
-    // expected-length weighting (expected_length_weight, 2026-08-27 两版统一,
-    // 移植自插件版 lua): 两码一字方案 L 码对应 floor(L/2) 字 — 词长等于期望
-    // 词长的候选加 weight·span (span = 本次有效分数跨度, 保留分差明显时的
-    // 语义排序); 失败哨兵/缺分候选不得奖励、不参与 min/max, 任一候选分数非
-    // 有限则整体跳过 (与插件版一致)。稳定排序: 加权分降序 → 匹配词长优先,
-    // 全同分保持原序 (词频融合序)。
+    // expected-length weighting: 加成作用于融合分 (2026-09-03 统一结合公式,
+    // 冷启动标定 elw=0.2): 两码一字方案 L 码对应 floor(L/2) 字 — 词长等于
+    // 期望词长的候选在融合分上加 weight·span (span = 原始有效分跨度);
+    // 修复旧实现按原始分重排导致 ELW 架空词频融合的组成缺陷。失败哨兵/
+    // 缺分候选不得奖励; 任一候选无有效融合分则整体跳过 (与插件版一致)。
+    // 稳定排序: 加权分降序 → 匹配词长优先, 全同分保持原序 (融合序)。
     if (g_expected_length_weight > 0 && order.size() > 1) {
       int expected_len = (int)(input_.length() / 2);
       double lo = 1e300, hi = -1e300;
-      bool all_finite = true;
+      bool all_valid = true;
       for (int i : order) {
-        if (!std::isfinite(score_of[i])) { all_finite = false; break; }
-        if (has_score[i]) {
-          if (score_of[i] < lo) lo = score_of[i];
-          if (score_of[i] > hi) hi = score_of[i];
+        if (!has_score[i] || fused_of[i] <= -1e307) {
+          all_valid = false;
+          break;
         }
+        if (score_of[i] < lo) lo = score_of[i];
+        if (score_of[i] > hi) hi = score_of[i];
       }
       double span = hi - lo;
-      if (all_finite && expected_len >= 1 && span > 1e-9) {
+      if (all_valid && expected_len >= 1 && span > 1e-9) {
         struct ELItem { double score; bool match; int idx; };
         std::vector<ELItem> items;
         items.reserve(order.size());
         for (int i : order) {
-          bool match =
-              has_score[i] && utf8_len(candidates_[i]->text()) == expected_len;
+          bool match = utf8_len(candidates_[i]->text()) == expected_len;
           double s =
-              score_of[i] + (match ? g_expected_length_weight * span : 0.0);
+              fused_of[i] + (match ? g_expected_length_weight * span : 0.0);
           items.push_back({s, match, i});
         }
         std::stable_sort(items.begin(), items.end(),
@@ -1344,8 +1334,7 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     if (config->GetInt("llm_rerank/max_code_len", &v)) { p.has_max_code_len = true; p.max_code_len = v; }
     double dw = 0.0;
     if (config->GetDouble("llm_rerank/expected_length_weight", &dw) && dw >= 0) { p.has_elw = true; p.elw = dw; }
-    if (config->GetDouble("llm_rerank/freq_weight", &dw) && dw >= 0) { p.has_freq_weight = true; p.freq_weight = dw; }
-    if (config->GetInt("llm_rerank/freq_k", &v) && v >= 1) { p.has_freq_k = true; p.freq_k = v; }
+    if (config->GetDouble("llm_rerank/freq_beta", &dw) && dw >= 0) { p.has_freq_beta = true; p.freq_beta = dw; }
     if (config->GetInt("llm_rerank/min_tokens", &v)) { p.has_min_tokens = true; p.min_tokens = v; }
     if (config->GetInt("llm_rerank/max_tokens", &v)) { p.has_max_tokens = true; p.max_tokens = v; }
     if (config->GetInt("llm_rerank/max_candidates", &v)) { p.has_max_cand = true; p.max_cand = v; }
@@ -1354,12 +1343,12 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     g_yaml_stamp = llm_yaml_stamp();
     llm_apply_params();
     log_msg("config: enabled=%d min_code_len=%d max_code_len=%d "
-            "expected_length_weight=%.2f freq_weight=%.2f freq_k=%d "
+            "expected_length_weight=%.2f freq_beta=%.2f "
             "min_tokens=%d "
             "max_tokens=%d max_candidates=%d cpu_cores=%d "
             "model=%s",
             g_enabled ? 1 : 0, g_min_code_len, g_max_code_len,
-            g_expected_length_weight, g_freq_weight, g_freq_k,
+            g_expected_length_weight, g_freq_beta,
             g_min_tokens,
             g_max_ctx_tokens, g_max_candidates, g_n_threads,
             g_model_path.c_str());
@@ -1449,7 +1438,7 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
     }
   }
   g_fallback_buffer += commit_text;
-  // 用户词频累计 (freq_weight 融合; 仅含中文的词, 每 20 词落盘)
+  // 用户词频累计 (freq_beta 对数融合; 仅含中文的词, 每 20 词落盘)
   user_freq_bump(commit_text);
   // bound the fallback buffer: LLM context is at most ~20 tokens
   // (1-2 chars/token = 40 chars), keep only the most recent 64 UTF-8
