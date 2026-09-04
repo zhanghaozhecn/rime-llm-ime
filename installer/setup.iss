@@ -10,10 +10,16 @@
 ;   已有小狼毫 = 装入其目录原地升级：停服务 → 系统 TSF DLL 改名腾位替换
 ;               （.llm_old，加载中的镜像可改名——实测），不动注册表
 ;   参数零写入方案：装完任何方案由 librime 全局挂载 llm_filter（enabled
-;   默认 false；托盘 "LLM 重排设置" 开启，保存即热重载生效）。
+;               默认 false；托盘 "LLM 重排设置" 开启，保存即热重载生效）。
+;   模型下载页（2026-09-04）：Ready 页后询问是否下载模型，下拉候选框
+;               默认"暂不下载"；另列出本机扫描到的 .gguf 可直接选用。
+;               下载/选用成功 → 追加式写 llm_rerank.yaml enabled: true
+;               （追加不改写原行：GUI 写的 yaml 是无 BOM UTF-8，Inno 字符串
+;               读写按 ANSI 会破坏中文注释；解析器后行覆盖前行，语义安全）。
+;               GUI（WeaselLLMSetup）自 2026-09-04 起不再提供下载。
 
 #define MyAppName "小狼毫 LLM 版"
-#define MyAppVer "2026.09.03"
+#define MyAppVer "2026.09.04"
 #define MyAppId "{{3F8A2D5C-6B1E-4F9A-8D73-9C2E5B7A1F40}"
 
 [Setup]
@@ -52,12 +58,17 @@ Root: HKLM; Subkey: "Software\WOW6432Node\Rime\Weasel"; ValueType: string; Value
 Source: "source\*"; DestDir: "{app}"; Flags: ignoreversion
 Source: "repair_tsf.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\bin\data\*"; DestDir: "{app}\data"; Flags: recursesubdirs ignoreversion
-; 升级路径：系统位 TSF DLL 原位替换（改名腾位在 PrepareToInstall 完成；
-; 全新路径由 WeaselSetup /s 自己部署系统文件，跳过两条。
+; 系统位 TSF DLL 部署（改名腾位在 PrepareToInstall 完成）。
+; 2026-08-31 修：原仅 IsUpgrade 执行、全新路径交给 WeaselSetup /s——但
+; 从官方版/插件版卸载切换的机器会踩坑（官方卸载器删 TSF 注册键 → 误判
+; 全新；System32 残留官方 DLL，/s 只补缺失不替换）→ 注册到官方 DLL：
+; 打字正常但无 LLM 菜单、无 TSF 采上文（真机实测）。现无条件部署：全新
+; 机两步顺序不变（[Files] 先放好我们的 DLL，[Run] WeaselSetup /s 见系统
+; 位已存在直接注册即收敛）。
 ; restartreplace 兜底：改名腾位失败且文件被 TSF 占用时排队重启替换，
 ; 避免安装中途报错中止——2026-08-27 实测直写成功属幸运路径，不可依赖）
-Source: "source\weaselx64.dll"; DestDir: "{sys}"; DestName: "weasel.dll"; Flags: ignoreversion restartreplace; Check: IsUpgrade
-Source: "source\weasel32.dll"; DestDir: "{syswow64}"; DestName: "weasel.dll"; Flags: ignoreversion restartreplace; Check: IsUpgrade
+Source: "source\weaselx64.dll"; DestDir: "{sys}"; DestName: "weasel.dll"; Flags: ignoreversion restartreplace
+Source: "source\weasel32.dll"; DestDir: "{syswow64}"; DestName: "weasel.dll"; Flags: ignoreversion restartreplace
 
 [Run]
 ; 全新机器：官方静默安装（TSF 注册 + 系统 DLL 部署；安装器已提权）
@@ -65,7 +76,7 @@ Filename: "{app}\WeaselSetup.exe"; Parameters: "/s"; Flags: runhidden; Check: Is
 ; 始终启动服务（无 skipifsilent——静默安装同样要恢复输入法服务；
 ; postinstall 勾选项只保留 GUI）
 Filename: "{app}\WeaselServer.exe"; Flags: nowait runhidden
-Filename: "{app}\WeaselLLMSetup.exe"; Flags: nowait postinstall skipifsilent unchecked; Description: "打开 LLM 重排设置（首次使用：下载模型并启用）"
+Filename: "{app}\WeaselLLMSetup.exe"; Flags: nowait postinstall skipifsilent unchecked; Description: "打开 LLM 重排设置（选择/检查模型与参数）"
 
 [UninstallRun]
 ; 官方卸载注册路径（停止 TSF 注册 + 移除系统文件）
@@ -77,6 +88,145 @@ Type: filesandordirs; Name: "{app}"
 [Code]
 var
   FreshInstall: Boolean;
+  ModelPage: TWizardPage;
+  ModelCombo: TNewComboBox;
+  ModelPaths: TArrayOfString;  // 下拉框 index-2 起对应的本机模型路径
+  DownloadPage: TDownloadWizardPage;
+
+const
+  // 与插件版 GUI 同源（unsloth 镜像，ModelScope 国内直连）
+  ModelUrlStr = 'https://modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/resolve/master/Qwen3.5-0.8B-Q4_K_M.gguf';
+  ModelFileName = 'Qwen3.5-0.8B-Q4_K_M.gguf';
+
+// ---- llm_rerank.yaml 追加（不重写原行；行尾 #13#10 保证与既有末行分隔，
+// 解析器空行跳过、后行覆盖前行。仅写 ASCII 行——见文件头说明） ----
+procedure YamlAppend(line: String);
+var
+  path: String;
+begin
+  path := ExpandConstant('{userappdata}\Rime');
+  ForceDirectories(path);
+  SaveStringToFile(path + '\llm_rerank.yaml', #13#10 + line, True);
+end;
+
+function IsAscii(s: String): Boolean;
+var
+  i: Integer;
+begin
+  Result := True;
+  for i := 1 to Length(s) do
+    if Ord(s[i]) > 127 then begin
+      Result := False;
+      Exit;
+    end;
+end;
+
+// 扫描常见位置的 .gguf 候选：Rime 用户目录（默认下载落点）+
+// %USERPROFILE%\gguf_models（插件版约定位置——迁移用户模型已在盘上）
+procedure ScanDirForModels(dir: String);
+var
+  FR: TFindRec;
+  n: Integer;
+begin
+  if GetArrayLength(ModelPaths) >= 4 then Exit;
+  if FindFirst(AddBackslash(dir) + '*.gguf', FR) then begin
+    try
+      repeat
+        if (FR.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then begin
+          ModelCombo.Items.Add('使用已有模型: ' + AddBackslash(dir) + FR.Name);
+          n := GetArrayLength(ModelPaths);
+          SetArrayLength(ModelPaths, n + 1);
+          ModelPaths[n] := AddBackslash(dir) + FR.Name;
+        end;
+      until (not FindNext(FR)) or (GetArrayLength(ModelPaths) >= 4);
+    finally
+      FindClose(FR);
+    end;
+  end;
+end;
+
+procedure InitializeWizard();
+var
+  lbl: TNewStaticText;
+begin
+  DownloadPage := CreateDownloadPage(SetupMessage(msgWizardPreparing),
+                                     SetupMessage(msgPreparingDesc), nil);
+  ModelPage := CreateCustomPage(wpReady, '模型下载',
+      '是否现在获取 LLM 重排模型？（不下载也可完成安装）');
+  lbl := TNewStaticText.Create(ModelPage.Surface);
+  lbl.Parent := ModelPage.Surface;
+  lbl.Caption := 'LLM 重排需要 GGUF 模型文件（Qwen3.5-0.8B-Q4_K_M，约 508 MB）。' +
+      '默认暂不下载；已在本机找到的模型可直接选用。下载/选用后自动开启重排。';
+  lbl.WordWrap := True;
+  lbl.SetBounds(ScaleX(0), ScaleY(0), ScaleX(430), ScaleY(44));
+  ModelCombo := TNewComboBox.Create(ModelPage.Surface);
+  ModelCombo.Parent := ModelPage.Surface;
+  ModelCombo.Style := csDropDownList;
+  ModelCombo.SetBounds(ScaleX(0), ScaleY(52), ScaleX(430), ScaleY(180));
+  ModelCombo.Items.Add('暂不下载（默认）— 之后可重跑安装包，或在设置中自行放置模型');
+  ModelCombo.Items.Add('下载 Qwen3.5-0.8B-Q4_K_M（约 508 MB，ModelScope）');
+  SetArrayLength(ModelPaths, 0);
+  ScanDirForModels(ExpandConstant('{userappdata}\Rime'));
+  ScanDirForModels(GetEnv('USERPROFILE') + '\gguf_models');
+  ModelCombo.ItemIndex := 0;
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  idx, i: Integer;
+  dest, p, err: String;
+  ok, giveUp: Boolean;
+begin
+  Result := True;
+  if CurPageID = ModelPage.ID then begin
+    idx := ModelCombo.ItemIndex;
+    if idx = 1 then begin
+      // 下载分支
+      dest := ExpandConstant('{userappdata}\Rime\') + ModelFileName;
+      ForceDirectories(ExpandConstant('{userappdata}\Rime'));
+      if FileExists(dest) then
+        if MsgBox('已存在模型文件：' + dest + #13#10#13#10 +
+                  '是否重新下载覆盖？（选"否"则沿用现有文件并开启重排）',
+                  mbConfirmation, MB_YESNO) = IDNO then begin
+          YamlAppend('enabled: true');
+          Exit;
+        end;
+      ok := False;
+      giveUp := False;
+      repeat
+        DownloadPage.Clear;
+        DownloadPage.Add(ModelUrlStr, ModelFileName, dest);
+        DownloadPage.Show;
+        try
+          DownloadPage.Download;
+          ok := True;
+        except
+          err := GetExceptionMessage;
+        end;
+        DownloadPage.Hide;
+        if (not ok) and (MsgBox(
+            '模型下载失败：' + err + #13#10 + #13#10 +
+            '选"重试"再试；选"取消"跳过——之后重跑安装包下载，或手动下载：'#13#10 +
+            ModelUrlStr + #13#10 + '放到：' + dest,
+            mbError, MB_RETRYCANCEL) <> IDRETRY) then
+          giveUp := True;
+      until ok or giveUp;
+      if ok then
+        YamlAppend('enabled: true');  // 选了下载即视为要启用
+    end
+    else if idx >= 2 then begin
+      // 使用已有模型分支
+      p := ModelPaths[idx - 2];
+      if IsAscii(p) then begin
+        YamlAppend('model_path: ' + p);
+        YamlAppend('enabled: true');
+      end else
+        MsgBox('所选模型路径含非 ASCII 字符（如中文用户名），安装器无法安全' +
+               '写入配置。'#13#10#13#10'请安装后打开"LLM 重排设置"，在模型' +
+               '路径下拉框中选择该文件并保存。', mbInformation, MB_OK);
+    end;
+  end;
+end;
 
 // 已有小狼毫 → 其目录原地升级；否则默认独立目录
 //（不用 FindFirst：探测用固定候选清单覆盖官方 0.17.x-0.19.x 与本包自身）
@@ -169,12 +319,14 @@ begin
   KillServer();
   Sleep(1500);
   CleanOld(ExpandConstant('{app}'));
-  if not FreshInstall then begin
-    CleanOld(ExpandConstant('{sys}'));
-    CleanOld(ExpandConstant('{syswow64}'));
-    RenameAside(ExpandConstant('{sys}\weasel.dll'));
-    RenameAside(ExpandConstant('{syswow64}\weasel.dll'));
-  end;
+  // 系统位改名腾位无条件执行（2026-08-31 修，配套 [Files] 去 IsUpgrade）：
+  // 从官方版卸载切换的机器 TSF 注册键缺失（误判全新）但 System32 残留
+  // 官方 DLL——必须腾位才能放入我们的构建。RenameAside 对不存在文件是
+  // no-op，真全新机不受影响。
+  CleanOld(ExpandConstant('{sys}'));
+  CleanOld(ExpandConstant('{syswow64}'));
+  RenameAside(ExpandConstant('{sys}\weasel.dll'));
+  RenameAside(ExpandConstant('{syswow64}\weasel.dll'));
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
