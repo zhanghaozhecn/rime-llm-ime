@@ -99,6 +99,11 @@ static double g_expected_length_weight = 0.2;  // 预期词长加权 (冷启动�
 // 用户词频对数融合 (2026-09-02): fused = score + β·log(1+eff), 默认 β=1.5
 // (本机打字真实窗回放标定: β∈[1,2] 平台, 大 β 为标签偏好假象; 见 Collect 段)
 static double g_freq_beta = 1.5;
+// debug_fusion 诊断 (2026-09-03 插件版先行、本文件移植): true = 逐块记录
+// 评分→词频融合→词长加成全过程写 rime_llm_debug.txt (与插件版同名同格式;
+// 差异: commit 行无码字段 — OnCommit 只收到上屏文本; reset 行按代次触发,
+// 无法区分具体编辑键)。默认 false, 关闭时仅一次 bool 读零开销。
+static bool g_debug_fusion = false;
 static int g_min_tokens = 1;
 static int g_max_ctx_tokens = 10;  // tok=10: 93.4% acc, 10->17 gains only +1.1pp
 static int g_n_threads = 4;        // default = GGML_DEFAULT_N_THREADS; override via cpu_cores
@@ -125,6 +130,7 @@ struct LlmParamSet {
   bool has_max_tokens = false;   int max_tokens = 10;
   bool has_max_cand = false;     int max_cand = 5;
   bool has_cpu_cores = false;    int cpu_cores = 4;
+  bool has_debug_fusion = false; bool debug_fusion = false;
   bool has_model_path = false;   std::string model_path;
 };
 static LlmParamSet g_schema_params;  // Initialize 时快照（部署期固定）
@@ -145,6 +151,9 @@ static void llm_apply_params() {
       s.has_elw ? s.elw : (y.has_elw ? y.elw : 0.2);
   g_freq_beta = s.has_freq_beta ? s.freq_beta
                                 : (y.has_freq_beta ? y.freq_beta : 1.5);
+  g_debug_fusion = s.has_debug_fusion
+                       ? s.debug_fusion
+                       : (y.has_debug_fusion ? y.debug_fusion : false);
   g_min_tokens =
       s.has_min_tokens ? s.min_tokens : (y.has_min_tokens ? y.min_tokens : 1);
   g_max_ctx_tokens = s.has_max_tokens
@@ -221,6 +230,7 @@ static void llm_load_global_params() {
     else if (key == "max_tokens") { p.has_max_tokens = true; p.max_tokens = atoi(val.c_str()); }
     else if (key == "max_candidates") { p.has_max_cand = true; p.max_cand = atoi(val.c_str()); }
     else if (key == "cpu_cores") { p.has_cpu_cores = true; p.cpu_cores = atoi(val.c_str()); }
+    else if (key == "debug_fusion") { p.has_debug_fusion = true; p.debug_fusion = (val == "true"); }
     else if (key == "model_path") { p.has_model_path = true; p.model_path = val; }
   }
   fclose(f);
@@ -253,10 +263,10 @@ static void llm_reload_global_if_changed() {
   llm_load_global_params();
   llm_apply_params();
   log_msg("llm_rerank.yaml reloaded: enabled=%d elw=%.2f freq_beta=%.2f "
-          "tok=%d/%d cand=%d cores=%d model=%s",
+          "debug_fusion=%d tok=%d/%d cand=%d cores=%d model=%s",
           g_enabled ? 1 : 0, g_expected_length_weight, g_freq_beta,
-          g_min_tokens, g_max_ctx_tokens, g_max_candidates, g_n_threads,
-          g_model_path.c_str());
+          g_debug_fusion ? 1 : 0, g_min_tokens, g_max_ctx_tokens,
+          g_max_candidates, g_n_threads, g_model_path.c_str());
   if (g_enabled)
     load_model_async();  // 路径变更时内部自动卸载重载；同路径已载为 no-op
   else if (g_loaded.load() || g_loading.load())
@@ -531,6 +541,46 @@ static void event_log(const std::string &input, const std::string &before,
   fprintf(f, "%s|%ld|%s|%s|%s|%s|%.0fms|%s\n", ts, n, input.c_str(),
           before.c_str(), ctx.c_str(), after.c_str(), elapsed_ms, src.c_str());
   fclose(f);
+}
+
+// ============================================================
+// debug_fusion 诊断输出 (与插件版 llm_filter.lua/llm_processor.lua
+// 同名同格式, 写 rime_llm_debug.txt): score 块 = 头行 + 负路径行 +
+// 逐候选明细 + 名次变化 + span; commit 行 = 词频 bump 前后; reset 行 =
+// 代次变化清缓存。块尾空行分隔。
+// ============================================================
+static std::string now_hms() {
+  std::time_t t = std::time(nullptr);
+  std::tm tm_buf;
+#ifdef _WIN32
+  localtime_s(&tm_buf, &t);
+#else
+  localtime_r(&t, &tm_buf);
+#endif
+  char ts[16];
+  std::strftime(ts, sizeof(ts), "%H:%M:%S", &tm_buf);
+  return ts;
+}
+
+static void debug_fusion_write(const std::vector<std::string> &lines) {
+  if (lines.empty())
+    return;
+  FILE *f = open_log_file("rime_llm_debug.txt");
+  if (!f)
+    return;
+  for (auto &l : lines)
+    fprintf(f, "%s\n", l.c_str());
+  fprintf(f, "\n");
+  fclose(f);
+}
+
+// 诊断数值: 哨兵/非有限 → 短标记, 免 %f 展开 -1e308 撑爆行宽
+static std::string dbg_num(double v) {
+  if (!(v > -1e307))
+    return "-inf";
+  char b[32];
+  snprintf(b, sizeof(b), "%.3f", v);
+  return b;
 }
 
 // ============================================================
@@ -1106,6 +1156,13 @@ void LlmRerankTranslation::Collect() {
       if (api->context_reset_generation)
         gen = api->context_reset_generation();
     if (gen != s_cache_gen) {
+      // 插件版在 processor 编辑键回调记 reset 行; 源码版无 lua 层, 在下次
+      // Collect 见到代次变化时补记 (首块 s_cache_gen=-1 不记, 免启动噪音)
+      if (g_debug_fusion && s_cache_gen != -1)
+        debug_fusion_write({now_hms() + "|reset|代次 " +
+                            std::to_string(s_cache_gen) + "→" +
+                            std::to_string(gen) +
+                            " → 上文重置+缓存清空 (编辑键/切窗)"});
       s_cache_valid = false;
       s_cache_gen = gen;
     }
@@ -1116,8 +1173,28 @@ void LlmRerankTranslation::Collect() {
     std::vector<double> score_of(candidates_.size(), 0.0);  // 词频融合重放用
     std::vector<char> has_score(candidates_.size(), 0);
 
-    if (s_cache_valid && ctx == s_cache_ctx && input_ == s_cache_input &&
-        !s_cache_ranked.empty()) {
+    // debug_fusion 块缓冲: 头行先写, 明细在各段补, 末尾统一落盘
+    std::vector<std::string> dbg;
+    double dbg_span = 0;
+    bool dbg_span_on = false;
+    std::vector<double> dbg_eb(candidates_.size(), 0.0);
+    const bool cache_hit = s_cache_valid && ctx == s_cache_ctx &&
+                           input_ == s_cache_input && !s_cache_ranked.empty();
+    if (g_debug_fusion) {
+      user_freq_ensure_loaded();  // tick 读数须在懒加载后 (插件版同修)
+      std::string tail =
+          ctx.size() > 16 ? "…" + ctx.substr(ctx.size() - 15) : ctx;
+      char head[512];
+      snprintf(head, sizeof(head),
+               "%s|score|input=%s|cache=%s|ctx=[%s]|src=%s|tick=%lld|ready=1"
+               "|n=%d",
+               now_hms().c_str(), input_.c_str(), cache_hit ? "HIT" : "MISS",
+               tail.c_str(), src_.c_str(), (long long)g_user_tick,
+               (int)candidates_.size());
+      dbg.push_back(head);
+    }
+
+    if (cache_hit) {
       // cache hit: 同一 (ctx, input) 的评分结果复用 — 翻页/候选窗重建
       // 不再跑 S2/S3 (~36ms/次)。缓存存评分顺序+原始分, 词频融合与徽章按
       // 当前配置重放; 候选集变化时新候选未命中 → 落到尾部 (与插件版一致)。
@@ -1177,9 +1254,21 @@ void LlmRerankTranslation::Collect() {
             s_cache_scores.push_back(scores[i]);
           }
           did_score = true;
+        } else if (g_debug_fusion) {
+          dbg.push_back("  评分异常: scores 数组长度不符 (推理失败)");
         }
+      } else if (g_debug_fusion) {
+        dbg.push_back("  score=nil (ctx tokens " +
+                      std::to_string((int)ctx_ids.size()) +
+                      " < min_tokens " + std::to_string(g_min_tokens) +
+                      " — 上文空/过短跳过)");
       }
     }
+
+    // CE 序名次 (诊断): 此刻 order = 评分序 (缓存命中 = 缓存的评分序)
+    std::vector<int> ce_rank(candidates_.size(), 0);
+    for (size_t k = 0; k < order.size(); k++)
+      ce_rank[(size_t)order[k]] = (int)k + 1;
 
     // 对数词频融合 (freq_beta, 2026-09-02; 词频 Rime 时间衰减 2026-08-21):
     // fused = score + β·log(1+eff)。score = 原始 LLM 分 (−CE, 对数概率域),
@@ -1241,9 +1330,10 @@ void LlmRerankTranslation::Collect() {
         items.reserve(order.size());
         for (int i : order) {
           bool match = utf8_len(candidates_[i]->text()) == expected_len;
-          double s =
-              fused_of[i] + (match ? g_expected_length_weight * span : 0.0);
-          items.push_back({s, match, i});
+          double bonus = match ? g_expected_length_weight * span : 0.0;
+          if (g_debug_fusion && match)
+            dbg_eb[i] = bonus;
+          items.push_back({fused_of[i] + bonus, match, i});
         }
         std::stable_sort(items.begin(), items.end(),
                          [](const ELItem &a, const ELItem &b) {
@@ -1252,8 +1342,52 @@ void LlmRerankTranslation::Collect() {
                          });
         order.clear();
         for (auto &it : items) order.push_back(it.idx);
+        if (g_debug_fusion) {
+          dbg_span = span;
+          dbg_span_on = true;
+        }
+      } else if (g_debug_fusion && !all_valid) {
+        dbg.push_back("  词长段跳过: 存在无效融合分候选");
       }
     }
+
+    // 诊断明细: 逐候选 CE/eff/频+/长+/key 与名次变化 (最终序前 8 个)
+    if (g_debug_fusion && !order.empty()) {
+      std::vector<int> final_rank(candidates_.size(), 0);
+      for (size_t k = 0; k < order.size(); k++)
+        final_rank[(size_t)order[k]] = (int)k + 1;
+      size_t shown = order.size() < 8 ? order.size() : 8;
+      for (size_t k = 0; k < shown; k++) {
+        int i = order[k];
+        double eff = has_score[i] ? user_freq_eff(candidates_[i]->text()) : 0;
+        double fb = has_score[i] ? g_freq_beta * std::log1p(eff) : 0;
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "  #%d %-6s CE=%8.3f eff=%6.3f 频+%6.3f 长+%5.2f key=%s"
+                 "  原次序%d→%d",
+                 (int)k + 1, candidates_[i]->text().c_str(), score_of[i], eff,
+                 fb, dbg_eb[i], dbg_num(fused_of[i] + dbg_eb[i]).c_str(),
+                 ce_rank[i], final_rank[i]);
+        dbg.push_back(line);
+      }
+      std::string moved;
+      for (size_t k = 0; k < order.size(); k++) {
+        int i = order[k];
+        if (ce_rank[i] && final_rank[i] && ce_rank[i] != final_rank[i]) {
+          if (!moved.empty())
+            moved += ", ";
+          moved += candidates_[i]->text() + " " +
+                   std::to_string(ce_rank[i]) + "→" +
+                   std::to_string(final_rank[i]);
+        }
+      }
+      dbg.push_back(moved.empty() ? "  名次变化: 无 (CE 序即融合序)"
+                                  : "  名次变化: " + moved);
+      if (dbg_span_on)
+        dbg.push_back("  词长span=" + dbg_num(dbg_span));
+    }
+    if (g_debug_fusion)
+      debug_fusion_write(dbg);
 
     if (!order.empty()) {
       // 应用顺序 (缓存命中与真实评分共用): 未匹配候选(新候选)落尾部
@@ -1329,6 +1463,10 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
       p.has_enabled = true;
       p.enabled = b;
     }
+    if (config->GetBool("llm_rerank/debug_fusion", &b)) {
+      p.has_debug_fusion = true;
+      p.debug_fusion = b;
+    }
     int v = 0;
     if (config->GetInt("llm_rerank/min_code_len", &v)) { p.has_min_code_len = true; p.min_code_len = v; }
     if (config->GetInt("llm_rerank/max_code_len", &v)) { p.has_max_code_len = true; p.max_code_len = v; }
@@ -1343,12 +1481,12 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     g_yaml_stamp = llm_yaml_stamp();
     llm_apply_params();
     log_msg("config: enabled=%d min_code_len=%d max_code_len=%d "
-            "expected_length_weight=%.2f freq_beta=%.2f "
+            "expected_length_weight=%.2f freq_beta=%.2f debug_fusion=%d "
             "min_tokens=%d "
             "max_tokens=%d max_candidates=%d cpu_cores=%d "
             "model=%s",
             g_enabled ? 1 : 0, g_min_code_len, g_max_code_len,
-            g_expected_length_weight, g_freq_beta,
+            g_expected_length_weight, g_freq_beta, g_debug_fusion ? 1 : 0,
             g_min_tokens,
             g_max_ctx_tokens, g_max_candidates, g_n_threads,
             g_model_path.c_str());
@@ -1438,8 +1576,35 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
     }
   }
   g_fallback_buffer += commit_text;
-  // 用户词频累计 (freq_beta 对数融合; 仅含中文的词, 每 20 词落盘)
-  user_freq_bump(commit_text);
+  // 用户词频累计 (freq_beta 对数融合; 仅含中文的词, 每 20 词落盘)。
+  // debug_fusion commit 行: eff/tick/脏计数 bump 前后 (码字段插件版有、
+  // 源码版无 — OnCommit 只收到上屏文本, 拿不到已提交的编码)
+  if (g_debug_fusion) {
+    user_freq_ensure_loaded();  // before 读数须在懒加载后 (插件版同修)
+    bool has_cjk = false;
+    for (unsigned char ch : commit_text)
+      if (ch >= 0x80) {
+        has_cjk = true;
+        break;
+      }
+    double eff_before = 0;
+    long long tick_before = g_user_tick;
+    int dirty_before = g_user_freq_dirty;
+    if (has_cjk)
+      eff_before = user_freq_eff(commit_text);
+    user_freq_bump(commit_text);
+    if (has_cjk) {
+      char line[256];
+      snprintf(line, sizeof(line),
+               "%s|commit|词=%s|eff %.3f→%.3f|tick %lld→%lld|flush脏%d/20",
+               now_hms().c_str(), commit_text.c_str(), eff_before,
+               user_freq_eff(commit_text), tick_before, (long long)g_user_tick,
+               dirty_before);
+      debug_fusion_write({line});
+    }
+  } else {
+    user_freq_bump(commit_text);
+  }
   // bound the fallback buffer: LLM context is at most ~20 tokens
   // (1-2 chars/token = 40 chars), keep only the most recent 64 UTF-8
   // bytes, aligned to character boundaries
