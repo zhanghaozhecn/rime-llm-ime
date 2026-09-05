@@ -340,6 +340,19 @@ static constexpr double kFreqTau = 200.0;  // rime formula_d 时间常数
 // Log file: RIME user data dir, single file rime_llm_filter_log.txt
 // (performance lines + per-inference event lines); falls back to %TEMP%.
 // resolve log file path: RIME user data dir + filename, fallback %TEMP%
+// 日志轮转（2026-09-04）：>5MB 改名 .old（单文件轮转）防无限增长；
+// 改名失败（被占等罕见）则继续追加，不丢日志
+static void rotate_if_large(const char *path) {
+  WIN32_FILE_ATTRIBUTE_DATA fa;
+  if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa) &&
+      ((((unsigned long long)fa.nFileSizeHigh << 32) |
+        (unsigned long long)fa.nFileSizeLow) > 5ull * 1024 * 1024)) {
+    std::string oldp = std::string(path) + ".old";
+    DeleteFileA(oldp.c_str());
+    MoveFileA(path, oldp.c_str());
+  }
+}
+
 static FILE *open_log_file(const char *filename) {
   char path[MAX_PATH];
   const RimeApi *api = rime_get_api();
@@ -347,12 +360,14 @@ static FILE *open_log_file(const char *filename) {
     const char *ud = api->get_user_data_dir();
     if (ud && *ud && strlen(ud) < MAX_PATH - 64) {
       snprintf(path, sizeof(path), "%s\\%s", ud, filename);
+      rotate_if_large(path);
       return fopen(path, "a");
     }
   }
 #ifdef _WIN32
   GetTempPathA(sizeof(path), path);
   strncat(path, filename, sizeof(path) - strlen(path) - 1);
+  rotate_if_large(path);
   return fopen(path, "a");
 #else
   (void)path;
@@ -444,14 +459,23 @@ static void user_freq_save() {
   if (!f)
     return;
   fprintf(f, "#tick=%lld\n", g_user_tick);
-  for (auto &kv : g_user_freq)
+  for (auto &kv : g_user_freq) {
+    // 落盘修剪（2026-09-04）：衰减有效计数 <1e-3 的冷词条不再写（对
+    // 融合分影响 <0.002 nats，远低于任何实际分差）——文件有界，旧冷
+    // 词条自然淘汰（内存 map 会话期保留，下次 save 重新评估）
+    if (kv.second.dee *
+            exp((double)(kv.second.tick - g_user_tick) / kFreqTau) < 1e-3)
+      continue;
     fprintf(f, "%s\t%lld\t%.3f\t%lld\n", kv.first.c_str(), kv.second.commits,
             kv.second.dee, kv.second.tick);
+  }
   fclose(f);
 }
 
 static void user_freq_bump(const std::string &w) {
-  // 仅计含中文的词 (与插件版训练语料同语义; 候选词均为中文词)
+  // 仅计非 ASCII 上屏（>=0x80）：与 Rime userdb "任何词条提交推 tick"
+  // 同源口径——全角标点也计，有意为之（2026-09-03 tick 含一字词定案的
+  // 同源原则；严格汉字判定反而偏离引擎口径）
   bool has_cjk = false;
   for (unsigned char ch : w)
     if (ch >= 0x80) {
@@ -581,6 +605,14 @@ static std::string dbg_num(double v) {
   char b[32];
   snprintf(b, sizeof(b), "%.3f", v);
   return b;
+}
+
+// 右对齐 8 列版（CE 列哨兵 -1e10 若用 %8.3f 会展开成 16 字符撑破行宽）
+static std::string dbg_num8(double v) {
+  std::string s = dbg_num(v);
+  if (s.size() < 8)
+    s.insert(0, 8 - s.size(), ' ');
+  return s;
 }
 
 // ============================================================
@@ -953,6 +985,9 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
       for (int ci : idx2)
         ce_sum[ci] = -1e10;
       log_msg("WARN: step2 decode failed");
+      // 失败自愈：prep 命中路径无 memory_clear，decode 失败多为 KV 耗尽
+      // （见下方 worker 清理说明）——置无效强制下次 score 走全流程重建
+      g_prep_ready = false;
     }
     llama_batch_free(b2);
     auto ts2_1 = std::chrono::high_resolution_clock::now();
@@ -988,10 +1023,25 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
       for (int ci : idx3)
         ce_sum[ci] = -1e10;
       log_msg("WARN: step3 decode failed");
+      g_prep_ready = false;  // 同 Step2：失败自愈
     }
     llama_batch_free(b3);
     auto ts3_1 = std::chrono::high_resolution_clock::now();
     ms3 = std::chrono::duration<double, std::milli>(ts3_1 - ts3_0).count();
+  }
+
+  // worker 序列 KV 清理（2026-09-04 修"推理自停"根因，与插件版同步）：
+  // seq_cp 是共享标记非复制，Step2/3 的 decode cell 评分后仍归属 seq 1..M；
+  // prep 命中路径无 memory_clear，同 ctx 连续评分（退格重打/改码不换 ctx/
+  // 失败重试）每轮净耗 M+K cell——n_ctx=128 约 14 轮耗尽 → decode 静默
+  // 失败 → 全哨兵分且 prep_ready 仍真 → 卡死失败循环，仅 commit 触发
+  // prepare 或重部署可解（非本机实测）。评分尾部立即释放 worker 归属：
+  // 共享 cell 只去掉一个归属方，seq0 与 prep 状态不受影响，prep 命中
+  // 照常，每次评分净耗归零。
+  if (M > 0) {
+    auto *mem = llama_get_memory(g_ctx);
+    for (int s = 1; s <= M; s++)
+      llama_memory_seq_rm(mem, s, 0, -1);
   }
 
   // final scoring: CE sum + long-candidate tail extrapolation
@@ -1363,9 +1413,10 @@ void LlmRerankTranslation::Collect() {
         double fb = has_score[i] ? g_freq_beta * std::log1p(eff) : 0;
         char line[256];
         snprintf(line, sizeof(line),
-                 "  #%d %-6s CE=%8.3f eff=%6.3f 频+%6.3f 长+%5.2f key=%s"
+                 "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f 长+%5.2f key=%s"
                  "  原次序%d→%d",
-                 (int)k + 1, candidates_[i]->text().c_str(), score_of[i], eff,
+                 (int)k + 1, candidates_[i]->text().c_str(),
+                 dbg_num8(has_score[i] ? score_of[i] : -1e308).c_str(), eff,
                  fb, dbg_eb[i], dbg_num(fused_of[i] + dbg_eb[i]).c_str(),
                  ce_rank[i], final_rank[i]);
         dbg.push_back(line);
