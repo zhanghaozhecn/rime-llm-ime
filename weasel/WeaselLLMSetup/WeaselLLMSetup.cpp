@@ -333,8 +333,13 @@ static void make_ui() {
   }
   mk(1, L"说明：预期词长权重适用于两码一字方案（词长 = 码长/2 加分）",
      0, 15, 262, 539, 20, 0);
-  mk(1, L"参数键名与 llm_rerank.yaml 相同；修改保存后立即生效",
-     0, 15, 282, 539, 20, 0);
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  wchar_t note2[128];
+  swprintf_s(note2,
+             L"参数键名与 llm_rerank.yaml 相同；修改保存后立即生效（本机逻辑核 %lu）",
+             si.dwNumberOfProcessors);
+  mk(1, note2, 0, 15, 282, 539, 20, 0);
   mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, 15, 302, 110, 30,
      IDC_SAVE);
   mk(0, L"关闭", WS_TABSTOP, 133, 302, 70, 30, IDC_CLOSE);
@@ -393,6 +398,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       make_ui();
       load_params();
       params_to_ui();
+      // 忘关提醒（2026-09-04）：诊断开着会持续写盘，打开设置时点一下
+      if (g_p.debug_fusion)
+        set_status(GetDlgItem(h, IDC_STATUS),
+                   L"提醒：诊断日志开着（rime_llm_debug.txt 持续增长，排障完建议关闭）");
       return 0;
     case WM_COMMAND:
       if (LOWORD(wp) == IDC_MODEL &&

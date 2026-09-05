@@ -29,8 +29,8 @@ LLM 候选重排**源码级集成**进 RIME 小狼毫：本地小语言模型（
 
 ### 安装包（推荐）
 
-1. 下载 `weasel-llm-setup-<日期>.exe`（约 10MB：[v2026.09.04](https://github.com/zhanghaozhecn/rime-llm-ime/releases/download/v2026.09.04/weasel-llm-setup-2026.09.04.exe)｜[全部版本](https://github.com/zhanghaozhecn/rime-llm-ime/releases)）双击。全新机器无需先装官方小狼毫；已有官方小狼毫则原地升级、不动注册
-2. 安装向导最后一步是**模型下载页**（2026-09-04 起）：默认**暂不下载**；可选下载 Qwen3.5-0.8B-Q4_K_M（约 508MB，ModelScope），或从下拉框选用本机已扫描到的 `.gguf`。下载/选用成功自动开启重排
+1. 下载 `weasel-llm-setup-<日期>.exe`（约 10MB：[v2026.09.05](https://github.com/zhanghaozhecn/rime-llm-ime/releases/download/v2026.09.05/weasel-llm-setup-2026.09.05.exe)｜[全部版本](https://github.com/zhanghaozhecn/rime-llm-ime/releases)）双击。全新机器无需先装官方小狼毫；已有官方小狼毫则原地升级、不动注册
+2. 安装向导最后一步是**模型下载页**：默认**暂不下载**；页上显示**当前模型位置**（读 `llm_rerank.yaml` 的 `model_path`，配置过/修改过一次即显示；空置时为默认位置 `%APPDATA%\Rime`），下载即落到该位置（约 508MB，ModelScope）。下载成功自动开启重排
 3. **在要启用的方案里加组件**（一次性，见下"方案接入"），托盘右键 → **重新部署**
 4. 若装时跳过了模型：托盘右键 → **"LLM 重排设置"**，模型路径下拉框选/浏览已有 `.gguf`（状态行会提示文件是否存在）→ 勾选**启用 LLM 重排** → **保存并生效**（立即热重载）
 5. 验证：打满 4 码，首选候选出现 `AI·TSF` / `AI·历史` 标记即已生效

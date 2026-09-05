@@ -11,15 +11,19 @@
 ;               （.llm_old，加载中的镜像可改名——实测），不动注册表
 ;   参数零写入方案：装完任何方案由 librime 全局挂载 llm_filter（enabled
 ;               默认 false；托盘 "LLM 重排设置" 开启，保存即热重载生效）。
-;   模型下载页（2026-09-04）：Ready 页后询问是否下载模型，下拉候选框
-;               默认"暂不下载"；另列出本机扫描到的 .gguf 可直接选用。
-;               下载/选用成功 → 追加式写 llm_rerank.yaml enabled: true
-;               （追加不改写原行：GUI 写的 yaml 是无 BOM UTF-8，Inno 字符串
-;               读写按 ANSI 会破坏中文注释；解析器后行覆盖前行，语义安全）。
-;               GUI（WeaselLLMSetup）自 2026-09-04 起不再提供下载。
+;   模型下载页（2026-09-04 引入；2026-09-05 改版）：Ready 页后询问是否
+;               下载模型，下拉候选默认"暂不下载"；显示"当前模型位置"——
+;               读 llm_rerank.yaml 的 model_path（配置过/修改过一次即显示），
+;               空置时为默认位置 %APPDATA%\Rime（不做本机模型扫描）。
+;               下载落点 = 当前位置；成功 → 追加式写 enabled: true（追加
+;               不改写原行：GUI 写的 yaml 是无 BOM UTF-8，Inno 按行读写会
+;               破坏中文注释；解析器后行覆盖前行，语义安全）。非 ASCII 的
+;               model_path 经 ANSI 读入会错码——按未配置处理（回落默认
+;               位置，用户可在 GUI 里选择真实路径）。GUI 自 2026-09-04 起
+;               不再提供下载。
 
 #define MyAppName "小狼毫 LLM 版"
-#define MyAppVer "2026.09.04"
+#define MyAppVer "2026.09.05"
 #define MyAppId "{{3F8A2D5C-6B1E-4F9A-8D73-9C2E5B7A1F40}"
 
 [Setup]
@@ -90,7 +94,7 @@ var
   FreshInstall: Boolean;
   ModelPage: TWizardPage;
   ModelCombo: TNewComboBox;
-  ModelPaths: TArrayOfString;  // 下拉框 index-2 起对应的本机模型路径
+  CurPathLbl: TNewStaticText;
   DownloadPage: TDownloadWizardPage;
 
 const
@@ -121,33 +125,48 @@ begin
     end;
 end;
 
-// 扫描常见位置的 .gguf 候选：Rime 用户目录（默认下载落点）+
-// %USERPROFILE%\gguf_models（插件版约定位置——迁移用户模型已在盘上）
-procedure ScanDirForModels(dir: String);
+// 读 llm_rerank.yaml 的 model_path（配置过/修改过一次即有；平面文件，
+// 后行覆盖前行）。文件为无 BOM UTF-8，Inno 按 ANSI 读入——非 ASCII
+// 路径会错码，按未配置处理（回落默认位置，用户可在 GUI 里选真实路径）
+function YamlModelPath(): String;
 var
-  FR: TFindRec;
-  n: Integer;
+  lines: TArrayOfString;
+  i, c: Integer;
+  s, key, val: String;
 begin
-  if GetArrayLength(ModelPaths) >= 4 then Exit;
-  if FindFirst(AddBackslash(dir) + '*.gguf', FR) then begin
-    try
-      repeat
-        if (FR.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then begin
-          ModelCombo.Items.Add('使用已有模型: ' + AddBackslash(dir) + FR.Name);
-          n := GetArrayLength(ModelPaths);
-          SetArrayLength(ModelPaths, n + 1);
-          ModelPaths[n] := AddBackslash(dir) + FR.Name;
-        end;
-      until (not FindNext(FR)) or (GetArrayLength(ModelPaths) >= 4);
-    finally
-      FindClose(FR);
+  Result := '';
+  if not LoadStringsFromFile(
+      ExpandConstant('{userappdata}\Rime\llm_rerank.yaml'), lines) then
+    Exit;
+  for i := 0 to GetArrayLength(lines) - 1 do begin
+    s := lines[i];
+    c := Pos(':', s);
+    if c < 1 then Continue;
+    key := Trim(Copy(s, 1, c - 1));
+    val := Trim(Copy(s, c + 1, Length(s) - c));
+    if SameText(key, 'model_path') then begin
+      if (Length(val) >= 2) and (val[1] = '"') and
+         (val[Length(val)] = '"') then
+        val := Copy(val, 2, Length(val) - 2);
+      Result := val;  // 后行覆盖前行
     end;
   end;
+  if (Result <> '') and (not IsAscii(Result)) then
+    Result := '';
+end;
+
+// 当前生效的模型位置：yaml 显式配置优先，否则默认 %APPDATA%\Rime
+function CurModelPath(): String;
+begin
+  Result := YamlModelPath();
+  if Result = '' then
+    Result := ExpandConstant('{userappdata}\Rime\') + ModelFileName;
 end;
 
 procedure InitializeWizard();
 var
   lbl: TNewStaticText;
+  p: String;
 begin
   DownloadPage := CreateDownloadPage(SetupMessage(msgWizardPreparing),
                                      SetupMessage(msgPreparingDesc), nil);
@@ -155,35 +174,42 @@ begin
       '是否现在获取 LLM 重排模型？（不下载也可完成安装）');
   lbl := TNewStaticText.Create(ModelPage.Surface);
   lbl.Parent := ModelPage.Surface;
-  lbl.Caption := 'LLM 重排需要 GGUF 模型文件（Qwen3.5-0.8B-Q4_K_M，约 508 MB）。' +
-      '默认暂不下载；已在本机找到的模型可直接选用。下载/选用后自动开启重排。';
+  lbl.Caption := 'LLM 重排需要 GGUF 模型文件（Qwen3.5-0.8B-Q4_K_M，约 508 MB），' +
+      '放在下方"当前模型位置"。默认暂不下载；下载成功后自动开启重排。';
   lbl.WordWrap := True;
   lbl.SetBounds(ScaleX(0), ScaleY(0), ScaleX(430), ScaleY(44));
   ModelCombo := TNewComboBox.Create(ModelPage.Surface);
   ModelCombo.Parent := ModelPage.Surface;
   ModelCombo.Style := csDropDownList;
-  ModelCombo.SetBounds(ScaleX(0), ScaleY(52), ScaleX(430), ScaleY(180));
+  ModelCombo.SetBounds(ScaleX(0), ScaleY(52), ScaleX(430), ScaleY(80));
   ModelCombo.Items.Add('暂不下载（默认）— 之后可重跑安装包，或在设置中自行放置模型');
   ModelCombo.Items.Add('下载 Qwen3.5-0.8B-Q4_K_M（约 508 MB，ModelScope）');
-  SetArrayLength(ModelPaths, 0);
-  ScanDirForModels(ExpandConstant('{userappdata}\Rime'));
-  ScanDirForModels(GetEnv('USERPROFILE') + '\gguf_models');
   ModelCombo.ItemIndex := 0;
+  // 当前模型位置：读 yaml（配置过即显示），空置时为默认位置
+  CurPathLbl := TNewStaticText.Create(ModelPage.Surface);
+  CurPathLbl.Parent := ModelPage.Surface;
+  p := CurModelPath();
+  if FileExists(p) then
+    CurPathLbl.Caption := '当前模型位置：' + p + '（文件已存在）'
+  else
+    CurPathLbl.Caption := '当前模型位置：' + p + '（文件不存在）';
+  CurPathLbl.WordWrap := True;
+  CurPathLbl.SetBounds(ScaleX(0), ScaleY(88), ScaleX(430), ScaleY(40));
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
-  idx, i: Integer;
-  dest, p, err: String;
+  idx: Integer;
+  dest, err: String;
   ok, giveUp: Boolean;
 begin
   Result := True;
   if CurPageID = ModelPage.ID then begin
     idx := ModelCombo.ItemIndex;
     if idx = 1 then begin
-      // 下载分支
-      dest := ExpandConstant('{userappdata}\Rime\') + ModelFileName;
-      ForceDirectories(ExpandConstant('{userappdata}\Rime'));
+      // 下载分支：落点 = 当前显示位置（yaml 配置优先，否则默认）
+      dest := CurModelPath();
+      ForceDirectories(ExtractFileDir(dest));
       if FileExists(dest) then
         if MsgBox('已存在模型文件：' + dest + #13#10#13#10 +
                   '是否重新下载覆盖？（选"否"则沿用现有文件并开启重排）',
@@ -213,17 +239,6 @@ begin
       until ok or giveUp;
       if ok then
         YamlAppend('enabled: true');  // 选了下载即视为要启用
-    end
-    else if idx >= 2 then begin
-      // 使用已有模型分支
-      p := ModelPaths[idx - 2];
-      if IsAscii(p) then begin
-        YamlAppend('model_path: ' + p);
-        YamlAppend('enabled: true');
-      end else
-        MsgBox('所选模型路径含非 ASCII 字符（如中文用户名），安装器无法安全' +
-               '写入配置。'#13#10#13#10'请安装后打开"LLM 重排设置"，在模型' +
-               '路径下拉框中选择该文件并保存。', mbInformation, MB_OK);
     end;
   end;
 end;
