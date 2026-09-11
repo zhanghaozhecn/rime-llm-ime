@@ -78,8 +78,14 @@ Source: "source\weasel32.dll"; DestDir: "{syswow64}"; DestName: "weasel.dll"; Fl
 ; 全新机器：官方静默安装（TSF 注册 + 系统 DLL 部署；安装器已提权）
 Filename: "{app}\WeaselSetup.exe"; Parameters: "/s"; Flags: runhidden; Check: IsFreshInstall
 ; 始终启动服务（无 skipifsilent——静默安装同样要恢复输入法服务；
-; postinstall 勾选项只保留 GUI）
-Filename: "{app}\WeaselServer.exe"; Flags: nowait runhidden
+; postinstall 勾选项只保留 GUI）。
+; runasoriginaluser（2026-09-11 真机踩坑）：server 必须非提权运行——
+; 提权进程 GetActiveObject 读非提权 WPS 的 ROT 被 DCOM 跨完整性级别
+; 拒绝，COM 上文旁路静默失效（TSF/历史不受影响，难定位）。历史潜伏
+; 根因：升级安装时总有非提权旧 server 存续，新起的提权实例因单例退
+; 出被掩盖；全新/清场安装必现（插件版 install_plugin.ps1 的 explorer
+; 代启是同坑同解法）。右键"以管理员身份运行"安装器时此标志无效。
+Filename: "{app}\WeaselServer.exe"; Flags: nowait runhidden runasoriginaluser
 Filename: "{app}\WeaselLLMSetup.exe"; Flags: nowait postinstall skipifsilent unchecked; Description: "打开 LLM 重排设置（选择/检查模型与参数）"
 
 [UninstallRun]
