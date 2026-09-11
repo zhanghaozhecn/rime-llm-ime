@@ -23,7 +23,7 @@
 ;               不再提供下载。
 
 #define MyAppName "小狼毫 LLM 版"
-#define MyAppVer "2026.09.05"
+#define MyAppVer "2026.09.11"
 #define MyAppId "{{3F8A2D5C-6B1E-4F9A-8D73-9C2E5B7A1F40}"
 
 [Setup]

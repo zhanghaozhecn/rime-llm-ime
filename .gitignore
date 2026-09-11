@@ -42,6 +42,12 @@ scripts/*
 !scripts/test_ipc.ps1
 !scripts/test_rime.cpp
 !scripts/build_test_rime.bat
+!scripts/test_llm_context.cpp
+!scripts/build_test_llm_context.bat
+!scripts/probe_wps_ctx.cpp
+!scripts/build_probe_wps_ctx.bat
+!scripts/probe_uia_ctx.cpp
+!scripts/build_probe_uia_ctx.bat
 !scripts/run_test_rime.bat
 !scripts/test_llm_context.cpp
 !scripts/build_test_llm_context.bat

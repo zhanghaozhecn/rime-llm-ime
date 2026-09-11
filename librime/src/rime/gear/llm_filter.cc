@@ -27,6 +27,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -40,6 +41,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <objbase.h>
+#include <oleauto.h>  // COM 光标上文旁路: GetActiveObject/VARIANT
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
 #endif
 
 namespace rime {
@@ -104,6 +109,9 @@ static double g_freq_beta = 1.5;
 // 差异: commit 行无码字段 — OnCommit 只收到上屏文本; reset 行按代次触发,
 // 无法区分具体编辑键)。默认 false, 关闭时仅一次 bool 读零开销。
 static bool g_debug_fusion = false;
+// COM 文档模型光标上文旁路开关 (2026-09-10 WPS 实验移植, 默认开; 定义与
+// 模块见下方 comctx 节 / 消费点 GetContextTextPair)
+static bool g_com_ctx_enabled = true;
 static int g_min_tokens = 1;
 static int g_max_ctx_tokens = 10;  // tok=10: 93.4% acc, 10->17 gains only +1.1pp
 static int g_n_threads = 4;        // default = GGML_DEFAULT_N_THREADS; override via cpu_cores
@@ -131,6 +139,7 @@ struct LlmParamSet {
   bool has_max_cand = false;     int max_cand = 5;
   bool has_cpu_cores = false;    int cpu_cores = 4;
   bool has_debug_fusion = false; bool debug_fusion = false;
+  bool has_com_ctx = false;      bool com_ctx = true;
   bool has_model_path = false;   std::string model_path;
 };
 static LlmParamSet g_schema_params;  // Initialize 时快照（部署期固定）
@@ -154,6 +163,9 @@ static void llm_apply_params() {
   g_debug_fusion = s.has_debug_fusion
                        ? s.debug_fusion
                        : (y.has_debug_fusion ? y.debug_fusion : false);
+  g_com_ctx_enabled = s.has_com_ctx
+                          ? s.com_ctx
+                          : (y.has_com_ctx ? y.com_ctx : true);
   g_min_tokens =
       s.has_min_tokens ? s.min_tokens : (y.has_min_tokens ? y.min_tokens : 1);
   g_max_ctx_tokens = s.has_max_tokens
@@ -231,6 +243,7 @@ static void llm_load_global_params() {
     else if (key == "max_candidates") { p.has_max_cand = true; p.max_cand = atoi(val.c_str()); }
     else if (key == "cpu_cores") { p.has_cpu_cores = true; p.cpu_cores = atoi(val.c_str()); }
     else if (key == "debug_fusion") { p.has_debug_fusion = true; p.debug_fusion = (val == "true"); }
+    else if (key == "com_context") { p.has_com_ctx = true; p.com_ctx = (val == "true"); }
     else if (key == "model_path") { p.has_model_path = true; p.model_path = val; }
   }
   fclose(f);
@@ -286,6 +299,355 @@ static int g_fallback_gen_seen = 0;    // consumed reset generation
 // engine thread only (同上)。
 static bool g_ctx_limited = false;
 static int g_limited_gen_seen = 0;
+
+// ============================================================
+// COM 文档模型光标上文旁路 (2026-09-10 WPS 实验移植; 探针源码 =
+// scripts/probe_wps_ctx.cpp; 定案与真机数据 memory/wps-context-
+// investigation.md 十一节)。WPS 文档正文只在自绘画布 (TSF store 只有
+// composition), 但 COM 文档模型可读: WPS 12.1 实测文档打开即注册 ROT
+// (打字前台态可用, 无微软 KB238610 失焦坑), ActiveWindow.Selection 前
+// 64 字读链稳态 ~5.5ms (6 跳 IDispatch), 24/24 拍逐词跟随。
+//
+// 消费语义 (见 GetContextTextPair): 仅粘性降级 (g_ctx_limited, WPS 类
+// 应用) 场景 — COM 缓存新鲜 → {com_text, "com"} (徽章仍 AI·TSF);
+// 失败/过期/com_context 关闭 → 原 {hist, "rime"} (八轮方案零改动)。
+// 好应用零开销: 线程懒启动 (首次降级命中才起), GetActiveObject 连败
+// 指数退避 500ms→8s。COM 只在旁路线程调用 (STA 出站调用无需消息泵,
+// probe 实测背书); 引擎线程仅经 mutex 读缓存快照。
+// ============================================================
+#ifdef _WIN32
+namespace comctx {
+
+static std::mutex g_mu;             // guards g_text/g_stamp
+static std::string g_text;          // UTF-8 caret-preceding text
+static unsigned long long g_stamp = 0;   // GetTickCount64() of last good read
+
+static std::mutex g_cv_mu;
+static std::condition_variable g_cv;
+static std::atomic<bool> g_kick{false};
+static std::atomic<bool> g_started{false};
+
+// 前台 Office 判定（2026-09-10 定案取代 lagging 后果判定做 COM 消费门控;
+// 2026-09-11 扩展演示）: OpusApp 同属 MS Word（开发代号 Opus）与 WPS 文字
+//（复刻 Word 窗口体系）; PP12FrameClass 同属 MS PowerPoint（2010+）与
+// WPS 演示（实测 12.1.0.28505）→ 两个类名圈定"文字 + 演示"。输入法跟前台
+// 焦点走, GetForegroundWindow 即打字处（候选窗不抢前台）。引擎线程每键
+// 调用, 微秒级。表格 XLMAIN（复刻 Excel）刻意不含——单元格编辑态 COM
+// 盲区（Office 系通病: 编辑态对象模型挂起、无 Selection.Start 等价物）,
+// 输入法打字恰在盲区, 落 TSF/历史兜底。
+enum class OfficeKind { NONE, WRITER, PPT };
+static OfficeKind foreground_office() {
+  HWND fg = GetForegroundWindow();
+  if (!fg)
+    return OfficeKind::NONE;
+  wchar_t cls[64];
+  if (GetClassNameW(fg, cls, 64) <= 0)
+    return OfficeKind::NONE;
+  if (wcscmp(cls, L"OpusApp") == 0)
+    return OfficeKind::WRITER;
+  if (wcscmp(cls, L"PP12FrameClass") == 0)
+    return OfficeKind::PPT;
+  return OfficeKind::NONE;
+}
+
+// ---- IDispatch 精简封装 (与探针同款; 错误只返回 hr, 调用方决策) ----
+static HRESULT disp_invoke(IDispatch *obj, const wchar_t *name, WORD flags,
+                           DISPPARAMS *pdp, VARIANT *ret) {
+  DISPID dispid = 0;
+  HRESULT hr = obj->GetIDsOfNames(IID_NULL, (LPOLESTR *)&name, 1,
+                                   LOCALE_USER_DEFAULT, &dispid);
+  if (FAILED(hr))
+    return hr;
+  VariantInit(ret);
+  return obj->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT, flags, pdp, ret,
+                     nullptr, nullptr);
+}
+static HRESULT disp_get(IDispatch *obj, const wchar_t *name, VARIANT *ret) {
+  DISPPARAMS dp;
+  ZeroMemory(&dp, sizeof(dp));
+  return disp_invoke(obj, name, DISPATCH_PROPERTYGET, &dp, ret);
+}
+
+enum class ReadResult { OK, NO_DOC, DEAD };  // NO_DOC: 无文档(保留引用) / DEAD: RPC 断(WPS 退出)
+
+// ---- 演示读链（WPP/PowerPoint，2026-09-11 本机实测验证）----
+// app.ActiveWindow.Selection.Type==3(文本编辑) 时：start = TextRange.Start
+//（框内 1-based 偏移）；前文 = ShapeRange.TextFrame.TextRange.Characters(
+// start-len, len).Text（len = min(64, start-1)）。Type!=3 → NO_DOC
+//（形状/幻灯片选择态）。表格 XLMAIN 不在此链（编辑态盲区）。
+static ReadResult ppt_read_chain(IDispatch *app, std::string &out) {
+  VARIANT vwin, vsel, vtype, vstart, vshape, vframe, vrng, vtxt;
+  VariantInit(&vwin); VariantInit(&vsel); VariantInit(&vtype);
+  VariantInit(&vstart); VariantInit(&vshape); VariantInit(&vframe);
+  VariantInit(&vrng); VariantInit(&vtxt);
+  auto vt_ok = [](const VARIANT &v) {
+    return v.vt == VT_DISPATCH && v.pdispVal;
+  };
+  HRESULT hr;
+  auto cleanup = [&]() {
+    VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vtype);
+    VariantClear(&vstart); VariantClear(&vshape); VariantClear(&vframe);
+    VariantClear(&vrng); VariantClear(&vtxt);
+  };
+  if (FAILED(hr = disp_get(app, L"ActiveWindow", &vwin)) || !vt_ok(vwin) ||
+      FAILED(hr = disp_get(vwin.pdispVal, L"Selection", &vsel)) ||
+      !vt_ok(vsel) ||
+      FAILED(hr = disp_get(vsel.pdispVal, L"Type", &vtype)) ||
+      vtype.vt != VT_I4) {
+    cleanup();
+    if (hr == DISP_E_EXCEPTION)
+      return ReadResult::NO_DOC;
+    return ReadResult::DEAD;
+  }
+  if (vtype.lVal != 3) {  // ppSelectionText = 3：非文本编辑态
+    cleanup();
+    return ReadResult::NO_DOC;
+  }
+  ReadResult res = ReadResult::OK;
+  do {
+    if (FAILED(hr = disp_get(vsel.pdispVal, L"TextRange", &vrng)) ||
+        !vt_ok(vrng) ||
+        FAILED(hr = disp_get(vrng.pdispVal, L"Start", &vstart)) ||
+        vstart.vt != VT_I4) {
+      res = (hr == DISP_E_EXCEPTION) ? ReadResult::NO_DOC : ReadResult::DEAD;
+      break;
+    }
+    long start = vstart.lVal;                     // 1-based
+    long len = start - 1 > 64 ? 64 : start - 1;   // 前文字数（截 64）
+    if (len <= 0) { out.clear(); break; }  // 光标在框首：前文真空
+    if (FAILED(hr = disp_get(vsel.pdispVal, L"ShapeRange", &vshape)) ||
+        !vt_ok(vshape) ||
+        FAILED(hr = disp_get(vshape.pdispVal, L"TextFrame", &vframe)) ||
+        !vt_ok(vframe)) {
+      res = (hr == DISP_E_EXCEPTION) ? ReadResult::NO_DOC : ReadResult::DEAD;
+      break;
+    }
+    VARIANT vfull;
+    VariantInit(&vfull);
+    if (FAILED(hr = disp_get(vframe.pdispVal, L"TextRange", &vfull)) ||
+        !vt_ok(vfull)) {
+      VariantClear(&vfull);
+      res = (hr == DISP_E_EXCEPTION) ? ReadResult::NO_DOC : ReadResult::DEAD;
+      break;
+    }
+    // Characters(start_index, length)：rgvark 反序 [length, start_index]
+    VARIANT args[2];
+    VariantInit(&args[0]); args[0].vt = VT_I4; args[0].lVal = len;
+    VariantInit(&args[1]); args[1].vt = VT_I4;
+    args[1].lVal = start - len;                   // 起始字符 = start-len
+    DISPPARAMS dp;
+    ZeroMemory(&dp, sizeof(dp));
+    dp.rgvarg = args; dp.cArgs = 2;
+    VariantClear(&vrng);  // 复用作出参：先释放首个 TextRange 引用
+    if (FAILED(hr = disp_invoke(vfull.pdispVal, L"Characters",
+                                DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+                                &dp, &vrng)) || !vt_ok(vrng)) {
+      VariantClear(&vfull);
+      res = (hr == DISP_E_EXCEPTION) ? ReadResult::NO_DOC : ReadResult::DEAD;
+      break;
+    }
+    VariantClear(&vfull);
+    if (FAILED(hr = disp_get(vrng.pdispVal, L"Text", &vtxt)) ||
+        vtxt.vt != VT_BSTR) {
+      res = (hr == DISP_E_EXCEPTION) ? ReadResult::NO_DOC : ReadResult::DEAD;
+      break;
+    }
+    int n = WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, nullptr, 0,
+                                nullptr, nullptr);
+    if (n > 0) {
+      out.resize(n - 1);
+      if (n > 1)
+        WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, &out[0], n,
+                            nullptr, nullptr);
+    }
+  } while (false);
+  cleanup();
+  return res;
+}
+
+static ReadResult read_chain(IDispatch *app, std::string &out) {
+  // app.ActiveWindow → win.Selection → sel.Start → app.ActiveDocument →
+  // doc.Range(pos-64, pos).Text   (rgvark 反序: 末参数在前)
+  VARIANT vwin, vsel, vstart, vdoc, vrng, vtxt;
+  VariantInit(&vwin); VariantInit(&vsel); VariantInit(&vstart);
+  VariantInit(&vdoc); VariantInit(&vrng); VariantInit(&vtxt);
+  auto vt_ok = [](const VARIANT &v) { return v.vt == VT_DISPATCH && v.pdispVal; };
+  HRESULT hr;
+  if (FAILED(hr = disp_get(app, L"ActiveWindow", &vwin)) || !vt_ok(vwin) ||
+      FAILED(hr = disp_get(vwin.pdispVal, L"Selection", &vsel)) || !vt_ok(vsel) ||
+      FAILED(hr = disp_get(vsel.pdispVal, L"Start", &vstart)) ||
+      vstart.vt != VT_I4) {
+    VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vstart);
+    VariantClear(&vdoc); VariantClear(&vrng); VariantClear(&vtxt);
+    // RPC 层失败 (hr 为 RPC_*/CO_*) → WPS 进程不在; DISP 异常 → 无文档
+    if (hr == DISP_E_EXCEPTION || hr == DISP_E_MEMBERNOTFOUND)
+      return ReadResult::NO_DOC;
+    return ReadResult::DEAD;
+  }
+  long pos = vstart.lVal, from = pos - 64;
+  if (from < 0) from = 0;
+  ReadResult res = ReadResult::OK;
+  do {
+    if (FAILED(hr = disp_get(app, L"ActiveDocument", &vdoc)) || !vt_ok(vdoc)) {
+      res = (hr == DISP_E_EXCEPTION) ? ReadResult::NO_DOC : ReadResult::DEAD;
+      break;
+    }
+    VARIANT args[2];  // rgvark 反序: 末参数 (pos) 在前
+    VariantInit(&args[0]); args[0].vt = VT_I4; args[0].lVal = pos;
+    VariantInit(&args[1]); args[1].vt = VT_I4; args[1].lVal = from;
+    DISPPARAMS dp;
+    ZeroMemory(&dp, sizeof(dp));
+    dp.rgvarg = args; dp.cArgs = 2;
+    if (FAILED(hr = disp_invoke(vdoc.pdispVal, L"Range",
+                                DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+                                &dp, &vrng)) || !vt_ok(vrng)) {
+      res = (hr == DISP_E_EXCEPTION) ? ReadResult::NO_DOC : ReadResult::DEAD;
+      break;
+    }
+    if (FAILED(hr = disp_get(vrng.pdispVal, L"Text", &vtxt)) ||
+        vtxt.vt != VT_BSTR) {
+      res = (hr == DISP_E_EXCEPTION) ? ReadResult::NO_DOC : ReadResult::DEAD;
+      break;
+    }
+    int n = WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, nullptr, 0,
+                                nullptr, nullptr);
+    if (n > 0) {
+      out.resize(n - 1);
+      if (n > 1)
+        WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, &out[0], n,
+                            nullptr, nullptr);
+    }
+  } while (false);
+  VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vstart);
+  VariantClear(&vdoc); VariantClear(&vrng); VariantClear(&vtxt);
+  return res;
+}
+
+static void thread_proc() {
+  CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  // 仅 WPS 系 ProgID（2026-09-11 定案）：COM 旁路只补 TSF/UIA 墙上唯一
+  // 缺口=WPS——微软 Word/PPT 的 TSF store 完整（事件驱动时序优于 2s 轮询），
+  // 无需 COM。类名二义由附着成败天然消解：前台 OpusApp 时 Kwps 附着成功=
+  // WPS 文字（用 COM）；失败=微软 Word 或无文档（落 TSF/历史）——
+  // Word/PPT 的 ProgID 回落已撤（共存双注册误附风险随之归零）。
+  CLSID clsid_kwps, clsid_kwpp;
+  bool has_kwps = SUCCEEDED(CLSIDFromProgID(L"Kwps.Application", &clsid_kwps));
+  bool has_kwpp = SUCCEEDED(CLSIDFromProgID(L"KWPP.Application", &clsid_kwpp));
+  if (!has_kwps && !has_kwpp)
+    return;  // ProgID 都解析不了（未装 WPS）— 旁路停用
+  IDispatch *app = nullptr;
+  OfficeKind app_kind = OfficeKind::NONE;  // 附着实例类型（文字/演示链路不同）
+  int backoff_ms = 500;
+  bool logged_attach = false;
+  bool com_pending = true;  // 前台 Office 且未附着 → 500ms 快速重试（文档
+                            // 打开瞬间 WPS 才注册 ROT，缩短发现间隙；附着
+                            // 成功回 2s 周期，开销仅微秒级 ROT 查询）
+  for (;;) {
+    // 周期 2s 兜底 (任何时刻缓存 age ≤ ~2s) + kick 即时唤醒 (OnCommit)
+    {
+      std::unique_lock<std::mutex> lk(g_cv_mu);
+      g_cv.wait_for(lk, std::chrono::milliseconds(
+                            // std::min<int>: 显式模板参数防 windows.h min 宏
+                            g_kick.load() ? 1
+                                          : (com_pending
+                                                 ? 500
+                                                 : std::min<int>(backoff_ms,
+                                                                 2000))));
+    }
+    if (!g_com_ctx_enabled) {
+      std::unique_lock<std::mutex> lk(g_cv_mu);
+      g_cv.wait_for(lk, std::chrono::seconds(5));
+      continue;
+    }
+    g_kick.store(false);
+    com_pending = false;
+    // 读端前台判定（2026-09-10 与插件版对齐）：前台非 Office 跳过 COM 读
+    //（消费端已有前台门控，旧缓存不会被误用——不清也安全；跳过读省
+    // Office 后台挂机时的 0.3% CPU）
+    OfficeKind fg = foreground_office();
+    if (fg == OfficeKind::NONE) {
+      continue;  // 回到 wait（正常周期），本轮不做 COM 读
+    }
+    // 前台类型切换（文字↔演示）→ 释放旧附着按前台类型选 ProgID
+    //（防 WPS 文字后台开文档时误附 Kwps 读错对象）
+    if (app && fg != app_kind) {
+      app->Release();
+      app = nullptr;
+      app_kind = OfficeKind::NONE;
+      logged_attach = false;
+    }
+    if (!app) {
+      const char *via = nullptr;
+      IUnknown *punk = nullptr;
+      if (fg == OfficeKind::WRITER && has_kwps) {
+        if (SUCCEEDED(GetActiveObject(clsid_kwps, nullptr, &punk)) && punk)
+          via = "Kwps.Application";
+      } else if (fg == OfficeKind::PPT && has_kwpp) {
+        if (SUCCEEDED(GetActiveObject(clsid_kwpp, nullptr, &punk)) && punk)
+          via = "KWPP.Application";
+      }
+      if (punk) {
+        punk->QueryInterface(IID_IDispatch, (void **)&app);
+        punk->Release();
+        app_kind = fg;
+        backoff_ms = 500;
+        if (!logged_attach) {
+          log_msg("com ctx: attached via ROT (%s)", via);
+          logged_attach = true;
+        }
+      } else {
+        backoff_ms = std::min<int>(backoff_ms * 2, 8000);
+        // ROT 无对象 (未装/无文档/已退出): 清缓存防消费到陈旧文本
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_text.clear();
+        g_stamp = 0;
+        com_pending = true;  // 前台 Office 仍未附着 → 500ms 快速重试
+        continue;
+      }
+    }
+    std::string txt;
+    ReadResult r = (app_kind == OfficeKind::PPT) ? ppt_read_chain(app, txt)
+                                                 : read_chain(app, txt);
+    if (r == ReadResult::OK) {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g_text = txt;
+      g_stamp = GetTickCount64();
+    } else {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g_text.clear();
+      g_stamp = 0;
+      if (r == ReadResult::DEAD) {  // 宿主退出 (WPS/Word/WPP): 丢弃重附
+        if (logged_attach) {
+          log_msg("com ctx: office app gone, will re-attach");
+          logged_attach = false;
+        }
+        app->Release();
+        app = nullptr;
+        app_kind = OfficeKind::NONE;
+      }
+      // NO_DOC (文档全关/演示非文本编辑态): 保留 app 引用, 下轮重试
+    }
+    com_pending = (app == nullptr);  // 未附着 → 下轮 500ms 快速重试
+  }
+}
+
+static void ensure_started() {  // 首次粘性降级命中时调用 (引擎线程)
+  bool expect = false;
+  if (g_started.compare_exchange_strong(expect, true))
+    std::thread(thread_proc).detach();
+}
+static void kick() { g_kick.store(true); g_cv.notify_all(); }  // OnCommit 后
+
+// 引擎线程消费: 新鲜窗口内的缓存文本 (空串 = 不可用 → 调用方回落 hist)
+static std::string snapshot(unsigned max_age_ms) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (g_stamp && GetTickCount64() - g_stamp <= max_age_ms)
+    return g_text;
+  return std::string();
+}
+
+}  // namespace comctx
+#endif  // _WIN32
 
 // ============================================================
 // prepare pre-decode state: after commit, asynchronously run
@@ -1463,7 +1825,12 @@ void LlmRerankTranslation::Collect() {
       // AI 首选徽章: 重排后首候选 comment 追加来源标记 (与已有 comment 合并,
       // ShadowCandidate 包装避免污染原候选; weasel 端识别 "AI·" 用强调色渲染)
       if (!candidates_.empty()) {
-        std::string tag = (src_ == "tsf") ? "AI·TSF" : "AI·历史";
+        // 来源标记: tsf = TSF 光标前文; com = COM 文档模型旁路 (WPS 类受限
+        // 应用, 2026-09-10); 其余 = 历史上屏记录。weasel 端按 "AI·" 前缀
+        // 统一强调渲染, 徽章文案区分来源。
+        std::string tag = (src_ == "tsf")   ? "AI·TSF"
+                          : (src_ == "com") ? "AI·COM"
+                                            : "AI·历史";
         auto &c0 = candidates_[0];
         std::string merged =
             c0->comment().empty() ? tag : c0->comment() + " " + tag;
@@ -1517,6 +1884,10 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     if (config->GetBool("llm_rerank/debug_fusion", &b)) {
       p.has_debug_fusion = true;
       p.debug_fusion = b;
+    }
+    if (config->GetBool("llm_rerank/com_context", &b)) {
+      p.has_com_ctx = true;
+      p.com_ctx = b;
     }
     int v = 0;
     if (config->GetInt("llm_rerank/min_code_len", &v)) { p.has_min_code_len = true; p.min_code_len = v; }
@@ -1677,12 +2048,30 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
     return;
 
   bool tsf_valid = api && api->context_text_valid && api->context_text_valid();
-  // commit-history fallback string, computed on the engine thread
-  std::string fallback;
-  if (!tsf_valid)
-    fallback = g_fallback_buffer;
+  // commit-history fallback string, computed on the engine thread (append
+  // 已完成, 该值即含本词); 总是填充 — WPS 受限窗口的 prepare 分支也要用
+  std::string fallback = g_fallback_buffer;
 
   std::thread([this, tsf_valid, fallback]() {
+#ifdef _WIN32
+    // 前台 writer（WPS/Word）：COM 是该场景的上文真源 —— kick 后短等
+    // (~50ms 覆盖 5.5ms 读链) 取快照做 prepare，与 score 的 COM 同源命中。
+    // COM 不可用 → fallback (hist)：WPS 场景 TSF 文本 lagging，poll 它做
+    // prepare 只会与 score 不同源 → prep 恒 miss、每词全量 S1（既有缺陷，
+    // 2026-09-10 修复）；Word 场景 COM 失败（失焦注册坑）时 hist 亦同源。
+    if (g_com_ctx_enabled && comctx::foreground_office() != comctx::OfficeKind::NONE) {
+      comctx::kick();
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      std::string com = comctx::snapshot(800);
+      if (!com.empty()) {
+        request_prepare(com);
+        return;
+      }
+      if (!fallback.empty())
+        request_prepare(fallback);
+      return;
+    }
+#endif
     std::string cur_ctx;
     if (tsf_valid) {
       std::string old_ctx = GetContextTextGlobal();
@@ -1722,6 +2111,25 @@ std::pair<std::string, std::string> LlmFilter::GetContextTextPair() const {
       g_ctx_limited = false;  // 编辑键/切窗 → 新窗口重新评估
     }
   }
+
+  // COM 文档模型旁路（前台门控，2026-09-10 定案——取代此前 lagging 触发）:
+  // lagging 是后果判定（TSF 表现出受限），不能作为 COM 消费门控——无 COM
+  // 的 lagging 应用会误用后台 WPS/Word 的文档文本；前台类名是身份判定，
+  // 与 COM 读的 ActiveDocument（该应用的活动文档）语义精确对齐。前台
+  // writer 命中时 COM 优先（文档真文含既有内容；WPS 的 TSF 在全会话/
+  // composition 间闪烁，COM 是其超集，弃 TSF 无损）；COM 空（文档关闭/
+  // 附着中/Word 冷启动失焦注册坑 KB238610）→ 落下面既有链。
+  // 下方 lagging 粘性机制保留但与 COM 解耦：无 COM 的 lagging 应用仍由
+  // 它兜底历史。
+#ifdef _WIN32
+  if (g_com_ctx_enabled && comctx::foreground_office() != comctx::OfficeKind::NONE) {
+    comctx::ensure_started();
+    std::string com = comctx::snapshot(2500);
+    if (!com.empty())
+      return {com, "com"};
+  }
+#endif
+
   if (g_ctx_limited) {
     std::string hist = CommitHistoryText();
     if (!hist.empty())
@@ -1811,6 +2219,16 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
 
   if (!g_enabled)
     return translation;  // enabled=false -> pass-through
+
+#ifdef _WIN32
+  // COM 旁路线程提前启动（2026-09-10 用户定案：统一 WPS 徽章，消除 lagging
+  // 首中词回落 AI·历史 的冷启动窗口）。开销核算（讨论定案）：未装 WPS =
+  // CLSID 解析失败线程即退，零开销；WPS 在而无文档 = GetActiveObject 连败
+  // 8s 退避（微秒级本地 ROT 查询）；有文档 = 2s 周期 × ~5.5ms 读链 ≈ 0.3%
+  // CPU。好应用打字不受影响——COM 消费被粘性降级门控，好应用走 TSF 分支。
+  if (g_com_ctx_enabled)
+    comctx::ensure_started();
+#endif
 
   size_t code_len = engine_->context() ? engine_->context()->input().size() : 0;
   if ((int)code_len < g_min_code_len ||
