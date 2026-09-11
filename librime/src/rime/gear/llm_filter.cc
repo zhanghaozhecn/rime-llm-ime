@@ -320,9 +320,10 @@ static int g_limited_gen_seen = 0;
 #ifdef _WIN32
 namespace comctx {
 
-static std::mutex g_mu;             // guards g_text/g_stamp
+static std::mutex g_mu;             // guards g_text/g_stamp/g_title
 static std::string g_text;          // UTF-8 caret-preceding text
 static unsigned long long g_stamp = 0;   // GetTickCount64() of last good read
+static std::wstring g_title;        // 发布时的前台标题（消费端指纹）
 
 static std::mutex g_cv_mu;
 static std::condition_variable g_cv;
@@ -383,18 +384,101 @@ static bool bstr_to_utf8(BSTR s, std::string &out) {
   return true;
 }
 
-enum class ReadResult { OK, NO_DOC, DEAD };  // NO_DOC: 无文档(保留引用) / DEAD: RPC 断(WPS 退出)
+static void wlower(wchar_t *s) {
+  for (; *s; ++s)
+    if (*s >= L'A' && *s <= L'Z')
+      *s = *s + 32;
+}
+
+// 文档名 ⊂ 前台标题校验（WPS 统一标签页防串档，2026-09-11 真机两轮定案）：
+// WPS 多组件标签共用单一框架窗口，前台类名恒为 OpusApp（实测演示标签激活
+// 仍 OpusApp、标题变"演示文稿1 - WPS Office"）——类名门控区分不了活动
+// 组件。帧标题随活动标签文档名变，组件模型的 ActiveDocument.Name /
+// ActivePresentation.Name 固定指本组件自己的活动文档：名字（全名与去
+// 扩展名两种形态）都不在前台标题中 = 活动标签是另一组件（或前台是微软
+// Office 而后台 WPS 同开），本组件读出的文本不属于当前光标处，判
+// TAB_IDLE 落 TSF/历史。锚点不可用 Window.Caption——实测带修改标记尾缀
+// " *" 且无扩展名剥不掉（"文字文稿1 *" ⊄ "文字文稿1 - WPS Office"）恒
+// 误杀。名字取不到/去扩展名后过短（单字符易误配）→ 保守放行。
+static bool name_matches_fg_title(const VARIANT &vname) {
+  if (vname.vt != VT_BSTR || !vname.bstrVal || !*vname.bstrVal)
+    return true;
+  wchar_t full[128] = {0}, stem[128] = {0};
+  const wchar_t *base = wcsrchr(vname.bstrVal, L'\\');
+  base = base ? base + 1 : vname.bstrVal;
+  wcsncpy_s(full, base, _TRUNCATE);
+  wcsncpy_s(stem, base, _TRUNCATE);
+  wchar_t *dot = wcsrchr(stem, L'.');
+  if (dot && dot != stem)
+    *dot = 0;
+  if (wcslen(stem) < 2)
+    return true;
+  HWND fg = GetForegroundWindow();
+  wchar_t title[256] = {0};
+  if (!fg || GetWindowTextW(fg, title, 256) <= 0)
+    return true;  // 标题取不到（罕见），保守放行
+  wlower(full);
+  wlower(stem);
+  wlower(title);
+  return wcsstr(title, full) != nullptr || wcsstr(title, stem) != nullptr;
+}
+
+enum class ReadResult {
+  OK,
+  NO_DOC,
+  DEAD,
+  TAB_IDLE
+};  // NO_DOC: 无文档(保留引用) / DEAD: RPC 断(WPS 退出) / TAB_IDLE:
+    // 附着正常但活动标签非本组件（WPS 统一标签页串档拦截）
+
+// 活动标签判定（不依赖文件名，2026-09-11 三轮真机定案）：文字组件视图
+// 窗口（_WwB 类，ActiveWindow.Hwnd）的根窗口 == 前台窗口 && 视图可见
+// = 文字标签/文字窗口活动。统一标签页：视图随活动标签显隐（实测即时
+// 翻转）；多独立窗口：视图都可见，但只有活动窗口的根 == 前台（他窗/
+// 他应用前台时根不等——微软 Word 前台场景由此天然排除，无需名字）。
+// 句柄取不到 = UNKNOWN（回落名字校验兜底）。
+enum class TabActive { YES, NO, UNKNOWN };
+static TabActive writer_tab_active(IDispatch *app_w) {
+  if (!app_w)
+    return TabActive::UNKNOWN;
+  VARIANT vwin, vh;
+  VariantInit(&vwin); VariantInit(&vh);
+  long long h = 0;
+  if (SUCCEEDED(disp_get(app_w, L"ActiveWindow", &vwin)) &&
+      vwin.vt == VT_DISPATCH && vwin.pdispVal &&
+      SUCCEEDED(disp_get(vwin.pdispVal, L"Hwnd", &vh))) {
+    if (vh.vt == VT_I4)
+      h = vh.lVal;
+    else if (vh.vt == VT_I8)
+      h = vh.llVal;
+    else if (vh.vt == VT_R8)
+      h = (long long)vh.dblVal;
+  }
+  VariantClear(&vwin); VariantClear(&vh);
+  if (!h)
+    return TabActive::UNKNOWN;
+  HWND root = GetAncestor((HWND)(LONG_PTR)h, GA_ROOT);
+  HWND fg = GetForegroundWindow();
+  if (!root || !fg)
+    return TabActive::UNKNOWN;
+  if (root != fg)
+    return TabActive::NO;
+  return IsWindowVisible((HWND)(LONG_PTR)h) ? TabActive::YES : TabActive::NO;
+}
 
 // ---- 演示读链（WPP/PowerPoint，2026-09-11 本机实测验证）----
 // app.ActiveWindow.Selection.Type==3(文本编辑) 时：start = TextRange.Start
 //（框内 1-based 偏移）；前文 = ShapeRange.TextFrame.TextRange.Characters(
 // start-len, len).Text（len = min(64, start-1)）。Type!=3 → NO_DOC
 //（形状/幻灯片选择态）。表格 XLMAIN 不在此链（编辑态盲区）。
-static ReadResult ppt_read_chain(IDispatch *app, std::string &out) {
+static ReadResult ppt_read_chain(IDispatch *app, std::string &out,
+                                 TabActive wta) {
   VARIANT vwin, vsel, vtype, vstart, vshape, vframe, vrng, vtxt;
+  VARIANT vpres, vname;
   VariantInit(&vwin); VariantInit(&vsel); VariantInit(&vtype);
   VariantInit(&vstart); VariantInit(&vshape); VariantInit(&vframe);
   VariantInit(&vrng); VariantInit(&vtxt);
+  VariantInit(&vpres); VariantInit(&vname);
   auto vt_ok = [](const VARIANT &v) {
     return v.vt == VT_DISPATCH && v.pdispVal;
   };
@@ -403,9 +487,35 @@ static ReadResult ppt_read_chain(IDispatch *app, std::string &out) {
     VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vtype);
     VariantClear(&vstart); VariantClear(&vshape); VariantClear(&vframe);
     VariantClear(&vrng); VariantClear(&vtxt);
+    VariantClear(&vpres); VariantClear(&vname);
   };
-  if (FAILED(hr = disp_get(app, L"ActiveWindow", &vwin)) || !vt_ok(vwin) ||
-      FAILED(hr = disp_get(vwin.pdispVal, L"Selection", &vsel)) ||
+  // 串档拦截①：文字视图判定活动 = 活动标签必是文字（演示/表格都不是）
+  if (wta == TabActive::YES) {
+    cleanup();
+    return ReadResult::TAB_IDLE;
+  }
+  if (FAILED(hr = disp_get(app, L"ActiveWindow", &vwin)) || !vt_ok(vwin)) {
+    cleanup();
+    if (hr == DISP_E_EXCEPTION)
+      return ReadResult::NO_DOC;
+    return ReadResult::DEAD;
+  }
+  // 串档拦截②：演示无窗口句柄（WPP Window.Hwnd/HWND 均空，实测），
+  // 名字校验是演示链主判据——挡表格标签/微软 Office 前台；同基名文档
+  // 场景由拦截①的 wta 覆盖
+  if (FAILED(hr = disp_get(app, L"ActivePresentation", &vpres)) ||
+      !vt_ok(vpres)) {
+    cleanup();
+    if (hr == DISP_E_EXCEPTION)
+      return ReadResult::NO_DOC;
+    return ReadResult::DEAD;
+  }
+  disp_get(vpres.pdispVal, L"Name", &vname);
+  if (!name_matches_fg_title(vname)) {
+    cleanup();
+    return ReadResult::TAB_IDLE;
+  }
+  if (FAILED(hr = disp_get(vwin.pdispVal, L"Selection", &vsel)) ||
       !vt_ok(vsel) ||
       FAILED(hr = disp_get(vsel.pdispVal, L"Type", &vtype)) ||
       vtype.vt != VT_I4) {
@@ -473,24 +583,55 @@ static ReadResult ppt_read_chain(IDispatch *app, std::string &out) {
   return res;
 }
 
-static ReadResult read_chain(IDispatch *app, std::string &out) {
+static ReadResult read_chain(IDispatch *app, std::string &out,
+                             TabActive wta) {
   // app.ActiveWindow → win.Selection → sel.Start → app.ActiveDocument →
   // doc.Range(pos-64, pos).Text   (rgvark 反序: 末参数在前)
-  VARIANT vwin, vsel, vstart, vdoc, vrng, vtxt;
+  VARIANT vwin, vsel, vstart, vdoc, vrng, vtxt, vname;
   VariantInit(&vwin); VariantInit(&vsel); VariantInit(&vstart);
   VariantInit(&vdoc); VariantInit(&vrng); VariantInit(&vtxt);
+  VariantInit(&vname);
   auto vt_ok = [](const VARIANT &v) { return v.vt == VT_DISPATCH && v.pdispVal; };
   HRESULT hr;
   auto cleanup = [&]() {
     VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vstart);
     VariantClear(&vdoc); VariantClear(&vrng); VariantClear(&vtxt);
+    VariantClear(&vname);
   };
-  if (FAILED(hr = disp_get(app, L"ActiveWindow", &vwin)) || !vt_ok(vwin) ||
-      FAILED(hr = disp_get(vwin.pdispVal, L"Selection", &vsel)) || !vt_ok(vsel) ||
+  // 串档拦截①：视图窗口判定非活动（统一标签页切走/他窗前台）——
+  // 不依赖文件名，同基名文档也能正确区分
+  if (wta == TabActive::NO) {
+    cleanup();
+    return ReadResult::TAB_IDLE;
+  }
+  if (FAILED(hr = disp_get(app, L"ActiveWindow", &vwin)) || !vt_ok(vwin)) {
+    cleanup();
+    // RPC 层失败 (hr 为 RPC_*/CO_*) → WPS 进程不在; DISP 异常 → 无文档
+    if (hr == DISP_E_EXCEPTION || hr == DISP_E_MEMBERNOTFOUND)
+      return ReadResult::NO_DOC;
+    return ReadResult::DEAD;
+  }
+  // ActiveDocument 前移：名字校验（串档拦截②兜底）与下方 Range 共用
+  if (FAILED(hr = disp_get(app, L"ActiveDocument", &vdoc)) || !vt_ok(vdoc)) {
+    cleanup();
+    if (hr == DISP_E_EXCEPTION || hr == DISP_E_MEMBERNOTFOUND)
+      return ReadResult::NO_DOC;
+    return ReadResult::DEAD;
+  }
+  if (wta == TabActive::UNKNOWN) {
+    // 视图句柄取不到时回落名字校验（YES 时有 root==fg 硬判据，跳过
+    // 免受标题格式差异影响——Caption 轮误杀的教训）
+    disp_get(vdoc.pdispVal, L"Name", &vname);
+    if (!name_matches_fg_title(vname)) {
+      cleanup();
+      return ReadResult::TAB_IDLE;
+    }
+  }
+  if (FAILED(hr = disp_get(vwin.pdispVal, L"Selection", &vsel)) ||
+      !vt_ok(vsel) ||
       FAILED(hr = disp_get(vsel.pdispVal, L"Start", &vstart)) ||
       vstart.vt != VT_I4) {
     cleanup();
-    // RPC 层失败 (hr 为 RPC_*/CO_*) → WPS 进程不在; DISP 异常 → 无文档
     if (hr == DISP_E_EXCEPTION || hr == DISP_E_MEMBERNOTFOUND)
       return ReadResult::NO_DOC;
     return ReadResult::DEAD;
@@ -499,10 +640,6 @@ static ReadResult read_chain(IDispatch *app, std::string &out) {
   if (from < 0) from = 0;
   ReadResult res = ReadResult::OK;
   do {
-    if (FAILED(hr = disp_get(app, L"ActiveDocument", &vdoc)) || !vt_ok(vdoc)) {
-      res = (hr == DISP_E_EXCEPTION) ? ReadResult::NO_DOC : ReadResult::DEAD;
-      break;
-    }
     VARIANT args[2];  // rgvark 反序: 末参数 (pos) 在前
     VariantInit(&args[0]); args[0].vt = VT_I4; args[0].lVal = pos;
     VariantInit(&args[1]); args[1].vt = VT_I4; args[1].lVal = from;
@@ -530,9 +667,12 @@ static void thread_proc() {
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   // 仅 WPS 系 ProgID（2026-09-11 定案）：COM 旁路只补 TSF/UIA 墙上唯一
   // 缺口=WPS——微软 Word/PPT 的 TSF store 完整（事件驱动时序优于 2s 轮询），
-  // 无需 COM。类名二义由附着成败天然消解：前台 OpusApp 时 Kwps 附着成功=
-  // WPS 文字（用 COM）；失败=微软 Word 或无文档（落 TSF/历史）——
-  // Word/PPT 的 ProgID 回落已撤（共存双注册误附风险随之归零）。
+  // 无需 COM。Word/PPT 的 ProgID 回落已撤（共存双注册误附风险归零）。
+  // 注意"附着成功 = 对的组件"已被 2026-09-11 串档真机证伪：WPS 统一标签
+  // 页前台类名恒 OpusApp（演示标签激活也不变），Kwps 附着成功但活动标签
+  // 是演示 → 读出文字文档冒充上文——组件消解改由读链标题校验（见
+  // caption_matches_fg_title）+ 双附着探读（见下方循环）完成；前台是
+  // 微软 Word 而后台 WPS 同开的场景同理由标题校验拦截。
   CLSID clsid_kwps, clsid_kwpp;
   bool has_kwps = SUCCEEDED(CLSIDFromProgID(L"Kwps.Application", &clsid_kwps));
   bool has_kwpp = SUCCEEDED(CLSIDFromProgID(L"KWPP.Application", &clsid_kwpp));
@@ -540,9 +680,16 @@ static void thread_proc() {
     CoUninitialize();  // 与 CoInitializeEx 配对（未装 WPS，旁路停用）
     return;
   }
-  IDispatch *app = nullptr;
-  OfficeKind app_kind = OfficeKind::NONE;  // 附着实例类型（文字/演示链路不同）
-  bool logged_attach = false;
+  // 双组件持久附着 + 探读（2026-09-11 串档修复）：WPS 统一标签页的框架
+  // 类名不随活动标签组件变（真机实测演示标签激活仍 OpusApp），旧"前台
+  // 类名选单附着"设计失效——文字附着会一直读出文字文档全文冒充演示上
+  // 文。改为 Kwps/KWPP 双附着，每轮按"前台类型对位优先、另一组件兜底"
+  // 顺序读，由读链标题校验（TAB_IDLE）裁决哪个组件的活动文档才是当前
+  // 光标处。DEAD（宿主退出）单独释放该组件下轮懒重附；双双无产出 →
+  // 清缓存（消费端落 TSF/历史），未附着时 500ms 快速重试不变。
+  IDispatch *app_w = nullptr;  // Kwps.Application（文字）
+  IDispatch *app_p = nullptr;  // KWPP.Application（演示）
+  bool logged_w = false, logged_p = false;
   bool com_pending = true;  // 前台 Office 且未附着 → 500ms 快速重试（文档
                             // 打开瞬间 WPS 才注册 ROT，缩短发现间隙；附着
                             // 成功回 2s 周期，开销仅微秒级 ROT 查询）
@@ -567,64 +714,95 @@ static void thread_proc() {
     if (fg == OfficeKind::NONE) {
       continue;  // 回到 wait（正常周期），本轮不做 COM 读
     }
-    // 前台类型切换（文字↔演示）→ 释放旧附着按前台类型选 ProgID
-    //（防 WPS 文字后台开文档时误附 Kwps 读错对象）
-    if (app && fg != app_kind) {
-      app->Release();
-      app = nullptr;
-      app_kind = OfficeKind::NONE;
-      logged_attach = false;
-    }
-    if (!app) {
-      const char *via = nullptr;
+    // 文字附着先行：ActiveWindow.Hwnd 的视图窗口判定是活动标签主信号
+    //（无文字文档时 UNKNOWN 回落名字校验）
+    if (has_kwps && !app_w) {
       IUnknown *punk = nullptr;
-      if (fg == OfficeKind::WRITER && has_kwps) {
-        if (SUCCEEDED(GetActiveObject(clsid_kwps, nullptr, &punk)) && punk)
-          via = "Kwps.Application";
-      } else if (fg == OfficeKind::PPT && has_kwpp) {
-        if (SUCCEEDED(GetActiveObject(clsid_kwpp, nullptr, &punk)) && punk)
-          via = "KWPP.Application";
-      }
-      if (punk) {
-        punk->QueryInterface(IID_IDispatch, (void **)&app);
+      if (SUCCEEDED(GetActiveObject(clsid_kwps, nullptr, &punk)) && punk) {
+        punk->QueryInterface(IID_IDispatch, (void **)&app_w);
         punk->Release();
-        app_kind = fg;
-        if (!logged_attach) {
-          log_msg("com ctx: attached via ROT (%s)", via);
-          logged_attach = true;
+        if (app_w && !logged_w) {
+          log_msg("com ctx: attached via ROT (Kwps.Application)");
+          logged_w = true;
         }
-      } else {
-        // ROT 无对象 (未装/无文档/已退出): 清缓存防消费到陈旧文本
-        std::lock_guard<std::mutex> lk(g_mu);
-        g_text.clear();
-        g_stamp = 0;
-        com_pending = true;  // 前台 Office 仍未附着 → 500ms 快速重试
-        continue;
       }
     }
-    std::string txt;
-    ReadResult r = (app_kind == OfficeKind::PPT) ? ppt_read_chain(app, txt)
-                                                 : read_chain(app, txt);
-    if (r == ReadResult::OK) {
-      std::lock_guard<std::mutex> lk(g_mu);
-      g_text = txt;
-      g_stamp = GetTickCount64();
-    } else {
-      std::lock_guard<std::mutex> lk(g_mu);
-      g_text.clear();
-      g_stamp = 0;
-      if (r == ReadResult::DEAD) {  // 宿主退出 (WPS/Word/WPP): 丢弃重附
-        if (logged_attach) {
+    TabActive wta = writer_tab_active(app_w);
+    if (wta == TabActive::NO && app_w) {
+      // 跨进程标签切换重附（2026-09-11 四轮真机定案）：新建文档/演示
+      // 标签各起新 wps.exe、各持帧窗口，仅活动标签所属进程的帧可见——
+      // 旧附着实例的视图 root≠前台恒 NO。实测 GetActiveObject 返回最新
+      // 激活实例（sees 跟随活动标签切换），重附一次即取到活动实例，仍
+      // NO 才真非活动（表格标签/他应用前台）。GetActiveObject 微秒级，
+      // 每轮至多重附一次。
+      app_w->Release();
+      app_w = nullptr;
+      if (has_kwps) {
+        IUnknown *punk = nullptr;
+        if (SUCCEEDED(GetActiveObject(clsid_kwps, nullptr, &punk)) && punk) {
+          punk->QueryInterface(IID_IDispatch, (void **)&app_w);
+          punk->Release();
+        }
+      }
+      wta = writer_tab_active(app_w);
+    }
+    // 前台类型对位优先、另一组件兜底（统一标签页两类都可能藏在其后）
+    OfficeKind order[2] = {fg, (fg == OfficeKind::WRITER) ? OfficeKind::PPT
+                                                          : OfficeKind::WRITER};
+    bool published = false;
+    for (int i = 0; i < 2 && !published; i++) {
+      bool is_p = (order[i] == OfficeKind::PPT);
+      if (is_p ? !has_kwpp : !has_kwps)
+        continue;
+      IDispatch *&app = is_p ? app_p : app_w;
+      bool &logged = is_p ? logged_p : logged_w;
+      if (!app) {
+        IUnknown *punk = nullptr;
+        if (SUCCEEDED(GetActiveObject(is_p ? clsid_kwpp : clsid_kwps, nullptr,
+                                      &punk)) &&
+            punk) {
+          punk->QueryInterface(IID_IDispatch, (void **)&app);
+          punk->Release();
+        }
+        if (app && !logged) {
+          log_msg("com ctx: attached via ROT (%s)",
+                  is_p ? "KWPP.Application" : "Kwps.Application");
+          logged = true;
+        }
+      }
+      if (!app)
+        continue;
+      std::string txt;
+      ReadResult r =
+          is_p ? ppt_read_chain(app, txt, wta) : read_chain(app, txt, wta);
+      if (r == ReadResult::OK) {
+        wchar_t wt[256] = {0};
+        HWND fh = GetForegroundWindow();
+        if (fh)
+          GetWindowTextW(fh, wt, 256);
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_text = txt;
+        g_stamp = GetTickCount64();
+        g_title = wt;  // 消费端指纹: 标题变 = 切标签/切窗
+        published = true;
+      } else if (r == ReadResult::DEAD) {  // 宿主退出 (WPS/Word/WPP): 丢弃重附
+        if (logged) {
           log_msg("com ctx: office app gone, will re-attach");
-          logged_attach = false;
+          logged = false;
         }
         app->Release();
         app = nullptr;
-        app_kind = OfficeKind::NONE;
       }
-      // NO_DOC (文档全关/演示非文本编辑态): 保留 app 引用, 下轮重试
+      // NO_DOC (文档全关/演示非文本编辑态) 与 TAB_IDLE (活动标签非本
+      // 组件): 保留 app 引用, 试另一组件
     }
-    com_pending = (app == nullptr);  // 未附着 → 下轮 500ms 快速重试
+    if (!published) {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g_text.clear();
+      g_stamp = 0;
+      g_title.clear();
+    }
+    com_pending = (app_w == nullptr && app_p == nullptr);  // 全未附着才快试
   }
 }
 
@@ -635,11 +813,19 @@ static void ensure_started() {  // 首次粘性降级命中时调用 (引擎线�
 }
 static void kick() { g_kick.store(true); g_cv.notify_all(); }  // OnCommit 后
 
-// 引擎线程消费: 新鲜窗口内的缓存文本 (空串 = 不可用 → 调用方回落 hist)
+// 引擎线程消费: 新鲜窗口内的缓存文本 (空串 = 不可用 → 调用方回落 hist)。
+// 标题指纹：发布后前台标题变了（WPS 切标签/切窗即换标题）→ 旧快照属于
+// 旧标签，拒用——挡住 ≤2s 轮询间隙的串档（OnCommit kick 会立刻换上新
+// 标签文本）。任一侧标题取不到 → 保守放行。
 static std::string snapshot(unsigned max_age_ms) {
   std::lock_guard<std::mutex> lk(g_mu);
-  if (g_stamp && GetTickCount64() - g_stamp <= max_age_ms)
-    return g_text;
+  if (g_stamp && GetTickCount64() - g_stamp <= max_age_ms) {
+    wchar_t t[256] = {0};
+    HWND fh = GetForegroundWindow();
+    bool title_ok = (!fh || GetWindowTextW(fh, t, 256) <= 0);
+    if (title_ok || g_title.empty() || g_title == t)
+      return g_text;
+  }
   return std::string();
 }
 
