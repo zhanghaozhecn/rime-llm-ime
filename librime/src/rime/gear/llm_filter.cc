@@ -293,9 +293,14 @@ static void llm_reload_global_if_changed() {
 static std::string g_fallback_buffer;  // session committed texts
 static int g_fallback_gen_seen = 0;    // consumed reset generation
 
-// 受限窗口粘性降级 (2026-08-18 八轮, 用户决策): lagging 命中一次即标记本
-// 窗口"受限" (WPS 类应用 TSF 只暴露最近 composition), 之后整窗直接用
-// 历史上文 (标 AI·历史), 直到编辑键/切窗 reset (代次变) 才清除重评。
+// 受限窗口粘性降级 (2026-08-18 八轮, 用户决策; 2026-09-11 简化定案):
+// lagging 命中一次即标记本窗口"受限" (WPS 类应用 TSF 只暴露最近
+// composition), 之后整窗只用历史上文——受限 store 快照不跟光标走
+//（格内鼠标移位后首词拿到旧光标尾巴, 真机定局实验）, TSF 永不直接
+// 消费。标记留存: reset 后仍处 Office 前台（WPS 内部 DocumentMgr 切换
+// ——格/标签移动、编辑键）仅清历史、保留受限; 离开 Office 前台（真切
+// 窗）才清除重评。鼠标移动 = reset 语义: focus:switch（WPS 格/标签）+
+// 新鲜送达非历史尾部（同窗内无 DocumentMgr 切换的移动, 仅作事件信号）。
 // engine thread only (同上)。
 static bool g_ctx_limited = false;
 static int g_limited_gen_seen = 0;
@@ -1325,6 +1330,19 @@ inline bool stale(const std::string &tsf, const std::string &hist) {
   return !tail.empty() && tsf.find(tail) == std::string::npos;
 }
 
+// 尾部连贯判定（鼠标移动 reset 信号, 2026-09-11 深夜全应用推广）:
+// h 与 t 任一为另一的尾部 = 光标仍在连续打字位置——好应用 tsf 是全文
+//（历史为其尾部）、受限 store 的 tsf=最后上屏词（为历史尾部）。互不为
+// 尾部 = 光标被移走（同窗内移动不触发 reset 代次，但 selection-change
+// 会送达新位置文本）
+inline bool ends_with(const std::string &h, const std::string &t) {
+  return t.size() <= h.size() &&
+         h.compare(h.size() - t.size(), t.size(), t) == 0;
+}
+inline bool tail_consistent(const std::string &h, const std::string &t) {
+  return ends_with(h, t) || ends_with(t, h);
+}
+
 // 空文本分类: age<1.5s 且历史非空 → transient empty (commit 后 TSF 异步
 // 刷新未落地 / selection-change 采到不稳定选择) → 用历史兜底让候选窗仍
 // 重排; 否则真空 (光标在文档开头/全删, 历史上屏词在光标后不是上文) → 跳过。
@@ -2273,6 +2291,35 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
 std::pair<std::string, std::string> LlmFilter::GetContextTextPair() const {
   const RimeApi *api = rime_get_api();
 
+#ifdef _WIN32
+  // 鼠标点击检测（2026-09-11 深夜用户定案：鼠标移动主要靠点击检测——
+  // 任何点击=光标可能移动→清历史兜底，不做例外排除——候选窗/工具栏
+  // 点击也清，上下文宁短不错。GetAsyncKeyState LSB=自本进程上次查询
+  // 以来按下过，专为轮询设计；首次调用建立基线防进程历史点击误报。
+  // 真文通道 tsf/COM 不受影响，只影响兜底。与插件版 lua click_happened
+  // 同源同语义）
+  {
+    static bool s_click_inited = false;
+    short b = GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+              GetAsyncKeyState(VK_MBUTTON);
+    if (s_click_inited && (b & 1))
+      g_fallback_buffer.clear();
+    s_click_inited = true;
+  }
+#endif
+
+  // 鼠标移动光标 = reset（补充通道）：新鲜 TSF 送达与历史上屏互不为
+  // 尾部 = 光标被移走（无点击的位移/送达层信号）→ 清历史基座。与上方
+  // 点击检测互补，真文通道不受影响。
+  if (api && api->get_context_text) {
+    const char *t = api->get_context_text();
+    unsigned long long tage =
+        api->context_text_age_ms ? api->context_text_age_ms() : ~0ULL;
+    if (t && *t && tage < 5000 &&
+        !ctx_logic::tail_consistent(g_fallback_buffer, t))
+      g_fallback_buffer.clear();
+  }
+
   // 受限窗口粘性降级 (2026-08-18 八轮, 用户决策): 见 g_ctx_limited 声明处
   // 注释。判据只有 lagging 一条, 其余信号刻意不粘:
   //  - 空文本/transient 空: 好应用提交后也会瞬时采空, 粘了会误降级;
@@ -2283,8 +2330,19 @@ std::pair<std::string, std::string> LlmFilter::GetContextTextPair() const {
   if (api && api->context_reset_generation) {
     int gen = api->context_reset_generation();
     if (gen != g_limited_gen_seen) {
+      // 受限标记留存（2026-09-11 简化定案）：reset 后仍处 Office 前台
+      //（WPS 内部 DocumentMgr 切换：格/标签移动、编辑键）→ 保留受限
+      // 判定，历史由 g_fallback_gen_seen 同步清空；离开 Office 前台
+      //（真切窗）→ 清除重新评估。残余：WPS→微软 Word 同类名切换时
+      // 受限会带过去，Word 落历史直到下次真切换（可接受）。
+#ifdef _WIN32
+      if (g_ctx_limited &&
+          comctx::foreground_office() == comctx::OfficeKind::NONE)
+        g_ctx_limited = false;
+#else
+      g_ctx_limited = false;
+#endif
       g_limited_gen_seen = gen;
-      g_ctx_limited = false;  // 编辑键/切窗 → 新窗口重新评估
     }
   }
 
@@ -2307,9 +2365,15 @@ std::pair<std::string, std::string> LlmFilter::GetContextTextPair() const {
 #endif
 
   if (g_ctx_limited) {
+    // 受限窗口：上文只来自历史——TSF 永不直接消费（受限 store 快照不
+    // 跟光标走，2026-09-11 定局实验：格内鼠标移位后首词拿到旧光标尾
+    // 巴）。鼠标移动清历史由顶部全应用检测负责（含同窗内移动的送达
+    // 感知）；WPS 格/标签移动由 focus:switch reset 清历史（受限标记
+    // 留存，见上方代次同步）。历史空（reset/移位后首词）→ 不推理。
     std::string hist = CommitHistoryText();
     if (!hist.empty())
       return {hist, "rime"};
+    return {"", "rime"};
   }
 
   if (api && api->get_context_text) {

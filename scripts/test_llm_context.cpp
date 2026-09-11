@@ -43,6 +43,14 @@ inline bool stale(const std::string &tsf, const std::string &hist) {
   return !tail.empty() && tsf.find(tail) == std::string::npos;
 }
 
+inline bool ends_with(const std::string &h, const std::string &t) {
+  return t.size() <= h.size() &&
+         h.compare(h.size() - t.size(), t.size(), t) == 0;
+}
+inline bool tail_consistent(const std::string &h, const std::string &t) {
+  return ends_with(h, t) || ends_with(t, h);
+}
+
 inline bool transient_empty(const std::string &hist,
                             unsigned long long age_ms) {
   return age_ms < 1500 && !hist.empty();
@@ -50,9 +58,11 @@ inline bool transient_empty(const std::string &hist,
 
 }  // namespace ctx_logic
 
+using ctx_logic::ends_with;
 using ctx_logic::hist_tail;
 using ctx_logic::lagging;
 using ctx_logic::stale;
+using ctx_logic::tail_consistent;
 using ctx_logic::transient_empty;
 
 static int g_fail = 0;
@@ -100,6 +110,25 @@ int main() {
   check(!transient_empty("测试", 1500), "T2 边界age=1500 → 真空 (>=1500不用历史)");
   check(!transient_empty("测试", 5000), "T3 5s → 真空 (光标在文档开头/全删)");
   check(!transient_empty("", 100), "T4 历史空 → 不用历史");
+
+  // ── 尾部连贯判定 (受限窗口鼠标重定位检测, 2026-09-11) ──
+  // 连续打字: 受限 TSF = 最后上屏词 = hist 尾部 → 连贯 (维持长历史)
+  // 鼠标移位: TSF = 新位置真文 (前缀/别处文本) → 非尾部 → 重置基座用真文
+  check(ends_with("化学试剂测试", "测试"), "E1 连续打字: tsf=最后上屏词 → 连贯");
+  check(ends_with("化学试剂测试", "化学试剂测试"), "E2 tsf==hist 全长 → 连贯");
+  check(!ends_with("化学试剂测试", "化学试剂"), "E3 鼠标移回中部: tsf是前缀非尾部 → 不连贯");
+  check(!ends_with("化学试剂测试", "英雄事迹"), "E4 鼠标移到别处: 无关文本 → 不连贯");
+  check(!ends_with("测试", "化学试剂测试"), "E5 tsf比hist长 (移到更长上下文处) → 不连贯");
+  check(ends_with("abc测试", "试"), "E6 单字尾部 → 连贯");
+  check(ends_with("abc", ""), "E7 空tsf视作连贯 (空由其他分支处理)");
+
+  // ── 双向尾部连贯 (鼠标移动 reset 信号, 全应用推广) ──
+  // 好应用方向: tsf 全文含历史尾部 → 连贯; 受限方向: tsf=尾词=历史尾部 → 连贯
+  check(tail_consistent("第一第二", "前面内容第一第二"), "C1 好应用: hist是tsf全文尾部 → 连贯");
+  check(tail_consistent("第一第二第三", "第三"), "C2 受限: tsf尾词是hist尾部 → 连贯");
+  check(!tail_consistent("第一第二第三", "前面内容"), "C3 鼠标移位: 互不为尾部 → 不连贯");
+  check(!tail_consistent("第一第二第三", "第二"), "C4 鼠标移回中部: 前缀非尾部 → 不连贯");
+  check(tail_consistent("", "任意文本"), "C5 历史空 → 连贯 (无需清)");
 
   std::printf("\n%s (%d failures)\n", g_fail ? "SOME TESTS FAILED" : "ALL TESTS PASSED",
               g_fail);
