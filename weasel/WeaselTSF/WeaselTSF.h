@@ -179,10 +179,6 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   friend class CEndCompositionEditSession;  // 提交后立即采集 (下一词 TSF 上文)
   void _RequestContextText(ITfContext* pContext, bool immediate = false);
   void _OnContextTextReady(const std::wstring& text, bool immediate = false);
-  // 架构调研 A 探针 (2026-08-18, 实验代码): 枚举 DocumentMgr 全部 context
-  // 逐个试读光标前文本, 仅写日志不发送 — 验证 WPS 全文是否藏在非顶层
-  // context (顶层只暴露 composition)。结论出来后移除或产品化
-  void _ProbeAllContexts(ITfContext* pTopContext);
   // 上文采集去抖 (CEF 类应用文档更新极频繁, 限流 SetContextText 避免
   // IPC + Server 端 prepare 风暴): 非空 100ms 合并, 相同不重发, 空文本
   // 一律 800ms (WPS 提交后 transient 空高发, 详见 _OnContextTextReady)

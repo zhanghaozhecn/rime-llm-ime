@@ -40,9 +40,6 @@ STDAPI WeaselTSF::OnSetFocus(ITfDocumentMgr* pDocMgrFocus,
     com_ptr<ITfContext> pContext;
     if (pDocMgrFocus->GetTop(&pContext) == S_OK && pContext)
       _RequestContextText(pContext);
-    // 架构调研 A 探针 (实验): 焦点切换时枚举全部 context 试读, 仅日志
-    if (pContext)
-      _ProbeAllContexts(pContext);
   }
 
   com_ptr<ITfDocumentMgr> pCandidateListDocumentMgr;

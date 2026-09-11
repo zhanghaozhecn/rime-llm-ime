@@ -8,6 +8,16 @@ LONG g_cRefDll = -1;
 CRITICAL_SECTION g_cs;
 
 void TSFDbgLog(const wchar_t* fmt, ...) {
+  // 诊断开关（默认关）: 环境变量 WEASEL_TSF_DBG=1 时才写。常开会在每个
+  // 按键路径产生文件 I/O（OnEndEdit/RequestContextText 每键触发, 每进程
+  // 独立 %TEMP% 文件且无轮转）——TSF DLL 加载进所有应用进程, 常开即全局
+  // 每键开销。排障时在目标应用启动前设环境变量（静态缓存, 进程内一次）。
+  static const bool dbg_on = []() {
+    wchar_t v[8] = {0};
+    return GetEnvironmentVariableW(L"WEASEL_TSF_DBG", v, 8) > 0 && v[0] == L'1';
+  }();
+  if (!dbg_on)
+    return;
   wchar_t buf[1024];
   va_list ap;
   va_start(ap, fmt);

@@ -311,9 +311,11 @@ static int g_limited_gen_seen = 0;
 // 消费语义 (见 GetContextTextPair): 仅粘性降级 (g_ctx_limited, WPS 类
 // 应用) 场景 — COM 缓存新鲜 → {com_text, "com"} (徽章仍 AI·TSF);
 // 失败/过期/com_context 关闭 → 原 {hist, "rime"} (八轮方案零改动)。
-// 好应用零开销: 线程懒启动 (首次降级命中才起), GetActiveObject 连败
-// 指数退避 500ms→8s。COM 只在旁路线程调用 (STA 出站调用无需消息泵,
-// probe 实测背书); 引擎线程仅经 mutex 读缓存快照。
+// 好应用零开销: 线程懒启动 (首次降级命中才起), 前台 Office 才读 +
+// 未附着 500ms 快速重试 / 附着后 2s 周期 (与插件版同款; 2026-09-11
+// 审查发现历史 backoff 指数退避为死变量——附着成功即复位, 稳态实际
+// 500ms 轮询, 已删并归位 2s)。COM 只在旁路线程调用 (STA 出站调用无需
+// 消息泵, probe 实测背书); 引擎线程仅经 mutex 读缓存快照。
 // ============================================================
 #ifdef _WIN32
 namespace comctx {
@@ -366,6 +368,19 @@ static HRESULT disp_get(IDispatch *obj, const wchar_t *name, VARIANT *ret) {
   DISPPARAMS dp;
   ZeroMemory(&dp, sizeof(dp));
   return disp_invoke(obj, name, DISPATCH_PROPERTYGET, &dp, ret);
+}
+
+// BSTR → UTF-8（文字/演示两条读链共用；失败时 out 不变返回 false）
+static bool bstr_to_utf8(BSTR s, std::string &out) {
+  if (!s)
+    return false;
+  int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, nullptr, 0, nullptr, nullptr);
+  if (n <= 0)
+    return false;
+  out.resize(n - 1);
+  if (n > 1)
+    WideCharToMultiByte(CP_UTF8, 0, s, -1, &out[0], n, nullptr, nullptr);
+  return true;
 }
 
 enum class ReadResult { OK, NO_DOC, DEAD };  // NO_DOC: 无文档(保留引用) / DEAD: RPC 断(WPS 退出)
@@ -452,14 +467,7 @@ static ReadResult ppt_read_chain(IDispatch *app, std::string &out) {
       res = (hr == DISP_E_EXCEPTION) ? ReadResult::NO_DOC : ReadResult::DEAD;
       break;
     }
-    int n = WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, nullptr, 0,
-                                nullptr, nullptr);
-    if (n > 0) {
-      out.resize(n - 1);
-      if (n > 1)
-        WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, &out[0], n,
-                            nullptr, nullptr);
-    }
+    bstr_to_utf8(vtxt.bstrVal, out);
   } while (false);
   cleanup();
   return res;
@@ -473,12 +481,15 @@ static ReadResult read_chain(IDispatch *app, std::string &out) {
   VariantInit(&vdoc); VariantInit(&vrng); VariantInit(&vtxt);
   auto vt_ok = [](const VARIANT &v) { return v.vt == VT_DISPATCH && v.pdispVal; };
   HRESULT hr;
+  auto cleanup = [&]() {
+    VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vstart);
+    VariantClear(&vdoc); VariantClear(&vrng); VariantClear(&vtxt);
+  };
   if (FAILED(hr = disp_get(app, L"ActiveWindow", &vwin)) || !vt_ok(vwin) ||
       FAILED(hr = disp_get(vwin.pdispVal, L"Selection", &vsel)) || !vt_ok(vsel) ||
       FAILED(hr = disp_get(vsel.pdispVal, L"Start", &vstart)) ||
       vstart.vt != VT_I4) {
-    VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vstart);
-    VariantClear(&vdoc); VariantClear(&vrng); VariantClear(&vtxt);
+    cleanup();
     // RPC 层失败 (hr 为 RPC_*/CO_*) → WPS 进程不在; DISP 异常 → 无文档
     if (hr == DISP_E_EXCEPTION || hr == DISP_E_MEMBERNOTFOUND)
       return ReadResult::NO_DOC;
@@ -509,17 +520,9 @@ static ReadResult read_chain(IDispatch *app, std::string &out) {
       res = (hr == DISP_E_EXCEPTION) ? ReadResult::NO_DOC : ReadResult::DEAD;
       break;
     }
-    int n = WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, nullptr, 0,
-                                nullptr, nullptr);
-    if (n > 0) {
-      out.resize(n - 1);
-      if (n > 1)
-        WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, &out[0], n,
-                            nullptr, nullptr);
-    }
+    bstr_to_utf8(vtxt.bstrVal, out);
   } while (false);
-  VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vstart);
-  VariantClear(&vdoc); VariantClear(&vrng); VariantClear(&vtxt);
+  cleanup();
   return res;
 }
 
@@ -533,11 +536,12 @@ static void thread_proc() {
   CLSID clsid_kwps, clsid_kwpp;
   bool has_kwps = SUCCEEDED(CLSIDFromProgID(L"Kwps.Application", &clsid_kwps));
   bool has_kwpp = SUCCEEDED(CLSIDFromProgID(L"KWPP.Application", &clsid_kwpp));
-  if (!has_kwps && !has_kwpp)
-    return;  // ProgID 都解析不了（未装 WPS）— 旁路停用
+  if (!has_kwps && !has_kwpp) {
+    CoUninitialize();  // 与 CoInitializeEx 配对（未装 WPS，旁路停用）
+    return;
+  }
   IDispatch *app = nullptr;
   OfficeKind app_kind = OfficeKind::NONE;  // 附着实例类型（文字/演示链路不同）
-  int backoff_ms = 500;
   bool logged_attach = false;
   bool com_pending = true;  // 前台 Office 且未附着 → 500ms 快速重试（文档
                             // 打开瞬间 WPS 才注册 ROT，缩短发现间隙；附着
@@ -547,12 +551,7 @@ static void thread_proc() {
     {
       std::unique_lock<std::mutex> lk(g_cv_mu);
       g_cv.wait_for(lk, std::chrono::milliseconds(
-                            // std::min<int>: 显式模板参数防 windows.h min 宏
-                            g_kick.load() ? 1
-                                          : (com_pending
-                                                 ? 500
-                                                 : std::min<int>(backoff_ms,
-                                                                 2000))));
+                            g_kick.load() ? 1 : (com_pending ? 500 : 2000)));
     }
     if (!g_com_ctx_enabled) {
       std::unique_lock<std::mutex> lk(g_cv_mu);
@@ -590,13 +589,11 @@ static void thread_proc() {
         punk->QueryInterface(IID_IDispatch, (void **)&app);
         punk->Release();
         app_kind = fg;
-        backoff_ms = 500;
         if (!logged_attach) {
           log_msg("com ctx: attached via ROT (%s)", via);
           logged_attach = true;
         }
       } else {
-        backoff_ms = std::min<int>(backoff_ms * 2, 8000);
         // ROT 无对象 (未装/无文档/已退出): 清缓存防消费到陈旧文本
         std::lock_guard<std::mutex> lk(g_mu);
         g_text.clear();
@@ -858,7 +855,8 @@ static void user_freq_bump(const std::string &w) {
   }
 }
 
-static void log_msg(const char *fmt, ...) {  char buf[512];
+static void log_msg(const char *fmt, ...) {
+  char buf[512];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -908,33 +906,6 @@ static std::string sanitize_field(const std::string &s) {
   return t;
 }
 
-static void event_log(const std::string &input, const std::string &before,
-                      const std::string &ctx, const std::string &after,
-                      double elapsed_ms, const std::string &src) {
-  FILE *f = open_log_file("rime_llm_filter_log.txt");
-  if (!f)
-    return;
-  long n = ++g_event_cnt;
-  std::time_t t = std::time(nullptr);
-  std::tm tm_buf;
-#ifdef _WIN32
-  localtime_s(&tm_buf, &t);
-#else
-  localtime_r(&t, &tm_buf);
-#endif
-  char ts[16];
-  std::strftime(ts, sizeof(ts), "%H:%M:%S", &tm_buf);
-  fprintf(f, "%s|%ld|%s|%s|%s|%s|%.0fms|%s\n", ts, n, input.c_str(),
-          before.c_str(), ctx.c_str(), after.c_str(), elapsed_ms, src.c_str());
-  fclose(f);
-}
-
-// ============================================================
-// debug_fusion 诊断输出 (与插件版 llm_filter.lua/llm_processor.lua
-// 同名同格式, 写 rime_llm_debug.txt): score 块 = 头行 + 负路径行 +
-// 逐候选明细 + 名次变化 + span; commit 行 = 词频 bump 前后; reset 行 =
-// 代次变化清缓存。块尾空行分隔。
-// ============================================================
 static std::string now_hms() {
   std::time_t t = std::time(nullptr);
   std::tm tm_buf;
@@ -948,6 +919,25 @@ static std::string now_hms() {
   return ts;
 }
 
+static void event_log(const std::string &input, const std::string &before,
+                      const std::string &ctx, const std::string &after,
+                      double elapsed_ms, const std::string &src) {
+  FILE *f = open_log_file("rime_llm_filter_log.txt");
+  if (!f)
+    return;
+  long n = ++g_event_cnt;
+  fprintf(f, "%s|%ld|%s|%s|%s|%s|%.0fms|%s\n", now_hms().c_str(), n,
+          input.c_str(), before.c_str(), ctx.c_str(), after.c_str(),
+          elapsed_ms, src.c_str());
+  fclose(f);
+}
+
+// ============================================================
+// debug_fusion 诊断输出 (与插件版 llm_filter.lua/llm_processor.lua
+// 同名同格式, 写 rime_llm_debug.txt): score 块 = 头行 + 负路径行 +
+// 逐候选明细 + 名次变化 + span; commit 行 = 词频 bump 前后; reset 行 =
+// 代次变化清缓存。块尾空行分隔。
+// ============================================================
 static void debug_fusion_write(const std::vector<std::string> &lines) {
   if (lines.empty())
     return;
