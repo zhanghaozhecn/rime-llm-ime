@@ -1,4 +1,4 @@
-# 构建产物
+﻿# 构建产物
 build/
 output/
 msbuild/
@@ -56,6 +56,10 @@ scripts/*
 !scripts/build_llm_setup.bat
 !scripts/build_setup.bat
 !scripts/build_pkg.bat
+!scripts/enum_wps.py
+!scripts/probe_tab_active.ps1
+!scripts/probe_tab_active2.ps1
+!scripts/probe_tab_verdict.ps1
 
 # bin/ = 本地构建产物与运行数据（全部不入库；WeaselServer 运行需 bin\data，
 # 从官方小狼毫安装目录拷入；发布载荷走 installer\source\）
