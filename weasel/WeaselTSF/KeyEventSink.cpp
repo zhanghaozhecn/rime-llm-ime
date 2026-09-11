@@ -164,6 +164,15 @@ void WeaselTSF::_HandleEditKeyReset(WPARAM wParam) {
       reason = "editkey:enter";
       break;
     default:
+      // 撤销/重做/粘贴/剪切（Ctrl+Z/Y/V/X，2026-09-12 信号层统一补入）：
+      // 改变光标前文本但无专用 VK。TSF 文本变化事件会自动重采（推送制
+      // 自愈），本信号主要用于引擎侧 COM 快照失效——快照制对非 commit
+      // 编辑事件是盲区。Shift+Insert 等罕见粘贴变体不追（2.5s 新鲜窗
+      // 限损 + 空闲周期读自愈）。
+      if ((wParam == 'Z' || wParam == 'Y' || wParam == 'V' ||
+           wParam == 'X') &&
+          (GetKeyState(VK_CONTROL) & 0x8000))
+        reason = "editkey:undo-clipboard";
       break;
   }
   if (reason) {

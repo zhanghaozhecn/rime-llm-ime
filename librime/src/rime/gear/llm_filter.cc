@@ -710,8 +710,13 @@ static void thread_proc() {
       g_cv.wait_for(lk, std::chrono::seconds(5));
       continue;
     }
-    g_kick.store(false);
+    bool woken_by_kick = g_kick.exchange(false);
     com_pending = false;
+    // kick 统一延迟 ~50ms 再读（2026-09-12 信号层统一，与插件版同源）：
+    // 编辑键/点击的 kick 若立即读会赶在应用处理完退格/点击之前拿到旧
+    // 文本；commit kick 的文档更新同量级。下一键远晚于 100ms（人手速度），
+    // 统一延迟无感；连续 kick 在 sleep 期间再次置位，下一轮 1ms 即醒合并。
+    if (woken_by_kick) Sleep(50);
     // 读端前台判定（2026-09-10 与插件版对齐）：前台非 Office 跳过 COM 读
     //（消费端已有前台门控，旧缓存不会被误用——不清也安全；跳过读省
     // Office 后台挂机时的 0.3% CPU）
@@ -817,6 +822,17 @@ static void ensure_started() {  // 首次粘性降级命中时调用 (引擎线�
     std::thread(thread_proc).detach();
 }
 static void kick() { g_kick.store(true); g_cv.notify_all(); }  // OnCommit 后
+// 任何"光标前文本可能变了"的已知信号（编辑键/点击，2026-09-12 信号层
+// 统一）：成对失效快照 + kick 延迟重读（~50ms）。失效保证读回窗口内
+// 旧快照不冒充（消费端落 TSF/历史），kick 保证应用处理完编辑后读到新
+// 真文。TSF 推送制本身事件自愈无需此信号——受益者是 COM 快照（原本
+// 对非 commit 编辑事件是盲区，旧快照 2.5s 新鲜窗内冒充真文）。
+static void invalidate() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  g_text.clear();
+  g_stamp = 0;
+  g_title.clear();
+}
 
 // 引擎线程消费: 新鲜窗口内的缓存文本 (空串 = 不可用 → 调用方回落 hist)。
 // 标题指纹：发布后前台标题变了（WPS 切标签/切窗即换标题）→ 旧快照属于
@@ -2302,8 +2318,16 @@ std::pair<std::string, std::string> LlmFilter::GetContextTextPair() const {
     static bool s_click_inited = false;
     short b = GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
               GetAsyncKeyState(VK_MBUTTON);
-    if (s_click_inited && (b & 1))
+    if (s_click_inited && (b & 1)) {
       g_fallback_buffer.clear();
+      // 2026-09-12 信号层统一：点击也成对失效 COM 快照 + kick 重读——
+      // 快照是旧时刻真文，点击移光标后同样冒充（标题不变挡不住同文档内
+      // 移位）。点击候选窗选词场景：commit kick 刚刷新的正确快照被废，
+      // kick ~50ms 后读回同样正确的文本（点击已处理完、含新上屏词），
+      // 自愈无净损。
+      comctx::invalidate();
+      comctx::kick();
+    }
     s_click_inited = true;
   }
 #endif
@@ -2341,6 +2365,14 @@ std::pair<std::string, std::string> LlmFilter::GetContextTextPair() const {
         g_ctx_limited = false;
 #else
       g_ctx_limited = false;
+#endif
+      // 编辑键/切窗（reset 代次）：与历史清空成对失效 COM 快照 + kick
+      // 延迟重读（2026-09-12 信号层统一）——此块在下方 COM 消费之前，
+      // 保证代次变化的首次调用就不会采信旧快照；kick ~50ms 后读到新
+      // 真文，第二词起恢复。TSF 推送制事件自愈无需此信号。
+#ifdef _WIN32
+      comctx::invalidate();
+      comctx::kick();
 #endif
       g_limited_gen_seen = gen;
     }
