@@ -147,6 +147,18 @@ rime-llm-ime/
 └── scripts/              # 构建 / 打包 / 测试脚本
 ```
 
+### 真机自动化回归（test_ctx_auto.py）
+
+`scripts\test_ctx_auto.py` 用 SendInput 合成真实键击走完整输入法链路（编码→候选→LLM 重排→上屏，不绕过任何环节），从 `rime_llm_events.txt` 逐词断言上文来源徽章（uia/com/rime）与内容——把退格 / 撤销 / 移光标 / 粘贴等上文信号场景变成一键回归（2026-09-13 真机 12/12 通过，验证插件版信号层修复）：
+
+```bat
+python scripts\test_ctx_auto.py               :: 记事本 5 场景（s1 基线/s2 退格/s3 撤销/s4 移光标/s5 粘贴）
+python scripts\test_ctx_auto.py -s s2         :: 单场景
+python scripts\test_ctx_auto.py --app wps     :: WPS：手动开好空文字文档置前再跑（断言 src=com）
+```
+
+运行期间手离开键鼠约 20 秒；自动清旧记事本起新窗口，内置输入法自愈（评分探针 + Win+Space 循环）。三个写进脚本注释的关键事实：满 4 码不自动顶屏（上屏由第 5 键或空格触发，编辑前须先空格顶屏否则删的是编码）；INPUT 结构 union 必须含 MOUSEINPUT（x64 上 40 字节，32B 被 SendInput 静默拒绝）；绝不能 taskkill WeaselServer（丢输入法绑定，恢复只能逐窗 Win+Space）。断言当前解析插件版 events 日志格式；源码版原生组件（`rime_llm_filter_log.txt`）解析待加。
+
 ### 构建步骤
 
 weasel 基底为 **0.17.4 release tag**（勿用 master——IPC 协议有差异，混用会输入失效）。相对上游的完整改动清单与维护陷阱（rime_api.h 双副本同步、include 路径等）见项目记忆 `memory\upstream-diff.md`，不在本文展开。
