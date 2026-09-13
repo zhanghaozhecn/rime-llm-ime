@@ -393,7 +393,7 @@ def ensure_foreground(hwnd=None, office=False):
     return False
 
 
-def ime_heal(hwnd):
+def ime_heal(hwnd, ev_path):
     """环境自愈（2026-09-13 深夜真机教训全收录）：
     1. 点击客户区复位 caret（编辑焦点丢失时注入键全部无效）
     2. wkjl 探针：满码评分行出现 = weasel 活 + 中文态（一石二鸟——
@@ -403,9 +403,8 @@ def ime_heal(hwnd):
     4. 中途若输入法选择器滞留抢前台（类名异常）→ Esc 关闭
     注意：绝不能 taskkill WeaselServer——会丢各应用的输入法绑定（Windows
     自动切到其他 TIP），恢复只能逐窗 Win+Space，且部分应用要重启。"""
-    EV = os.path.join(os.environ["APPDATA"], "Rime", "rime_llm_events.txt")
     def nlines():
-        return len(open(EV, encoding="utf-8", errors="replace")
+        return len(open(ev_path, encoding="utf-8", errors="replace")
                    .read().splitlines())
     def probe():
         n0 = nlines()
@@ -449,10 +448,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-s", "--scenarios", default="s1,s2,s3,s4,s5")
     ap.add_argument("--app", default="notepad", choices=["notepad", "wps"])
+    ap.add_argument("--engine", default="plugin", choices=["plugin", "source"],
+                    help="plugin=lua 版 events 日志（rime_llm_events.txt）；"
+                         "source=原生组件（rime_llm_filter_log.txt，event_log"
+                         " 行格式与插件版一致，2026-09-14 核对 llm_filter.cc"
+                         ":1136）")
     args = ap.parse_args()
 
-    events = os.path.join(os.environ["APPDATA"], "Rime",
-                          "rime_llm_events.txt")
+    logname = ("rime_llm_filter_log.txt" if args.engine == "source"
+               else "rime_llm_events.txt")
+    events = os.path.join(os.environ["APPDATA"], "Rime", logname)
     if not os.path.exists(events):
         print("events log not found: %s" % events)
         sys.exit(2)
@@ -474,7 +479,7 @@ def main():
     user32.SetForegroundWindow(hwnd) if hwnd else None
     time.sleep(0.6)
 
-    if not ime_heal(hwnd):
+    if not ime_heal(hwnd, events):
         print("ERROR: IME not usable after heal attempts - "
               "check tray input method is 小狼毫 Chinese mode, then rerun")
         sys.exit(2)
