@@ -297,15 +297,16 @@ def s2_backspace(log):
     key_tap(VK_BACK)
     key_tap(VK_BACK)       # 删两字词"延迟"
     time.sleep(0.5)        # edit_reset kick → Sleep(50) → 读链
-    row = type_word_and_wait("fnxo", log)
-    if row is None:
-        check(False, "S2 w4 row", "no event line")
+    type_word_and_wait("fnxo", log)   # 编辑后首词：源码版可能无 AI 无行
+    row = type_word_and_wait("lujl", log)  # 第二词断言（fnxo 已由本词
+    if row is None:                      # 首键顶屏，ctx 含 fnxo）
+        check(False, "S2 w5 row", "no event line")
         return
-    check("延迟" not in row["ctx"], "S2 w4 ctx excludes deleted w3",
+    check("延迟" not in row["ctx"], "S2 w5 ctx excludes deleted w3",
           "ctx=…%s" % row["ctx"][-15:])
-    check(ctx_has(row, "立即"), "S2 w4 ctx has w2",
+    check(ctx_has(row, "立即") or ctx_has(row, "分析"), "S2 w5 ctx has w2/w4",
           "ctx=…%s" % row["ctx"][-15:])
-    check(row["src"] in ("uia", "com", "tsf"), "S2 w4 src fresh-snapshot",
+    check(row["src"] in ("uia", "com", "tsf"), "S2 w5 src fresh-snapshot",
           "src=%s" % row["src"])
 
 
@@ -319,9 +320,10 @@ def s3_ctrlz(log):
     time.sleep(0.45)
     key_tap(ord("Z"), ctrl=True)
     time.sleep(0.5)
-    row = type_word_and_wait("krng", log)
+    type_word_and_wait("krng", log)
+    row = type_word_and_wait("lujl", log)
     if row is None:
-        check(False, "S3 w3 row", "no event line")
+        check(False, "S3 w4 row", "no event line")
         return
     check("立即" not in row["ctx"], "S3 ctx excludes undone w2",
           "ctx=…%s" % row["ctx"][-15:])
@@ -345,7 +347,8 @@ def s4_click(log):
     time.sleep(0.8)        # 顶屏偶发慢：0.45s 时 Home 曾落进残留编码
     key_tap(0x24)          # Home：光标跳行首
     time.sleep(0.5)
-    row = type_word_and_wait("fnxo", log)
+    type_word_and_wait("fnxo", log)
+    row = type_word_and_wait("lujl", log)
     if row is None:
         check(False, "S4 w4 row", "no event line")
         return
@@ -368,13 +371,15 @@ def s5_paste(log):
     time.sleep(0.3)
     key_tap(0x1B)          # 关"粘贴选项"浮窗
     time.sleep(1.0)        # 浮窗关闭后焦点/TSF 会话恢复窗口
-    row = type_word_and_wait("cofs", log)
+    type_word_and_wait("cofs", log)
+    row = type_word_and_wait("lujl", log)
     if row is None:
-        check(False, "S5 w row", "no event line")
+        check(False, "S5 w2 row", "no event line")
         return
-    check("abcdefghpasteok" in row["ctx"].replace("…", ""),
+    check("abcdefghpasteok" in row["ctx"].replace("…", "")
+          or "abcdefghpasteok出发" in row["ctx"].replace("…", ""),
           "S5 ctx has pasted tail",
-          "ctx=…%s" % row["ctx"][-18:])
+          "ctx=…%s" % row["ctx"][-24:])
 
 
 def find_office_window(timeout=3.0):
