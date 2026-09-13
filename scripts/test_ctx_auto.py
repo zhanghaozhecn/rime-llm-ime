@@ -327,7 +327,7 @@ def s3_ctrlz(log):
           "ctx=…%s" % row["ctx"][-15:])
 
 
-def s4_click(log, hwnd):
+def s4_click(log):
     """S4 光标移动：3 词（末词空格顶屏）→ Home 键（光标跳行首，导航键
     = edit_reset 信号）→ W4；W4 上文不应含任何词（光标前文本≈空）。
     首版用鼠标点击移光标——Win11 记事本文本区坐标随布局/缩放漂移
@@ -353,13 +353,19 @@ def s4_click(log, hwnd):
 
 
 def s5_paste(log):
-    """S5 粘贴：剪贴板置英文短语 → Ctrl+V → 打词；上文含短语尾部。
-    注意 lua 侧上文 gsub 去空白 → 断言词用无空格形态。"""
-    print("[S5] ctrl+v paste")
+    """S5 粘贴：剪贴板置英文短语 → Ctrl+V → Esc 关浮窗 → 1s 恢复 → 打词；
+    上文含短语尾部（lua 侧上文去空白 → 断言词用无空格形态）。
+    WPS 粘贴三轮真机踩坑：Ctrl+V 松 Ctrl 弹"粘贴选项"浮窗吃后续键；
+    浮窗 2.5s 不自灭；Esc 后焦点/TSF 会话恢复有竞态（0.3s 时首键直出
+    键序错乱 ofsw）；Shift+Insert 的 Shift 释放被 weasel 当中英切换
+    （英文态直出）——定案 Ctrl+V + Esc + 1.0s 恢复。"""
+    print("[S5] paste (Ctrl+V + Esc + settle)")
     set_clipboard_text("abcdefgh paste ok")
     time.sleep(0.2)
     key_tap(ord("V"), ctrl=True)
-    time.sleep(0.6)
+    time.sleep(0.3)
+    key_tap(0x1B)          # 关"粘贴选项"浮窗
+    time.sleep(1.0)        # 浮窗关闭后焦点/TSF 会话恢复窗口
     row = type_word_and_wait("cofs", log)
     if row is None:
         check(False, "S5 w row", "no event line")
@@ -491,10 +497,7 @@ def main():
             sys.exit(2)
         clear_doc()
         try:
-            if name == "s4" and args.app == "notepad":
-                fn(log, hwnd)
-            else:
-                fn(log)
+            fn(log)
         except Exception as e:
             FAIL.append("%s exception" % name)
             print("  EXC   %s: %r" % (name, e))
