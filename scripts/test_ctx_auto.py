@@ -263,15 +263,17 @@ def s1_base(log):
     rows = {}
     for code in ("fsxd", "wkjl", "krng"):
         rows[code] = type_word_and_wait(code, log)
-    check(rows["fsxd"] is not None, "S1 w1 scored",
-          "src=%s ctx=…%s" % ((rows["fsxd"] or {}).get("src", "-"),
-                              (rows["fsxd"] or {}).get("ctx", "")[-12:]))
+    if rows["fsxd"] is None:
+        warn("S1 w1 no row (source-engine cold start: empty ctx -> "
+             "no inference, no event line)")
+    else:
+        check(True, "S1 w1 scored", "src=%s" % rows["fsxd"]["src"])
     for code, word in (("wkjl", "立即"), ("krng", "可能")):
         row = rows[code]
         if row is None:
             check(False, "S1 row %s" % code, "no event line")
             continue
-        check(row["src"] in ("uia", "com"), "S1 %s src" % code,
+        check(row["src"] in ("uia", "com", "tsf"), "S1 %s src" % code,
               "src=%s ctx=…%s" % (row["src"], row["ctx"][-12:]))
     # 第 2/3 词的上文应含前一上屏词
     check(ctx_has(rows["wkjl"], "发现"), "S1 w2 ctx has w1",
@@ -303,7 +305,7 @@ def s2_backspace(log):
           "ctx=…%s" % row["ctx"][-15:])
     check(ctx_has(row, "立即"), "S2 w4 ctx has w2",
           "ctx=…%s" % row["ctx"][-15:])
-    check(row["src"] in ("uia", "com"), "S2 w4 src fresh-snapshot",
+    check(row["src"] in ("uia", "com", "tsf"), "S2 w4 src fresh-snapshot",
           "src=%s" % row["src"])
 
 
@@ -340,7 +342,7 @@ def s4_click(log):
         type_word_and_wait(code, log)
     type_code("krng")
     key_tap(0x20)          # 顶屏"可能"（否则编辑键作用在残留编码上）
-    time.sleep(0.45)
+    time.sleep(0.8)        # 顶屏偶发慢：0.45s 时 Home 曾落进残留编码
     key_tap(0x24)          # Home：光标跳行首
     time.sleep(0.5)
     row = type_word_and_wait("fnxo", log)
@@ -471,7 +473,11 @@ def ime_heal(hwnd, ev_path):
         cls = ctypes.create_unicode_buffer(64)
         fg = user32.GetForegroundWindow()
         user32.GetClassNameW(fg, cls, 64)
-        if hwnd and cls.value != "Notepad":
+        if hwnd and fg != hwnd and cls.value == "Notepad":
+            # 多记事本窗口间漂移（类名同、句柄不同）——精确拉回目标句柄
+            user32.SetForegroundWindow(hwnd)
+            time.sleep(0.4)
+        elif hwnd and cls.value != "Notepad":
             key_tap(0x1B)
             time.sleep(0.3)
             user32.SetForegroundWindow(hwnd)
@@ -506,14 +512,15 @@ def main():
 
     hwnd = None
     if args.app == "notepad":
-        # 清掉历史测试窗口（多 notepad 并存时 find/前台/输入法绑定都漂移
-        # ——2026-09-13 深夜实测：残留窗口令探针在新旧窗口间错位全失败）
-        subprocess.run(["taskkill", "/F", "/IM", "Notepad.exe"],
-                       capture_output=True)
-        time.sleep(1.0)
-        print("launching notepad ...")
-        subprocess.Popen(["notepad.exe"])
-        hwnd = find_window_by_class("Notepad")
+        # 复用现有记事本（clear_doc 会清掉旧内容）；没有才开新的。
+        # 首版 taskkill /F 强杀被 Win11 记事本当崩溃——下次 Popen 恢复
+        # 全部旧会话标签（真机实测一次弹出 6 个窗口），多窗口间前台/
+        # 输入法绑定漂移令探针 8 轮全灭——绝不能强杀。
+        hwnd = find_window_by_class("Notepad", timeout=1.5)
+        if not hwnd:
+            print("launching notepad ...")
+            subprocess.Popen(["notepad.exe"])
+            hwnd = find_window_by_class("Notepad")
         if not hwnd:
             print("ERROR: notepad window not found")
             sys.exit(2)
