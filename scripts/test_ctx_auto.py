@@ -375,9 +375,46 @@ def s5_paste(log):
           "ctx=…%s" % row["ctx"][-18:])
 
 
+def find_office_window(timeout=3.0):
+    """按类名找 Office 系前台候选窗口（WPS 文字/演示/表格）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for cls in ("OpusApp", "PP12FrameClass", "XLMAIN"):
+            found = []
+
+            @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+            def cb_cls(hwnd, _, _cls=cls):
+                b = ctypes.create_unicode_buffer(64)
+                if user32.IsWindowVisible(hwnd) and user32.GetClassNameW(
+                        hwnd, b, 64) and b.value == _cls:
+                    found.append(hwnd)
+                return True
+
+            user32.EnumWindows(cb_cls, 0)
+            if found:
+                return found[-1]
+        time.sleep(0.3)
+    return None
+
+
+def bring_foreground(hwnd):
+    """把 hwnd 切回前台。终端跑命令会抢前台（用户真机反馈）——脚本进程
+    非前台时 SetForegroundWindow 被系统前台锁拒绝，先用一次 Alt 键按下
+    释放解锁（经典 hack：合成 Alt 后本进程获得 SetForegroundWindow 权）。"""
+    send_key(0x12)          # Alt down
+    time.sleep(0.05)
+    send_key(0x12, up=True)
+    time.sleep(0.05)
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.4)
+    return user32.GetForegroundWindow() == hwnd
+
+
 def ensure_foreground(hwnd=None, office=False):
     """打字前的安全门：目标窗口必须前台，否则重试；仍失败则中止——
-    绝不向非目标窗口发合成键击。office=True 用于 WPS（校验前台类名）。"""
+    绝不向非目标窗口发合成键击。office=True 用于 WPS（前台类名校验 +
+    偏离时自动找 Office 窗口切回——2026-09-14 用户真机反馈：终端跑命令
+    即抢前台，原版只校验不切换直接 ABORT）。"""
     for _ in range(10):
         fg = user32.GetForegroundWindow()
         if hwnd is not None and fg == hwnd:
@@ -387,6 +424,10 @@ def ensure_foreground(hwnd=None, office=False):
             user32.GetClassNameW(fg, cls, 64)
             if cls.value in ("OpusApp", "PP12FrameClass", "XLMAIN"):
                 return True
+            oh = find_office_window(timeout=1.0)
+            if oh:
+                bring_foreground(oh)
+                continue
         if hwnd is not None:
             user32.SetForegroundWindow(hwnd)
         time.sleep(0.3)
@@ -476,6 +517,14 @@ def main():
         if not hwnd:
             print("ERROR: notepad window not found")
             sys.exit(2)
+    else:
+        # wps：终端跑命令会抢前台（用户真机反馈）——ime_heal 探针打字前
+        # 必须先把 Office 窗口切回，否则打码进终端假成功
+        oh = find_office_window()
+        if not oh:
+            print("ERROR: no WPS/Office window found - open a document first")
+            sys.exit(2)
+        bring_foreground(oh)
     user32.SetForegroundWindow(hwnd) if hwnd else None
     time.sleep(0.6)
 
