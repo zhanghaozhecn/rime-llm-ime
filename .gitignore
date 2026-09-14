@@ -80,3 +80,5 @@ server_out.log
 server_err.log
 bin/deploy_update.log
 !scripts/test_ctx_auto.py
+
+.vscode/
