@@ -531,6 +531,16 @@ typedef struct RIME_FLAVORED(rime_api_t) {
   void (*set_context_changed_callback)(void (*callback)(const char* text));
 } RIME_FLAVORED(RimeApi);
 
+
+//! Register a hook fired the instant the reset generation increments
+//! (2026-09-14, align signal timing with the plugin edition): invalidate the
+//! COM snapshot + kick a delayed re-read the moment the edit-key IPC arrives,
+//! instead of at the next full-code scoring pass (one keystroke late: first
+//! word after an edit got an empty context). Hook runs on the server IPC
+//! thread outside locks and must be non-blocking. Pass nullptr to unregister.
+RIME_API void RimeSetContextResetHook(void (*hook)(void* user_data),
+                                      void* user_data);
+
 //! API entry
 /*!
  *  Acquire the version controlled RimeApi structure.

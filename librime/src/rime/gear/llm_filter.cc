@@ -816,10 +816,25 @@ static void thread_proc() {
   }
 }
 
+#ifdef _WIN32
+static void llm_context_reset_hook(void*);  // 定义在 invalidate/kick 之后
+#endif
 static void ensure_started() {  // 首次粘性降级命中时调用 (引擎线程)
   bool expect = false;
-  if (g_started.compare_exchange_strong(expect, true))
+  if (g_started.compare_exchange_strong(expect, true)) {
+    // 编辑键 reset 钩子 (2026-09-14 信号时机对齐插件版): server IPC 收到
+    // ResetContext 递增代次的瞬间 (RimeResetContextText) 即 invalidate+kick
+    // ——只挂 GetContextTextPair (满码评分时) 比插件版 processor 按键回调
+    // 慢一拍, 编辑后首词 ctx 空不推理。回调跑在 server IPC 线程锁外,
+    // invalidate (mutex) + kick (atomic+cv) 无阻塞微秒级。注册放这里而
+    // 非静态构造: 跨 TU 静态初始化顺序不定 (api.cc 的 g_context_text_
+    // mutex 可能未构造), 首次使用时一切静态早已就绪; 代价是首个评分前
+    // 的编辑键 miss 一次 (窗口极小)。
+#ifdef _WIN32
+    RimeSetContextResetHook(&llm_context_reset_hook, nullptr);
+#endif
     std::thread(thread_proc).detach();
+  }
 }
 static void kick() { g_kick.store(true); g_cv.notify_all(); }  // OnCommit 后
 // 任何"光标前文本可能变了"的已知信号（编辑键/点击，2026-09-12 信号层
@@ -833,6 +848,12 @@ static void invalidate() {
   g_stamp = 0;
   g_title.clear();
 }
+#ifdef _WIN32
+static void llm_context_reset_hook(void*) {
+  comctx::invalidate();
+  comctx::kick();
+}
+#endif
 
 // 引擎线程消费: 新鲜窗口内的缓存文本 (空串 = 不可用 → 调用方回落 hist)。
 // 标题指纹：发布后前台标题变了（WPS 切标签/切窗即换标题）→ 旧快照属于

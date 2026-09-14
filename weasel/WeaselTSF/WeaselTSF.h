@@ -177,8 +177,10 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   // 按键时获取光标前文本 (TSF 文档锁内) 并发送给 server (供 LLM 上文)
   friend class CGetTextBeforeCaretEditSession;
   friend class CEndCompositionEditSession;  // 提交后立即采集 (下一词 TSF 上文)
-  void _RequestContextText(ITfContext* pContext, bool immediate = false);
-  void _OnContextTextReady(const std::wstring& text, bool immediate = false);
+  void _RequestContextText(ITfContext* pContext, bool immediate = false,
+                           bool from_edit_reset = false);
+  void _OnContextTextReady(const std::wstring& text, bool immediate = false,
+                           bool from_edit_reset = false);
   // 上文采集去抖 (CEF 类应用文档更新极频繁, 限流 SetContextText 避免
   // IPC + Server 端 prepare 风暴): 非空 100ms 合并, 相同不重发, 空文本
   // 一律 800ms (WPS 提交后 transient 空高发, 详见 _OnContextTextReady)
@@ -189,6 +191,7 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   bool m_ctx_flush_running = false;  // 合并发送线程是否在跑
   ULONGLONG m_ctx_pending_since = 0;  // pending 入队 tick (期间更新不重置, 保证发送进度)
   bool m_ctx_pending_immediate = false;  // pending 由提交路径产生 (非空 0ms 发送)
+  bool m_ctx_from_edit_reset = false;  // pending 由编辑键重采集产生 (空 50ms 而非 800ms)
   uint64_t m_ctx_seq = 0;  // pending 更新计数 (等待谓词: 有新内容则唤醒重算)
   // focus:switch reset 1s 合并节流 (新版 WPS 内部 DocumentMgr 频繁 A↔B
   // 切换, 每次全清上下文+fallback → 风暴期词无重排; 见 ThreadMgrEventSink)
@@ -198,7 +201,13 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   void _OnContextReset();
   // 编辑键 (退格/删除/导航/回车, composition 空时): 光标位置变化,
   // 上屏历史不再代表光标前上文 -> 通知 librime 重置 commit-history 兜底
-  void _HandleEditKeyReset(WPARAM wParam);
+  void _HandleEditKeyReset(WPARAM wParam, ITfContext* pContext);
+  // 编辑键 reset 后的延迟重采集 (2026-09-14): 导航键纯光标移动不触发
+  // OnEndEdit, 旧文本停留引擎 fresh 窗冒充——120ms 后 WM_TIMER 回本
+  // 线程 (TSF apartment) 主动采集一次; idEvent 携带 this
+  static VOID CALLBACK EditResetCollectProc(HWND hwnd, UINT msg,
+                                            UINT_PTR idEvent, DWORD dwTime);
+  com_ptr<ITfContext> m_pEditResetContext;  // 编辑键时刻的 context (保活)
   std::string _Utf8FromWide(const std::wstring& wstr) const;
   std::wstring m_textBeforeCaret;
 

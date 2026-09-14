@@ -316,8 +316,10 @@ class CGetTextBeforeCaretEditSession : public CEditSession {
  public:
   CGetTextBeforeCaretEditSession(com_ptr<WeaselTSF> pTextService,
                                  com_ptr<ITfContext> pContext,
-                                 bool immediate = false)
-      : CEditSession(pTextService, pContext), immediate_(immediate) {}
+                                 bool immediate = false,
+                                 bool from_edit_reset = false)
+      : CEditSession(pTextService, pContext), immediate_(immediate),
+        from_edit_reset_(from_edit_reset) {}
 
   STDMETHODIMP DoEditSession(TfEditCookie ec) {
     TF_SELECTION selection;
@@ -413,20 +415,23 @@ class CGetTextBeforeCaretEditSession : public CEditSession {
     }
     TSFDbgLog(L"CtxEditSession done chars=%d neg_shift=%d", (int)text.size(),
               (int)used_neg_shift);
-    _pTextService->_OnContextTextReady(text, immediate_);
+    _pTextService->_OnContextTextReady(text, immediate_, from_edit_reset_);
     return S_OK;
   }
 
  private:
   bool immediate_;  // 提交路径: 跳过去抖延迟立即发送 (第二词需在首键前送达)
+  bool from_edit_reset_;  // 编辑键重采集: 空文本快速送达 (50ms)
 };
 
-void WeaselTSF::_RequestContextText(ITfContext* pContext, bool immediate) {
+void WeaselTSF::_RequestContextText(ITfContext* pContext, bool immediate,
+                                    bool from_edit_reset) {
   TSFDbgLog(L"RequestContextText immediate=%d", (int)immediate);
   if (!pContext)
     return;
   com_ptr<CGetTextBeforeCaretEditSession> pEditSession(
-      new CGetTextBeforeCaretEditSession(this, pContext, immediate));
+      new CGetTextBeforeCaretEditSession(this, pContext, immediate,
+                                        from_edit_reset));
   HRESULT hr = E_FAIL;
   // 只读锁 + 异步 (按键时锁可能被占用; 缺 TF_ES_READ 权限位会直接 E_FAIL)
   pContext->RequestEditSession(_tfClientId, pEditSession,
@@ -443,7 +448,22 @@ void WeaselTSF::_OnContextReset() {  // Server 端上下文已清空 (RimeResetC
   m_ctx_last_sent.clear();
 }
 
-void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate) {
+// 编辑键 reset 后 120ms 的主动重采集 (2026-09-14): 导航键纯光标移动不
+// 触发 OnEndEdit (采集只挂在编辑事件), Home/方向键后旧文本停留引擎
+// 5s fresh 窗内被信任冒充 (真机 S4 实锤)。SetTimer(NULL) 定时器消息由
+// 设置线程 (TSF apartment/UI 线程) 的消息循环派发——TimerProc 天然回到
+// 正确线程, 规避跨线程 ITfContext 的 apartment 风险。KillTimer 先行:
+// 同 id 重复 SetTimer 只重置计时, 连续编辑键自然合并为最后一次。
+VOID CALLBACK WeaselTSF::EditResetCollectProc(HWND, UINT, UINT_PTR idEvent,
+                                               DWORD) {
+  KillTimer(nullptr, idEvent);
+  WeaselTSF* ts = reinterpret_cast<WeaselTSF*>(idEvent);
+  ts->_RequestContextText(ts->m_pEditResetContext.p, true);
+  ts->m_pEditResetContext = nullptr;  // 释放保活引用
+}
+
+void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate,
+                                    bool from_edit_reset) {
   m_textBeforeCaret = text;
   // 发送移出 TSF 文档锁 (EditSession 回调必须快速返回, 禁同步阻塞 IPC):
   // 独立线程执行管道 Transact (PipeChannel 线程安全, thread_local 管道句柄)。
@@ -471,6 +491,8 @@ void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate) {
     m_ctx_pending = utf8;
     if (immediate)
       m_ctx_pending_immediate = true;
+    if (from_edit_reset)
+      m_ctx_from_edit_reset = true;
     ++m_ctx_seq;
     if (!m_ctx_flush_running) {
       m_ctx_flush_running = true;
@@ -493,8 +515,12 @@ void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate) {
           // lagging 粘性降级到历史上文后, 空送达不再有杀伤力; 好应用
           // 本就极少送空。等待结束 (超时或新 pending) 无条件回循环头
           // 重算 (六轮教训保留: 超时≠无变化)
-          ULONGLONG quota =
-              send.empty() ? 800 : (m_ctx_pending_immediate ? 0 : 100);
+          ULONGLONG quota = 0;  // 编辑键重采集的空文本快速送达 (50ms):
+          // 导航键后用户最快 100ms 打首键 / 250ms 满码评分 (时序设计
+          // 标准 2026-09-14), 800ms 去抖令旧文本 fresh 窗冒充到第二词
+          quota =
+              send.empty() ? (m_ctx_from_edit_reset ? 50 : 800)
+                           : (m_ctx_pending_immediate ? 0 : 100);
           ULONGLONG waited = GetTickCount64() - m_ctx_pending_since;
           int delay = waited >= quota ? 0 : (int)(quota - waited);
           if (delay > 0) {
@@ -514,6 +540,7 @@ void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate) {
           m_ctx_last_sent = send;
           if (m_ctx_pending == send) {
             m_ctx_pending_immediate = false;  // 标记随该内容一起消费
+            m_ctx_from_edit_reset = false;
             m_ctx_flush_running = false;
             break;  // 发送期间无新更新, 收尾
           }

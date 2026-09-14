@@ -99,7 +99,7 @@ STDAPI WeaselTSF::OnTestKeyDown(ITfContext* pContext,
   // ESC 清码 (按键处理后 composing 已变 false), 事后检查会误判为
   // "无编码退格"而误清上文。同时保持异步发送 (08-13): 同步 Transact
   // 在按键回调内拉长 TSF 处理链, 08-11 WPS 停用的教训。
-  _HandleEditKeyReset(wParam);
+  _HandleEditKeyReset(wParam, pContext);
   _ProcessKeyEvent(wParam, lParam, pfEaten);
   _UpdateComposition(pContext);
   if (*pfEaten)
@@ -120,14 +120,14 @@ STDAPI WeaselTSF::OnKeyDown(ITfContext* pContext,
     // OnTestKeyDown (QQ 类), 两处都调用, _HandleEditKeyReset 内
     // 500ms 去重防同一按键重复 reset。
     // 2026-08-14: 判定移到 _ProcessKeyEvent 之前, 见 OnTestKeyDown 注释。
-    _HandleEditKeyReset(wParam);
+    _HandleEditKeyReset(wParam, pContext);
     _ProcessKeyEvent(wParam, lParam, pfEaten);
     _UpdateComposition(pContext);
   }
   return S_OK;
 }
 
-void WeaselTSF::_HandleEditKeyReset(WPARAM wParam) {
+void WeaselTSF::_HandleEditKeyReset(WPARAM wParam, ITfContext* pContext) {
   // composition 非空时退格等是删编码, 光标位置未变, 不重置
   if (_status.composing)
     return;
@@ -183,6 +183,17 @@ void WeaselTSF::_HandleEditKeyReset(WPARAM wParam) {
     std::string r = reason;
     std::thread([this, r]() { m_client.ResetContext(r.c_str()); }).detach();
     _OnContextReset();              // 清去抖标记, 下次采集强制重发
+    // 导航键等纯光标移动不触发 OnEndEdit 重采集 (2026-09-14 源码版 S4
+    // 实锤: Home 后旧文本停留引擎 5s fresh 窗内被信任冒充)。80ms 后经
+    // WM_TIMER 回本线程 (TSF apartment) 主动采集一次。80ms = 时序设计
+    // 标准 (2026-09-14): 光标移动后用户最快 100ms 打首键——采集必须
+    // 赶在首键前; SetTimer(NULL)
+    // 的定时器消息由本线程消息循环派发, TimerProc 天然回到正确的线程;
+    // 不在按键回调内同步采集 (08-11 拉长处理链教训)。同 id 重复 SetTimer
+    // 只重置计时, 连续编辑键自然合并。immediate 采集的空文本仍走 800ms
+    // 去抖 (Home 到行首=真空, 由 librime 侧 fresh/stale 兜底)。
+    m_pEditResetContext = pContext;  // com_ptr 保活到 TimerProc
+    SetTimer(nullptr, (UINT_PTR)this, 120, WeaselTSF::EditResetCollectProc);
   }
 }
 
