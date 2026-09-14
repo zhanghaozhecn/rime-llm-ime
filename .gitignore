@@ -82,3 +82,4 @@ bin/deploy_update.log
 !scripts/test_ctx_auto.py
 
 .vscode/
+!scripts/release_gh.py
