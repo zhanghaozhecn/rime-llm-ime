@@ -73,8 +73,9 @@ static std::atomic<bool> g_loading{false};
 // 排序管线（顺序固定，与插件版一致）: CE 评分序 → 词频融合（融合应用于
 //   评分序之上）→ expected_length 加权 → 稳定排序（失败哨兵不参与
 //   min-max 与加成；非有限分整块跳过）。
-// 长候选外推: 4+ token 候选按尾部 CE 外推（λ=0.6，语料模拟调参），
-//   不增加 decode 次数，3-token 词不受长词挤压。
+// CE 位置权重 (2026-09-16, 与插件版同源, 首项归一规范形 (1,1.13,0.61)): ce2 判别
+//   力最强(上下文契合+词内连贯), ce3 深入词内部降权; 4+ token 词只算前三
+//   项——尾部外推证伪删除(λ 0→1 端到端命中率单调递减, λ=0 最优)。
 // 全局配置（2026-08-27 直接安装版）: %APPDATA%\Rime\llm_rerank.yaml（GUI
 // 写入, 平面 key: value, Apply 时按 mtime|size 热重载）; 优先级 schema 节 >
 // 全局 yaml > 内置默认。2026-08-29 起为显式组件：方案 engine/filters 列出
@@ -1538,8 +1539,10 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
   float m0;
   double lse0;
   logits_normalizer(ctx_logits.data(), vs, m0, lse0);
+  // CE 位置权重 (kCeW1/2/3): 见文件头注释; 4+ token 只算前三项, 无外推
+  static constexpr double kCeW[3] = {1.0, 1.13, 0.61};
   for (int i = 0; i < n_cands; i++) {
-    ce_sum[i] = ce_target(ctx_logits.data(), cands[i][0], m0, lse0);
+    ce_sum[i] = kCeW[0] * ce_target(ctx_logits.data(), cands[i][0], m0, lse0);
   }
   auto ts_ce1_1 = std::chrono::high_resolution_clock::now();
   double ms_ce1 =
@@ -1570,7 +1573,7 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
         int ci = idx2[s];
         float *l = llama_get_logits_ith(g_ctx, s);
         if (l)
-          ce_sum[ci] += cross_entropy(l, vs, cands[ci][1]);
+          ce_sum[ci] += kCeW[1] * cross_entropy(l, vs, cands[ci][1]);
         else
           ce_sum[ci] = -1e10;
       }
@@ -1608,7 +1611,7 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
         int ci = idx3[s];
         float *l = llama_get_logits_ith(g_ctx, s);
         if (l)
-          ce_sum[ci] += cross_entropy(l, vs, cands[ci][2]);
+          ce_sum[ci] += kCeW[2] * cross_entropy(l, vs, cands[ci][2]);
         else
           ce_sum[ci] = -1e10;
       }
@@ -1637,24 +1640,11 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
       llama_memory_seq_rm(mem, s, 0, -1);
   }
 
-  // final scoring: CE sum + long-candidate tail extrapolation
+  // final scoring: weighted CE sum (first 3 tokens only, no extrapolation
+  // - removed 2026-09-16, lambda=0 was optimal across the whole 0..1 sweep)
   auto ts_sc_0 = std::chrono::high_resolution_clock::now();
   for (int i = 0; i < n_cands; i++) {
-    double score = ce_sum[i] > -1e9 ? -ce_sum[i] : -1e10;
-    if (score > -1e9 && (int)cands[i].size() > 3) {
-      // Only the first 3 token CEs are computed for 4+ token candidates.
-      // Without compensation the truncation lets long words skip their
-      // (negative) tail CEs, favoring them over 3-token words. Extrapolate
-      // the missing tail CEs by the average CE - no extra decode needed.
-      // lambda tuned on corpus (eval_long_cand, 187 long-cand samples,
-      // 7-point scan 0.3-0.7): real tail CE / head CE measured at
-      // mean 0.58 (len=4) / 0.62 (len=5+), so 0.6 sits on the plateau
-      // (0.5-0.7 all ~94% first-choice agreement) with balanced
-      // direction (up 5 / down 5 at 0.6 vs 6/4 at 0.5).
-      double avg_ce = ce_sum[i] / 3.0;
-      score = -ce_sum[i] - avg_ce * ((int)cands[i].size() - 3) * 0.6;
-    }
-    scores_out[i] = score;
+    scores_out[i] = ce_sum[i] > -1e9 ? -ce_sum[i] : -1e10;
   }
 
   auto t2 = std::chrono::high_resolution_clock::now();
@@ -1663,7 +1653,7 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
       std::chrono::duration<double, std::milli>(t2 - ts_sc_0).count();
   // one score line per inference (prep hit check)
   // timing: wait=S1(lock) S1=ctx decode(0 on prep hit) CE1=P(cand0|ctx)
-  //         KV=KV copy S2=decode cand0 S3=decode cand1 score=sum+extrap
+  //         KV=KV copy S2=decode cand0 S3=decode cand1 score=weighted sum
   log_msg("score: wait=%.0fms S1=%.0fms CE1=%.0fms KV=%.0fms S2=%.0fms "
           "S3=%.0fms score=%.0fms total=%.0fms prep=%d ctx_tok=%d cand=%d",
           wait_ms, ms1, ms_ce1, ms2a, ms2b, ms3, ms_score, total_ms,
