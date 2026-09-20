@@ -18,23 +18,13 @@ LLM 候选重排**源码级集成**进 RIME 小狼毫：本地小语言模型（
 
 > 与 [rime-llm-rerank](https://github.com/zhanghaozhecn/rime-llm-rerank)（插件版）功能等效，二选一；本版 TSF 采集 + COM 旁路，插件版 COM + UIA TextPattern + 历史三层。两版鼠标点击清兜底历史同语义。
 
-## 研究主要结论
-
-重排核心 = 对同码候选做交叉熵评分 `argmax P(wᵢ|上文)`（只排序、不生成、编码无关）。三项关键技术：**分层并行解码**（候选共享上文、≤3 次 decode，与候选数无关）、**预解码 + KV 代次**（commit 后异步算上文，按键延迟 ~43ms）、**CE 位置权重**（前 3 token 按 (1.0, 1.13, 0.61) 加权；尾部外推经端到端扫描证伪删除）。主要数字：
-
-- 首选率 **93.4%**（10 token 上文 / 5 候选，20000 样本），单字 96.8%；模型上限 ~94.3%；
-- 0.8B 即最优（2B 仅 +0.3pp 但延迟 3×、体积 2.6×）；10 tok / 5 cand 为性价比最优点；
-- 用户词频对数融合（`freq_beta=1.5`，fused = LLM分 + β·log(1+eff)）：词频无上限、强个人高频词可翻盘（本机真实窗回放事前口径 +0.4pp）；
-
-完整研究文档（方法细节、扫参全表、词频融合研究）在本地研究资料库 `D:\llm-rerank-research\`。
-
 ## 安装
 
 ### 安装包（推荐）
 
-1. 下载 `weasel-llm-setup-<日期>.exe`（约 10MB：[v2026.09.05](https://github.com/zhanghaozhecn/rime-llm-ime/releases/download/v2026.09.05/weasel-llm-setup-2026.09.05.exe)｜[全部版本](https://github.com/zhanghaozhecn/rime-llm-ime/releases)）双击。全新机器无需先装官方小狼毫；已有官方小狼毫则原地升级、不动注册
+1. 到 [Releases 最新版](https://github.com/zhanghaozhecn/rime-llm-ime/releases/latest) 下载 `weasel-llm-setup-<日期>.exe`（约 10MB）双击（未签名——SmartScreen 弹"Windows 已保护你的电脑"时选"更多信息 → 仍要运行"）。全新机器无需先装官方小狼毫；已有官方小狼毫则原地升级、不动注册。系统要求：Windows 10 或更高（更早版本未验证）
 2. 安装向导最后一步是**模型下载页**：默认**暂不下载**；页上显示**当前模型位置**（读 `llm_rerank.yaml` 的 `model_path`，配置过/修改过一次即显示；空置时为默认位置 `%APPDATA%\Rime`），下载即落到该位置（约 508MB，ModelScope）。下载成功自动开启重排
-3. **在要启用的方案里加组件**（一次性，见下"方案接入"），托盘右键 → **重新部署**
+3. **在要启用的方案里加组件**（一次性）：运行安装目录下的 `schema_add.ps1`（右键"使用 PowerShell 运行"→ 列出方案选序号，自动幂等插入并触发重新部署），或按下文"方案接入"手动加一行；然后托盘右键 → **重新部署**
 4. 若装时跳过了模型：托盘右键 → **"LLM 重排设置"**，模型路径下拉框选/浏览已有 `.gguf`（状态行会提示文件是否存在）→ 勾选**启用 LLM 重排** → **保存并生效**（立即热重载）
 5. 验证：打满 4 码，首选候选出现 `AI·TSF` / `AI·COM` / `AI·历史` 标记即已生效
 
@@ -114,12 +104,22 @@ engine:
 - **某些应用里标记是 `AI·历史`**：该应用不支持光标文本采集（WPS 表格编辑态、部分 32 位应用），自动用上屏历史，属正常回退
 - **WPS 里标记是 `AI·COM`**：WPS 文字/演示经 COM 文档模型读取光标前真文（TSF 只暴露组合串，COM 读的是文档本体）——这是预期行为，2026.09.11 起支持
 - **托盘没有"LLM 重排设置"**：菜单由各应用进程内的 TSF 组件提供，已运行的应用需重启后可见，新开应用立即可见
-- **内存紧张（≤4GB）**：模型加载后服务进程约占 2GB，建议保持关闭（模型路径留空 + 不启用即不占内存）
+- **内存紧张（≤4GB）**：模型加载后服务进程常驻约 1 GB（模型 ~500 MB + 推理缓存），低内存机器建议保持关闭（模型路径留空 + 不启用即不占内存）
 - **延迟偏高**：看日志（见下）total 是否 ~40ms 量级；~80ms 说明预解码未命中或 `cpu_cores` 超物理核数
 
 ## 日志（排查）
 
 `%APPDATA%\Rime\rime_llm_filter_log.txt`：每次推理一行延迟分解（wait/S1/KV/S2/total/prep/ctx_tok/cand）与事件行（编码/候选/上文/排序结果/来源）；会话启动的 `config:` 行显示当前生效参数与配置来源。反馈问题时附上此文件。
+
+## 研究主要结论
+
+重排核心 = 对同码候选做交叉熵评分 `argmax P(wᵢ|上文)`（只排序、不生成、编码无关）。三项关键技术：**分层并行解码**（候选共享上文、≤3 次 decode，与候选数无关）、**预解码 + KV 代次**（commit 后异步算上文，按键延迟 ~43ms）、**CE 位置权重**（前 3 token 按 (1.0, 1.13, 0.61) 加权；尾部外推经端到端扫描证伪删除）。主要数字：
+
+- 首选率 **93.4%**（10 token 上文 / 5 候选，20000 样本），单字 96.8%；模型上限 ~94.3%；
+- 0.8B 即最优（2B 仅 +0.3pp 但延迟 3×、体积 2.6×）；10 tok / 5 cand 为性价比最优点；
+- 用户词频对数融合（`freq_beta=1.5`，fused = LLM分 + β·log(1+eff)）：词频无上限、强个人高频词可翻盘（本机真实窗回放事前口径 +0.4pp）；
+
+完整研究文档（方法细节、扫参全表、词频融合研究）在本地研究资料库 `D:\llm-rerank-research\`。
 
 ## 从源码构建（开发者）
 
@@ -210,4 +210,4 @@ scripts\build_llm_setup.bat     :: → bin\WeaselLLMSetup.exe
 ## 相关项目
 
 - [拼读双拼](https://github.com/zhanghaozhecn/rime-pindu-double-pinyin) — 本方案使用的编码方案（带调双拼）
-- [rime-llm-rerank](https://github.com/zhanghaozhecn/rime-llm-rerank) — 插件版（lua + DLL 路线），功能等效，上文仅用上屏历史
+- [rime-llm-rerank](https://github.com/zhanghaozhecn/rime-llm-rerank) — 插件版（lua + DLL，跑在官方小狼毫上），功能等效；上文 COM + UIA + 历史（轮询快照），本版为 TSF 采集 + COM（事件驱动）
