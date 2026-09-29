@@ -12,6 +12,8 @@
 #include <shellapi.h>
 #include <objbase.h>
 #include <string>
+#include <vector>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -21,6 +23,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")  // RegGetValue（WeaselRoot 定位部署器）
 // 视觉样式（Common Controls v6）：否则按钮/勾选框呈 Win2000 经典浮雕样式
 #pragma comment(linker, "\"/manifestdependency:type='win32' \
 name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
@@ -42,6 +45,12 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_FREQ_W       1022
 #define IDC_DEBUG        1023
 #define IDC_MAX_CAND     1024
+// 方案接入（2026-09-29 GUI 化，语义同 installer\schema_add.ps1）
+#define IDC_SCHEMA       1031
+#define IDC_SCHEMAREF    1032
+#define IDC_SCHEMAADD    1033
+#define IDC_SCHEMAREM    1034
+#define IDC_SCHEMSTAT    1035
 #define IDC_SAVE         1101
 #define IDC_CLOSE        1102
 #define IDC_STATUS       1103
@@ -236,6 +245,261 @@ static void refresh_model_status() {
                L" .gguf 文件");
 }
 
+// ---- 方案接入（语义同 installer\schema_add.ps1，2026-09-29 GUI 化）----
+// 幂等插入/剥离 llm_filter 组件行；先剥后插——插件版 lua 组件行与
+// llm_rerank 节一并剥净（跨版自动转换）。schema 文件按 UTF-8 读写
+//（原 BOM 状态保留），行尾统一 CRLF（yaml-cpp 兼容）。
+static bool read_lines(const std::wstring& path, bool* had_bom,
+                       std::vector<std::string>* lines) {
+  FILE* f = NULL;
+  _wfopen_s(&f, path.c_str(), L"rb");
+  if (!f) return false;
+  std::string data;
+  char buf[65536];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) data.append(buf, n);
+  fclose(f);
+  *had_bom = data.compare(0, 3, "\xEF\xBB\xBF") == 0;
+  if (*had_bom) data.erase(0, 3);
+  lines->clear();
+  size_t start = 0;
+  while (start <= data.size()) {
+    size_t e = data.find('\n', start);
+    std::string ln = data.substr(start, (e == std::string::npos ? data.size()
+                                                            : e) - start);
+    if (!ln.empty() && ln.back() == '\r') ln.pop_back();
+    lines->push_back(ln);
+    if (e == std::string::npos) break;
+    start = e + 1;
+  }
+  return true;
+}
+
+static bool write_lines(const std::wstring& path, bool had_bom,
+                        const std::vector<std::string>& lines) {
+  std::string data = had_bom ? "\xEF\xBB\xBF" : "";
+  for (auto& ln : lines) { data += ln; data += "\r\n"; }
+  FILE* f = NULL;
+  _wfopen_s(&f, path.c_str(), L"wb");
+  if (!f) return false;
+  fwrite(data.data(), 1, data.size(), f);
+  fclose(f);
+  return true;
+}
+
+// 行是否为列表项 "- <item>"（允许任意缩进/空白）
+static bool is_list_item(const std::string& ln, const char* item) {
+  size_t i = ln.find_first_not_of(" \t");
+  if (i == std::string::npos || ln[i] != '-') return false;
+  i = ln.find_first_not_of(" \t", i + 1);
+  if (i == std::string::npos) return false;
+  size_t n = strlen(item);
+  if (ln.compare(i, n, item) != 0) return false;
+  i += n;
+  return ln.find_first_not_of(" \t", i) == std::string::npos;
+}
+
+// 剥离两版 LLM 组件行与 llm_rerank 节（含节前空行）；返回删除行数
+static int strip_llm(std::vector<std::string>* lines) {
+  std::vector<std::string> out;
+  int removed = 0;
+  bool in_cfg = false;
+  for (auto& ln : *lines) {
+    if (in_cfg) {
+      if (!ln.empty() && !isspace((unsigned char)ln[0])) { in_cfg = false; }
+      else { removed++; continue; }
+    }
+    if (is_list_item(ln, "lua_processor@*llm_processor") ||
+        is_list_item(ln, "lua_filter@*llm_filter") ||
+        is_list_item(ln, "llm_filter")) {
+      removed++; continue;
+    }
+    // 顶格 llm_rerank: 节
+    size_t first = ln.find_first_not_of(" \t");
+    if (first != std::string::npos && ln.compare(first, 11, "llm_rerank:") == 0) {
+      removed++;
+      if (!out.empty() && out.back().empty()) { out.pop_back(); removed++; }
+      in_cfg = true;
+      continue;
+    }
+    out.push_back(ln);
+  }
+  if (removed) *lines = out;
+  return removed;
+}
+
+// filters 块内幂等插入 "    - llm_filter"：
+// uniquifier 后 → simplifier 后 → 块末；无 filters 块返回 false
+static bool insert_llm_filter(std::vector<std::string>* lines,
+                              std::wstring* where) {
+  for (auto& ln : *lines) {
+    std::string t = trim(ln);
+    if (t == "llm_filter" || t == "- llm_filter") {
+      *where = L"（已存在）";
+      return true;
+    }
+  }
+  int filt_start = -1, filt_end = -1, uniquifier = -1, simplifier = -1;
+  bool in_filt = false;
+  for (int i = 0; i < (int)lines->size(); i++) {
+    const std::string& ln = (*lines)[i];
+    if (!in_filt) {
+      size_t first = ln.find_first_not_of(" \t");
+      if (first != std::string::npos && ln[first] != ' ' && ln[first] != '\t' &&
+          ln.compare(first, 8, "filters:") == 0) {
+        // 仅 engine 下的 filters（缩进 ≥1）；顶格 filters: 不是 engine 键
+        if (first > 0) { in_filt = true; filt_start = i; }
+      }
+      continue;
+    }
+    // 顶格键 = 块结束（注意不能用 ln[first]!=' ' 判顶格——first 来自
+    // find_first_not_of，恒非空白；2026-09-29 沙箱测试抓出的真 bug）
+    if (!ln.empty() && !isspace((unsigned char)ln[0])) {
+      filt_end = i - 1;
+      break;
+    }
+    if (ln.empty()) continue;  // 块尾空行：插入点不越过它
+    std::string t = trim(ln);
+    if (t.rfind("- ", 0) == 0) {
+      std::string item = trim(t.substr(2));
+      if (item == "uniquifier") uniquifier = i;
+      if (simplifier < 0 && item == "simplifier") simplifier = i;
+    }
+    filt_end = i;
+  }
+  if (filt_start < 0 || filt_end < filt_start) return false;
+  int at = uniquifier >= 0 ? uniquifier : simplifier;
+  *where = uniquifier >= 0 ? L"uniquifier 之后"
+                           : (simplifier >= 0 ? L"simplifier 之后" : L"filters 块末尾");
+  lines->insert(lines->begin() + (at >= 0 ? at : filt_end) + 1, "    - llm_filter");
+  return true;
+}
+
+// 触发重新部署：WeaselRoot 注册表定位 WeaselDeployer，15s 有界等待
+//（deployer 曾在 EndMaintenance 管道应答中挂死——超时留后台不杀）
+static void trigger_redeploy() {
+  // 测试开关：静默跳过（结果状态行不被覆盖）
+  if (GetEnvironmentVariableW(L"WEASEL_LLM_SETUP_NO_REDEPLOY", NULL, 0)) return;
+  wchar_t root[MAX_PATH] = L"";
+  DWORD sz = sizeof(root);
+  if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Rime\\Weasel", L"WeaselRoot",
+                   RRF_RT_REG_SZ, NULL, root, &sz) != ERROR_SUCCESS || !root[0]) {
+    sz = sizeof(root);
+    RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Rime\\Weasel",
+                 L"WeaselRoot", RRF_RT_REG_SZ, NULL, root, &sz);
+  }
+  std::wstring deployer = std::wstring(root) + L"\\WeaselDeployer.exe";
+  if (!root[0] || GetFileAttributesW(deployer.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
+               L"[提示] 未定位到 WeaselDeployer，请手动：托盘小狼毫 → 重新部署");
+    return;
+  }
+  STARTUPINFOW si = {sizeof(si)};
+  PROCESS_INFORMATION pi;
+  wchar_t cmd[MAX_PATH] = L"";
+  wcscpy_s(cmd, deployer.c_str());
+  if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+    CloseHandle(pi.hThread);
+    if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_TIMEOUT)
+      set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
+                 L"重新部署仍在后台进行；若候选异常请托盘手动重新部署");
+    CloseHandle(pi.hProcess);
+  } else {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
+               L"[提示] 自动重新部署失败，请手动：托盘小狼毫 → 重新部署");
+  }
+}
+
+static void scan_schemas() {
+  HWND combo = GetDlgItem(g_hwnd, IDC_SCHEMA);
+  SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+  std::wstring dir = yaml_path();
+  if (dir.empty()) return;
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((dir + L"\\*.schema.yaml").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)fd.cFileName);
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+  if (SendMessageW(combo, CB_GETCOUNT, 0, 0) > 0)
+    SendMessageW(combo, CB_SETCURSEL, 0, 0);
+}
+
+static std::wstring selected_schema_path(bool* ok) {
+  wchar_t name[MAX_PATH];
+  if (GetDlgItemTextW(g_hwnd, IDC_SCHEMA, name, MAX_PATH) && name[0]) {
+    *ok = true;
+    return yaml_path() + L"\\" + name;
+  }
+  *ok = false;
+  return std::wstring();
+}
+
+static void on_schema_add() {
+  bool ok;
+  std::wstring path = selected_schema_path(&ok);
+  if (!ok) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
+               L"请先在下拉框选择方案文件（%APPDATA%\\Rime\\*.schema.yaml）");
+    return;
+  }
+  bool had_bom;
+  std::vector<std::string> lines;
+  if (!read_lines(path, &had_bom, &lines)) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"读取方案失败：%s", path.c_str());
+    return;
+  }
+  int removed = strip_llm(&lines);
+  std::wstring where;
+  if (!insert_llm_filter(&lines, &where)) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
+               L"[失败] 方案内未找到 engine/filters 块，无法插入组件");
+    return;
+  }
+  if (!write_lines(path, had_bom, lines)) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"写入方案失败：%s", path.c_str());
+    return;
+  }
+  if (!write_lines(path, had_bom, lines)) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"写入方案失败：%s", path.c_str());
+    return;
+  }
+  wchar_t msg[512];
+  swprintf_s(msg, L"已接入 llm_filter（%s）%s", where.c_str(),
+             removed ? L"，旧 LLM 组件已剥离" : L"");
+  set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), msg);
+  trigger_redeploy();
+}
+
+static void on_schema_remove() {
+  bool ok;
+  std::wstring path = selected_schema_path(&ok);
+  if (!ok) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
+               L"请先在下拉框选择方案文件（%APPDATA%\\Rime\\*.schema.yaml）");
+    return;
+  }
+  bool had_bom;
+  std::vector<std::string> lines;
+  if (!read_lines(path, &had_bom, &lines)) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"读取方案失败：%s", path.c_str());
+    return;
+  }
+  int removed = strip_llm(&lines);
+  if (!removed) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
+               L"未发现 LLM 组件，方案未改动");
+    return;
+  }
+  write_lines(path, had_bom, lines);
+  wchar_t msg[128];
+  swprintf_s(msg, L"已移除 LLM 组件（含配置节）共 %d 行", removed);
+  set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), msg);
+  trigger_redeploy();
+}
+
 // ---- 控件读写 ----
 static void ui_to_params() {
   g_p.enabled = SendMessageW(GetDlgItem(g_hwnd, IDC_ENABLED), BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -317,58 +581,64 @@ static void make_ui() {
   mk(0, L"浏览…", WS_TABSTOP, 447, 42, 56, 25, IDC_BROWSE);
   // 模型状态（文件存在性/大小；路径一变即刷新）
   mk(1, L"", 0, 15, 74, 539, 18, IDC_MSTATUS);
+  // ── 方案接入（一次性；语义同 installer\schema_add.ps1）──
+  HWND hdr = mk(1, L"方案接入 —— 写入选中方案并自动重新部署（幂等，跨版自动转换）",
+                0, 15, 96, 539, 18, 0);
+  SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
+  mk(1, L"方案文件:", 0, 15, 120, 68, 20, 0);
+  mk(3, L"", CBS_DROPDOWNLIST | WS_TABSTOP, 86, 115, 240, 200, IDC_SCHEMA);
+  mk(0, L"刷新", WS_TABSTOP, 332, 116, 56, 25, IDC_SCHEMAREF);
+  mk(0, L"接入 LLM", WS_TABSTOP, 394, 116, 80, 25, IDC_SCHEMAADD);
+  mk(0, L"剥离", WS_TABSTOP, 480, 116, 60, 25, IDC_SCHEMAREM);
+  mk(1, L"", 0, 15, 146, 539, 18, IDC_SCHEMSTAT);
   // ── 触发条件 ─────────────────────────────────
-  HWND hdr = mk(1, L"触发条件 —— 何时打分", 0, 15, 96, 300, 18, 0);
+  hdr = mk(1, L"触发条件 —— 何时打分", 0, 15, 172, 300, 18, 0);
   SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
-  mk(1, L"最小编码长度", 0, 15, 120, 96, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 117, 52, 22, IDC_MIN_CODE);
-  mk(1, L"最大编码长度（0=不限）", 0, 200, 120, 168, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 374, 117, 52, 22, IDC_MAX_CODE);
-  mk(1, L"最少上文 token", 0, 15, 150, 106, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 147, 52, 22, IDC_MIN_TOK);
+  mk(1, L"最小编码长度", 0, 15, 196, 96, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 193, 52, 22, IDC_MIN_CODE);
+  mk(1, L"最大编码长度（0=不限）", 0, 200, 196, 168, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 374, 193, 52, 22, IDC_MAX_CODE);
+  mk(1, L"最少上文 token", 0, 15, 226, 106, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 223, 52, 22, IDC_MIN_TOK);
   // ── 推理规模 ─────────────────────────────────
-  hdr = mk(1, L"推理规模 —— 每次算多少、多快", 0, 15, 178, 340, 18, 0);
+  hdr = mk(1, L"推理规模 —— 每次算多少、多快", 0, 15, 254, 340, 18, 0);
   SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
-  mk(1, L"上文 token 上限", 0, 15, 202, 106, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 199, 52, 22, IDC_MAX_TOK);
-  mk(1, L"候选数上限", 0, 200, 202, 96, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 374, 199, 52, 22, IDC_MAX_CAND);
-  mk(1, L"CPU 线程数", 0, 15, 232, 98, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 229, 52, 22, IDC_CORES);
+  mk(1, L"上文 token 上限", 0, 15, 278, 106, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 275, 52, 22, IDC_MAX_TOK);
+  mk(1, L"候选数上限", 0, 200, 278, 96, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 374, 275, 52, 22, IDC_MAX_CAND);
+  mk(1, L"CPU 线程数", 0, 15, 308, 98, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 305, 52, 22, IDC_CORES);
   // ── 候选排序融合：公式两行，β/elw 挖空与作用项对齐（两框同列 x=127）──
-  hdr = mk(1, L"候选排序融合 —— 分数怎么合成", 0, 15, 260, 380, 18, 0);
+  hdr = mk(1, L"候选排序融合 —— 分数怎么合成", 0, 15, 336, 380, 18, 0);
   SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
-  mk(1, L"融合分 = score + ", 0, 15, 284, 108, 20, 0);
-  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 281, 50, 22, IDC_FREQ_W);
-  mk(1, L"·log(1+eff)", 0, 181, 284, 82, 20, 0);
-  mk(1, L"+", SS_RIGHT, 15, 312, 108, 20, 0);
-  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 309, 50, 22, IDC_ELW);
-  mk(1, L"·span·匹配词长", 0, 181, 312, 130, 20, 0);
+  mk(1, L"融合分 = score + ", 0, 15, 360, 108, 20, 0);
+  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 357, 50, 22, IDC_FREQ_W);
+  mk(1, L"·log(1+eff)", 0, 181, 360, 82, 20, 0);
+  mk(1, L"+", SS_RIGHT, 15, 388, 108, 20, 0);
+  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 385, 50, 22, IDC_ELW);
+  mk(1, L"·span·匹配词长", 0, 181, 388, 130, 20, 0);
   mk(1, L"β = 词频系数（0=关闭）；elw = 预期词长权重（0=关闭）",
-     0, 15, 340, 420, 18, 0);
+     0, 15, 416, 420, 18, 0);
   mk(1, L"elw 仅两码一字方案生效：词长=码长/2 的候选获得 span×elw 加成",
-     0, 15, 360, 480, 18, 0);
+     0, 15, 436, 480, 18, 0);
   // ── 保存 / 状态 ──────────────────────────────
-  mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, 15, 386, 110, 30,
+  mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, 15, 462, 110, 30,
      IDC_SAVE);
-  mk(0, L"关闭", WS_TABSTOP, 133, 386, 70, 30, IDC_CLOSE);
-  mk(0, L"打开用户文件夹", WS_TABSTOP, 440, 388, 114, 26, IDC_OPENDIR);
-  mk(1, L"", 0, 213, 392, 215, 18, IDC_STATUS);
+  mk(0, L"关闭", WS_TABSTOP, 133, 462, 70, 30, IDC_CLOSE);
+  mk(0, L"打开用户文件夹", WS_TABSTOP, 440, 464, 114, 26, IDC_OPENDIR);
+  mk(1, L"", 0, 213, 468, 215, 18, IDC_STATUS);
   SYSTEM_INFO si;
   GetSystemInfo(&si);
   wchar_t note2[128];
   swprintf_s(note2,
              L"参数键名与 llm_rerank.yaml 相同；修改保存后立即生效（本机逻辑核 %lu）",
              si.dwNumberOfProcessors);
-  mk(1, note2, 0, 15, 422, 539, 18, 0);
+  mk(1, note2, 0, 15, 498, 539, 18, 0);
   // ── 排障 ────────────────────────────────────
   // 诊断开关（2026-09-04 GUI 化；此前仅 yaml 手改）：排障时逐步评分
   mk(0, L"诊断日志 debug_fusion（逐块评分明细写用户文件夹 rime_llm_debug.txt）",
-     BS_AUTOCHECKBOX | WS_TABSTOP, 15, 446, 539, 22, IDC_DEBUG);
-  // llm_filter 为显式组件：GUI 只管参数，方案未列出则不参与重排（防"开了
-  // 却没效果"的静默困惑）
-  mk(1, L"方案需在 engine/filters 列出 llm_filter 并重新部署才生效（详见 README）",
-     0, 15, 474, 539, 18, 0);
+     BS_AUTOCHECKBOX | WS_TABSTOP, 15, 522, 539, 22, IDC_DEBUG);
 }
 
 static void on_browse() {
@@ -415,6 +685,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       make_ui();
       load_params();
       params_to_ui();
+      scan_schemas();
       // 忘关提醒（2026-09-04）：诊断开着会持续写盘，打开设置时点一下
       if (g_p.debug_fusion)
         set_status(GetDlgItem(h, IDC_STATUS),
@@ -429,6 +700,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       switch (LOWORD(wp)) {
         case IDC_BROWSE: on_browse(); return 0;
         case IDC_OPENDIR: on_open_dir(); return 0;
+        case IDC_SCHEMAREF: scan_schemas(); return 0;
+        case IDC_SCHEMAADD: on_schema_add(); return 0;
+        case IDC_SCHEMAREM: on_schema_remove(); return 0;
         case IDC_SAVE: {
           ui_to_params();
           if (save_params())
@@ -463,7 +737,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   HWND h = CreateWindowExW(WS_EX_APPWINDOW, L"WeaselLLMSetup",
                            L"LLM 重排设置 — 小狼毫", WS_OVERLAPPEDWINDOW &
                                ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 585, 540, NULL, NULL,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 585, 592, NULL, NULL,
                            inst, NULL);
   ShowWindow(h, show);
   UpdateWindow(h);

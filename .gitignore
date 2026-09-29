@@ -80,6 +80,7 @@ server_out.log
 server_err.log
 bin/deploy_update.log
 !scripts/test_ctx_auto.py
+!scripts/test_schema_gui.ps1
 
 .vscode/
 !scripts/release_gh.py
