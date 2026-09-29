@@ -111,7 +111,8 @@ static double g_freq_beta = 1.5;
 // 无法区分具体编辑键)。默认 false, 关闭时仅一次 bool 读零开销。
 static bool g_debug_fusion = false;
 // COM 文档模型光标上文旁路开关 (2026-09-10 WPS 实验移植, 默认开; 定义与
-// 模块见下方 comctx 节 / 消费点 GetContextTextPair)
+// 模块见下方 comctx 节 / 消费点 GetContextTextPair)。2026-09-29 定案删
+// com_context 配置项（两版同步）：旁路无常关配置，排障直接改此值重编。
 static bool g_com_ctx_enabled = true;
 static int g_min_tokens = 1;
 static int g_max_ctx_tokens = 10;  // tok=10: 93.4% acc, 10->17 gains only +1.1pp
@@ -140,7 +141,6 @@ struct LlmParamSet {
   bool has_max_cand = false;     int max_cand = 5;
   bool has_cpu_cores = false;    int cpu_cores = 4;
   bool has_debug_fusion = false; bool debug_fusion = false;
-  bool has_com_ctx = false;      bool com_ctx = true;
   bool has_model_path = false;   std::string model_path;
 };
 static LlmParamSet g_schema_params;  // Initialize 时快照（部署期固定）
@@ -164,9 +164,8 @@ static void llm_apply_params() {
   g_debug_fusion = s.has_debug_fusion
                        ? s.debug_fusion
                        : (y.has_debug_fusion ? y.debug_fusion : false);
-  g_com_ctx_enabled = s.has_com_ctx
-                          ? s.com_ctx
-                          : (y.has_com_ctx ? y.com_ctx : true);
+  // g_com_ctx_enabled 不再读配置（2026-09-29 删 com_context 配置项）——
+  // 保持定义处 true，排障改代码重编
   g_min_tokens =
       s.has_min_tokens ? s.min_tokens : (y.has_min_tokens ? y.min_tokens : 1);
   g_max_ctx_tokens = s.has_max_tokens
@@ -244,7 +243,6 @@ static void llm_load_global_params() {
     else if (key == "max_candidates") { p.has_max_cand = true; p.max_cand = atoi(val.c_str()); }
     else if (key == "cpu_cores") { p.has_cpu_cores = true; p.cpu_cores = atoi(val.c_str()); }
     else if (key == "debug_fusion") { p.has_debug_fusion = true; p.debug_fusion = (val == "true"); }
-    else if (key == "com_context") { p.has_com_ctx = true; p.com_ctx = (val == "true"); }
     else if (key == "model_path") { p.has_model_path = true; p.model_path = val; }
   }
   fclose(f);
@@ -316,7 +314,8 @@ static int g_limited_gen_seen = 0;
 //
 // 消费语义 (见 GetContextTextPair): 仅粘性降级 (g_ctx_limited, WPS 类
 // 应用) 场景 — COM 缓存新鲜 → {com_text, "com"} (徽章仍 AI·TSF);
-// 失败/过期/com_context 关闭 → 原 {hist, "rime"} (八轮方案零改动)。
+// 失败/过期/总开关关（代码级，见 g_com_ctx_enabled）→ 原 {hist, "rime"}
+// (八轮方案零改动)。
 // 好应用零开销: 线程懒启动 (首次降级命中才起), 前台 Office 才读 +
 // 未附着 500ms 快速重试 / 附着后 2s 周期 (与插件版同款; 2026-09-11
 // 审查发现历史 backoff 指数退避为死变量——附着成功即复位, 稳态实际
@@ -2105,10 +2104,6 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     if (config->GetBool("llm_rerank/debug_fusion", &b)) {
       p.has_debug_fusion = true;
       p.debug_fusion = b;
-    }
-    if (config->GetBool("llm_rerank/com_context", &b)) {
-      p.has_com_ctx = true;
-      p.com_ctx = b;
     }
     int v = 0;
     if (config->GetInt("llm_rerank/min_code_len", &v)) { p.has_min_code_len = true; p.min_code_len = v; }
