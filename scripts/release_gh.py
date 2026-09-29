@@ -22,7 +22,10 @@ import time
 
 GH = r"C:\Users\Administrator\bin\gh.exe"
 REPO = "zhanghaozhecn/rime-llm-ime"
-os.environ["HTTPS_PROXY"] = "http://localhost:15236"  # 本机系统代理
+# 代理可选（2026-09-29）：原硬编码 localhost:15236 的系统代理已停用，
+# 直连 GitHub 可通；需要代理时设环境变量 GH_PROXY（如 http://localhost:15236）
+if os.environ.get("GH_PROXY"):
+    os.environ["HTTPS_PROXY"] = os.environ["GH_PROXY"]
 
 
 def run(args, input_text=None, tries=5):
