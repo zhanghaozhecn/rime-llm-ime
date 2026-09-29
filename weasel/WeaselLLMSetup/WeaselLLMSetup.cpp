@@ -58,6 +58,7 @@ struct Params {
 static Params g_p;
 static HWND g_hwnd;
 static HFONT g_font;
+static HFONT g_font_bold;  // 分节标题
 
 // ---- 工具 ----
 static std::wstring yaml_path() {
@@ -267,18 +268,18 @@ static void params_to_ui() {
                g_p.debug_fusion ? BST_CHECKED : BST_UNCHECKED, 0);
   SetDlgItemTextW(g_hwnd, IDC_MODEL, shown_model().c_str());
   wchar_t buf[64];
-  struct { int id; int v; const wchar_t* fmt; } rows[] = {
-      {IDC_MIN_CODE, g_p.min_code_len, L"%d"}, {IDC_MAX_CODE, g_p.max_code_len, L"%d"},
-      {IDC_MIN_TOK, g_p.min_tokens, L"%d"},    {IDC_MAX_TOK, g_p.max_tokens, L"%d"},
-      {IDC_CORES, g_p.cpu_cores, L"%d"},       {IDC_ELW, 0, L"%.2f"},
-      {IDC_FREQ_W, 0, L"%.2f"},
-      {IDC_MAX_CAND, g_p.max_candidates, L"%d"}};
+  struct { int id; int v; } rows[] = {
+      {IDC_MIN_CODE, g_p.min_code_len}, {IDC_MAX_CODE, g_p.max_code_len},
+      {IDC_MIN_TOK, g_p.min_tokens},    {IDC_MAX_TOK, g_p.max_tokens},
+      {IDC_CORES, g_p.cpu_cores},       {IDC_MAX_CAND, g_p.max_candidates}};
   for (auto& r : rows) {
-    if (r.fmt[1] == L'd') swprintf_s(buf, L"%d", r.v);
-    else if (r.id == IDC_ELW) swprintf_s(buf, L"%.2f", g_p.elw);
-    else swprintf_s(buf, L"%.2f", g_p.freq_beta);
+    swprintf_s(buf, L"%d", r.v);
     SetDlgItemTextW(g_hwnd, r.id, buf);
   }
+  swprintf_s(buf, L"%.2f", g_p.freq_beta);
+  SetDlgItemTextW(g_hwnd, IDC_FREQ_W, buf);
+  swprintf_s(buf, L"%.2f", g_p.elw);
+  SetDlgItemTextW(g_hwnd, IDC_ELW, buf);
   scan_models(GetDlgItem(g_hwnd, IDC_MODEL));
   refresh_model_status();
 }
@@ -294,64 +295,80 @@ static HWND mk(int cls, const wchar_t* text, DWORD style, int x, int y, int w,
   return ctl;
 }
 
-struct Lbl { const wchar_t* t; int x, y; };
 // 布局铁律：任何控件的矩形不得与其他控件相交——不透明子控件按 z 序
 // 覆盖先画者，会把被覆盖控件的文字"局部擦除"成叠字残片（2026-08-27
 // 叠字事故根因：勾选框 w430 与下行标签矩形相交 + 空状态静态框横贯
-// 首行）。每行独占一个水平带，互不入侵。
+// 首行）。分节标题与每行参数独占一个水平带，行内 label 止于 edit x 前。
+// 分组（2026-09-29，按用途）：总控（启用+模型）/ 触发条件（何时打分）/
+// 推理规模（每次算多少）/ 候选排序融合（分数怎么合成）/ 排障（诊断）。
 static void make_ui() {
   g_font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
                        CLEARTYPE_QUALITY, 0, L"Segoe UI");
+  g_font_bold = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
+                            0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+  // ── 总控（不加标题，自明）──────────────────────
   mk(0, L"启用 LLM 重排（保存后立即生效，无需重新部署）",
      BS_AUTOCHECKBOX | WS_TABSTOP, 15, 12, 470, 22, IDC_ENABLED);
-  // 第 2 行：模型路径下拉框（可编辑：当前值 + 扫描到的 .gguf；高度含
-  // 下拉列表，闭合时只占顶部 ~24px，展开覆盖下方是组合框固有行为）
+  // 模型路径下拉框（可编辑：当前值 + 扫描到的 .gguf；高度含下拉列表，
+  // 闭合时只占顶部 ~24px，展开覆盖下方是组合框固有行为）
   mk(1, L"模型路径:", 0, 15, 46, 68, 20, 0);
   mk(3, L"", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_TABSTOP, 86, 41, 355, 200,
      IDC_MODEL);
   mk(0, L"浏览…", WS_TABSTOP, 447, 42, 56, 25, IDC_BROWSE);
-  // 第 3 行：模型状态（文件存在性/大小；路径一变即刷新）
+  // 模型状态（文件存在性/大小；路径一变即刷新）
   mk(1, L"", 0, 15, 74, 539, 18, IDC_MSTATUS);
-  // 参数两列（键名与 llm_rerank.yaml 相同，见下方说明）
-  Lbl c1[] = {{L"最小编码长度", 15, 106},
-              {L"最大编码长度（0=不限）", 15, 136},
-              {L"最少上文 token", 15, 166},
-              {L"上文 token 上限", 15, 196},
-              {L"CPU 线程数", 15, 226}};
-  int i1[] = {IDC_MIN_CODE, IDC_MAX_CODE, IDC_MIN_TOK, IDC_MAX_TOK, IDC_CORES};
-  for (int i = 0; i < 5; i++) {
-    mk(1, c1[i].t, 0, c1[i].x, c1[i].y, 168, 20, 0);
-    mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 186, c1[i].y - 3, 60, 22,
-       i1[i]);
-  }
-  struct { const wchar_t* t; int y; int id; } col2[] = {
-      {L"预期词长权重", 106, IDC_ELW}, {L"词频β", 136, IDC_FREQ_W},
-      {L"候选数上限", 166, IDC_MAX_CAND}};
-  for (auto& r : col2) {
-    mk(1, r.t, 0, 302, r.y, 126, 20, 0);
-    mk(2, L"", WS_BORDER | WS_TABSTOP, 430, r.y - 3, 60, 22, r.id);
-  }
-  mk(1, L"说明：预期词长权重适用于两码一字方案（词长 = 码长/2 加分）",
-     0, 15, 262, 539, 20, 0);
+  // ── 触发条件 ─────────────────────────────────
+  HWND hdr = mk(1, L"触发条件 —— 何时打分", 0, 15, 96, 300, 18, 0);
+  SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
+  mk(1, L"最小编码长度", 0, 15, 120, 96, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 117, 52, 22, IDC_MIN_CODE);
+  mk(1, L"最大编码长度（0=不限）", 0, 200, 120, 168, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 374, 117, 52, 22, IDC_MAX_CODE);
+  mk(1, L"最少上文 token", 0, 15, 150, 106, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 147, 52, 22, IDC_MIN_TOK);
+  // ── 推理规模 ─────────────────────────────────
+  hdr = mk(1, L"推理规模 —— 每次算多少、多快", 0, 15, 178, 340, 18, 0);
+  SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
+  mk(1, L"上文 token 上限", 0, 15, 202, 106, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 199, 52, 22, IDC_MAX_TOK);
+  mk(1, L"候选数上限", 0, 200, 202, 96, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 374, 199, 52, 22, IDC_MAX_CAND);
+  mk(1, L"CPU 线程数", 0, 15, 232, 98, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 229, 52, 22, IDC_CORES);
+  // ── 候选排序融合：公式两行，β/elw 挖空与作用项对齐（两框同列 x=127）──
+  hdr = mk(1, L"候选排序融合 —— 分数怎么合成", 0, 15, 260, 380, 18, 0);
+  SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
+  mk(1, L"融合分 = score + ", 0, 15, 284, 108, 20, 0);
+  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 281, 50, 22, IDC_FREQ_W);
+  mk(1, L"·log(1+eff)", 0, 181, 284, 82, 20, 0);
+  mk(1, L"+", SS_RIGHT, 15, 312, 108, 20, 0);
+  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 309, 50, 22, IDC_ELW);
+  mk(1, L"·span·匹配词长", 0, 181, 312, 130, 20, 0);
+  mk(1, L"β = 词频系数（0=关闭）；elw = 预期词长权重（0=关闭）",
+     0, 15, 340, 420, 18, 0);
+  mk(1, L"elw 仅两码一字方案生效：词长=码长/2 的候选获得 span×elw 加成",
+     0, 15, 360, 480, 18, 0);
+  // ── 保存 / 状态 ──────────────────────────────
+  mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, 15, 386, 110, 30,
+     IDC_SAVE);
+  mk(0, L"关闭", WS_TABSTOP, 133, 386, 70, 30, IDC_CLOSE);
+  mk(0, L"打开用户文件夹", WS_TABSTOP, 440, 388, 114, 26, IDC_OPENDIR);
+  mk(1, L"", 0, 213, 392, 215, 18, IDC_STATUS);
   SYSTEM_INFO si;
   GetSystemInfo(&si);
   wchar_t note2[128];
   swprintf_s(note2,
              L"参数键名与 llm_rerank.yaml 相同；修改保存后立即生效（本机逻辑核 %lu）",
              si.dwNumberOfProcessors);
-  mk(1, note2, 0, 15, 282, 539, 20, 0);
-  mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, 15, 302, 110, 30,
-     IDC_SAVE);
-  mk(0, L"关闭", WS_TABSTOP, 133, 302, 70, 30, IDC_CLOSE);
-  mk(0, L"打开用户文件夹", WS_TABSTOP, 440, 304, 114, 26, IDC_OPENDIR);
-  mk(1, L"", 0, 213, 308, 215, 18, IDC_STATUS);
+  mk(1, note2, 0, 15, 422, 539, 18, 0);
+  // ── 排障 ────────────────────────────────────
   // 诊断开关（2026-09-04 GUI 化；此前仅 yaml 手改）：排障时逐步评分
   mk(0, L"诊断日志 debug_fusion（逐块评分明细写用户文件夹 rime_llm_debug.txt）",
-     BS_AUTOCHECKBOX | WS_TABSTOP, 15, 336, 539, 22, IDC_DEBUG);
+     BS_AUTOCHECKBOX | WS_TABSTOP, 15, 446, 539, 22, IDC_DEBUG);
   // llm_filter 为显式组件：GUI 只管参数，方案未列出则不参与重排（防"开了
   // 却没效果"的静默困惑）
   mk(1, L"方案需在 engine/filters 列出 llm_filter 并重新部署才生效（详见 README）",
-     0, 15, 364, 539, 18, 0);
+     0, 15, 474, 539, 18, 0);
 }
 
 static void on_browse() {
@@ -446,7 +463,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   HWND h = CreateWindowExW(WS_EX_APPWINDOW, L"WeaselLLMSetup",
                            L"LLM 重排设置 — 小狼毫", WS_OVERLAPPEDWINDOW &
                                ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 585, 438, NULL, NULL,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 585, 540, NULL, NULL,
                            inst, NULL);
   ShowWindow(h, show);
   UpdateWindow(h);
