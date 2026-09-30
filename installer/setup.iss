@@ -1,4 +1,4 @@
-﻿; setup.iss — 小狼毫 LLM 版安装包（Inno Setup，2026-08-27 直接安装版）
+; setup.iss — 小狼毫 LLM 版安装包（Inno Setup，2026-08-27 直接安装版）
 ; 编译（开发机，installer\ 目录）: ..\scripts\build_pkg.bat 或
 ;   ISCC.exe setup.iss
 ; 产物: dist\weasel-llm-setup-<版本>.exe（约 15MB，不含模型——装后托盘
@@ -23,7 +23,7 @@
 ;               不再提供下载。
 
 #define MyAppName "小狼毫 LLM 版"
-#define MyAppVer "2026.09.29-2"  ; 同日重打安装包在日期后加 -2/-3 序号（2026-09-11 用户定案，避免同号不同内容）
+#define MyAppVer "2026.09.30"  ; 同日重打安装包在日期后加 -2/-3 序号（2026-09-11 用户定案，避免同号不同内容）
 #define MyAppId "{{3F8A2D5C-6B1E-4F9A-8D73-9C2E5B7A1F40}"
 
 [Setup]
