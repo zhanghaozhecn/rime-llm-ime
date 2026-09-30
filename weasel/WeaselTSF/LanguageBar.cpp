@@ -1,4 +1,4 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 #include <resource.h>
 #include <thread>
 #include <shellapi.h>
@@ -310,8 +310,9 @@ void WeaselTSF::_HandleLangBarMenuSelect(UINT wID) {
       }
       break;
     case ID_WEASELTRAY_LLM_SETUP:
-      // LLM 重排设置 GUI（直接安装版）：从安装目录启动 WeaselLLMSetup.exe，
-      // 读写全局 llm_rerank.yaml（llm_filter 热重载即时生效）
+      // LLM 重排设置 GUI：从安装目录启动 WeaselLLMSetup.exe——读写的
+      // 是所选方案的 llm_rerank 配置节（2026-09-30 起配置在方案里，
+      // 保存后由 GUI 触发重新部署生效）
       if (RegGetStringValue(HKEY_LOCAL_MACHINE, GetWeaselRegName(),
                             L"WeaselRoot", dir) == ERROR_SUCCESS) {
         std::thread th([dir]() {

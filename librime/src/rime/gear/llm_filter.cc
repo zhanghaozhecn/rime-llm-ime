@@ -10,8 +10,9 @@
 // 列出 llm_filter 才参与重排——位置由方案与其他 filter 的先后关系决定
 //（如需在 simplifier/uniquifier 之后，由方案作者自行安排）。未列出 =
 // 该方案无 LLM 重排。enabled 仍为运行时开关（默认 false 纯透传），
-// 参数优先级 schema llm_rerank 节 > 全局 %APPDATA%\Rime\llm_rerank.yaml
-//（GUI 写入，Apply 按 mtime|size 指纹热重载）。
+// 参数只来自**方案 schema.yaml 的 llm_rerank: 配置节**（2026-09-30 定案：
+// 与插件版统一，取消全局 %APPDATA%\Rime\llm_rerank.yaml；改配置 = 改方案，
+// 由 GUI 触发重新部署，部署期快照，无热重载）。
 //
 #include <rime/gear/llm_filter.h>
 #include <rime/candidate.h>
@@ -67,7 +68,7 @@ static std::atomic<bool> g_loading{false};
 //                 例：'.{4}' 恰 4 码 / '.{4,}' 4 码以上 / '.{3,4}' / '[abcde]{4}'；
 //                 空串 = 不限制；非法模式回退默认 '.{4}' 并写日志。
 //   min_code_len / max_code_len: **旧键，已不生效**（解析保留仅为兼容历史
-//                 yaml；等价换算 min=4,max=0 ⇒ code_pattern '.{4}'）
+//                 方案；等价换算 min=4,max=0 ⇒ code_pattern '.{4}'）
 //   expected_length_weight: >0 = bonus candidates whose word length equals
 //                 floor(code_len/2) (两码一字), weighted by current score span
 //   freq_beta: 用户词频对数融合 fused = score + β·log(1+eff)（score=原始
@@ -80,10 +81,11 @@ static std::atomic<bool> g_loading{false};
 // CE 位置权重 (2026-09-16, 与插件版同源, 首项归一规范形 (1,1.13,0.61)): ce2 判别
 //   力最强(上下文契合+词内连贯), ce3 深入词内部降权; 4+ token 词只算前三
 //   项——尾部外推证伪删除(λ 0→1 端到端命中率单调递减, λ=0 最优)。
-// 全局配置（2026-08-27 直接安装版）: %APPDATA%\Rime\llm_rerank.yaml（GUI
-// 写入, 平面 key: value, Apply 时按 mtime|size 热重载）; 优先级 schema 节 >
-// 全局 yaml > 内置默认。2026-08-29 起为显式组件：方案 engine/filters 列出
-// llm_filter 才参与重排（enabled 默认 false 纯透传）。
+// 参数来源（2026-09-30 用户定案，两版统一）：**只读方案的 llm_rerank 配置节**
+//（%APPDATA%\Rime\*.schema.yaml；GUI/接入助手写入，部署期快照）——全局
+// %APPDATA%\Rime\llm_rerank.yaml 已取消，与插件版（rime-lua 读同一节）一致：
+// 改参数 = 改方案 + 重新部署，不再有 mtime 热重载。2026-08-29 起为显式组件：
+// 方案 engine/filters 列出 llm_filter 才参与重排（enabled 默认 false 纯透传）。
 // 默认模型路径 = RIME 用户目录根\Qwen...gguf（2026-08-31 用户澄清定案：
 // "用户文件夹"= 小狼毫右键的用户文件夹——方案配置所在处，模型直接放根
 // 目录、不套子文件夹，与 simplifier 取 user_data_dir 同源；8-27 曾误用
@@ -106,7 +108,7 @@ static bool g_enabled = false;  // CPU only; GPU build retired (not published)
 // 触发条件（2026-09-30 起）：编码串是否匹配 code_pattern，**全串匹配**，
 // 语义与引擎同 Rime 自身的 speller/auto_select_pattern（boost::regex_match）。
 // 取代旧的两个整数键 min_code_len / max_code_len（用户配置面已移除；解析端
-// 保留 has_min/max 字段仅为兼容历史 yaml，本过滤层不再读它们）。
+// 保留 has_min/max 字段仅为兼容历史方案，本过滤层不再读它们）。
 // 默认 ".{4}" = 恰 4 码，与旧默认（min=4, max=0 不限）生产主路径一致。
 static const char *kDefaultCodePattern = ".{4}";
 static std::string g_code_pattern = kDefaultCodePattern;
@@ -139,10 +141,12 @@ static int g_n_ctx = 128;          // KV: 11 seqs x (ctx 10 + cand 2) = 132, 64 
 static int g_n_seq_max = 12;       // template seq 0 + up to 11 worker seqs
 static int g_max_candidates = 5;   // candidates participating in scoring
 
-// ==== 参数三级合并（2026-08-27 直接安装版）: schema llm_rerank 节 > 全局
-// llm_rerank.yaml（%APPDATA%\Rime，GUI 写入）> 内置默认。全局文件热重载
-//（Apply 时 stat mtime|size 指纹，变了重读合并；enabled 关→开触发模型异步
-// 加载；model_path 热改不重载模型，需重启会话）。engine 线程调用。 ====
+// ==== 参数来源（2026-09-30 用户定案：两版统一回归 Rime 原生做法）====
+// **只读方案 schema.yaml 的 llm_rerank: 配置节**（部署期快照 Apply/Initialize）。
+// 全局 %APPDATA%\Rime\llm_rerank.yaml 层**已取消**：与插件版一样，配置写在
+// 方案里、改完由 GUI 触发重新部署（enabled / model_path 变更随之生效）。
+// 旧键 min_code_len / max_code_len / min_tokens 仍解析（兼容历史方案），
+// 但不再参与判定（触发条件 = code_pattern；最少上文 token 恒 1）。
 struct LlmParamSet {
   bool has_enabled = false;      bool enabled = false;
   bool has_min_code_len = false; int min_code_len = 4;   // 旧键：解析保留、不再生效
@@ -157,18 +161,14 @@ struct LlmParamSet {
   bool has_debug_fusion = false; bool debug_fusion = false;
   bool has_model_path = false;   std::string model_path;
 };
-static LlmParamSet g_schema_params;  // Initialize 时快照（部署期固定）
-static LlmParamSet g_yaml_params;    // 全局 yaml（热重载）
-static unsigned long long g_yaml_stamp = 0;  // mtime|size 变更指纹
+static LlmParamSet g_schema_params;  // 方案 llm_rerank 节快照（部署期固定）
 static void load_model_async();      // fwd decl（定义在下方）
 
 static void llm_apply_params() {
-  const LlmParamSet &s = g_schema_params, &y = g_yaml_params;
-  g_enabled = s.has_enabled ? s.enabled : (y.has_enabled ? y.enabled : false);
-  // 触发条件：code_pattern（三级优先级）。空串 = 不限制（总是匹配）。
-  g_code_pattern = s.has_code_pattern
-                       ? s.code_pattern
-                       : (y.has_code_pattern ? y.code_pattern : kDefaultCodePattern);
+  const LlmParamSet &s = g_schema_params;
+  g_enabled = s.has_enabled ? s.enabled : false;
+  // 触发条件：code_pattern。空串 = 不限制（总是匹配）。
+  g_code_pattern = s.has_code_pattern ? s.code_pattern : kDefaultCodePattern;
   g_code_re_ok = true;
   if (!g_code_pattern.empty()) {
     try {
@@ -184,144 +184,27 @@ static void llm_apply_params() {
       }
     }
   }
-  // 旧键 min/max_code_len 仍解析（兼容历史 yaml），但**不再参与触发判定**；
+  // 旧键 min/max_code_len 仍解析（兼容历史方案），但**不再参与触发判定**；
   // 仅保留数值以免日志/兼容字段为空。
-  g_min_code_len = s.has_min_code_len ? s.min_code_len
-                                      : (y.has_min_code_len ? y.min_code_len : 4);
-  g_max_code_len = s.has_max_code_len ? s.max_code_len
-                                      : (y.has_max_code_len ? y.max_code_len : 0);
-  g_expected_length_weight =
-      s.has_elw ? s.elw : (y.has_elw ? y.elw : 0.2);
-  g_freq_beta = s.has_freq_beta ? s.freq_beta
-                                : (y.has_freq_beta ? y.freq_beta : 1.5);
-  g_debug_fusion = s.has_debug_fusion
-                       ? s.debug_fusion
-                       : (y.has_debug_fusion ? y.debug_fusion : false);
+  g_min_code_len = s.has_min_code_len ? s.min_code_len : 4;
+  g_max_code_len = s.has_max_code_len ? s.max_code_len : 0;
+  g_expected_length_weight = s.has_elw ? s.elw : 0.2;
+  g_freq_beta = s.has_freq_beta ? s.freq_beta : 1.5;
+  g_debug_fusion = s.has_debug_fusion ? s.debug_fusion : false;
   // g_com_ctx_enabled 不再读配置（2026-09-29 删 com_context 配置项）——
   // 保持定义处 true，排障改代码重编
-  g_min_tokens =
-      s.has_min_tokens ? s.min_tokens : (y.has_min_tokens ? y.min_tokens : 1);
-  g_max_ctx_tokens = s.has_max_tokens
-                         ? s.max_tokens
-                         : (y.has_max_tokens ? y.max_tokens : 10);
-  g_max_candidates =
-      s.has_max_cand ? s.max_cand : (y.has_max_cand ? y.max_cand : 5);
-  g_n_threads =
-      s.has_cpu_cores ? s.cpu_cores : (y.has_cpu_cores ? y.cpu_cores : 4);
+  g_min_tokens = s.has_min_tokens ? s.min_tokens : 1;
+  g_max_ctx_tokens = s.has_max_tokens ? s.max_tokens : 10;
+  g_max_candidates = s.has_max_cand ? s.max_cand : 5;
+  g_n_threads = s.has_cpu_cores ? s.cpu_cores : 4;
   // cap threads at hardware cores: 低核机器不应超订（变慢 + 每线程额外内存）
   unsigned hw = std::thread::hardware_concurrency();
   if (hw > 0 && (unsigned)g_n_threads > hw)
     g_n_threads = (int)hw;
-  g_model_path = s.has_model_path
-                     ? s.model_path
-                     : (y.has_model_path ? y.model_path
-                                         : default_model_path());
-}
-
-// 全局 llm_rerank.yaml 路径（与 user_freq.tsv 同目录解析）
-static bool llm_global_file(char *path, size_t n) {
-  const RimeApi *api = rime_get_api();
-  if (api && api->get_user_data_dir) {
-    const char *ud = api->get_user_data_dir();
-    if (ud && *ud) {
-      snprintf(path, n, "%s\\llm_rerank.yaml", ud);
-      return true;
-    }
-  }
-  return false;
-}
-
-static std::string llm_trim(const std::string &s) {
-  size_t a = s.find_first_not_of(" \t");
-  size_t b = s.find_last_not_of(" \t\r\n");
-  return (a == std::string::npos) ? std::string() : s.substr(a, b - a + 1);
-}
-
-// 扁平 key: value 解析（GUI 生成的平面 yaml；坏行跳过；值支持行内 # 注释
-// 与成对引号）
-static void llm_load_global_params() {
-  g_yaml_params = LlmParamSet();
-  char path[MAX_PATH];
-  if (!llm_global_file(path, sizeof(path)))
-    return;
-  FILE *f = fopen(path, "r");
-  if (!f)
-    return;
-  char line[512];
-  while (fgets(line, sizeof(line), f)) {
-    std::string ln = llm_trim(line);
-    if (ln.empty() || ln[0] == '#')
-      continue;
-    size_t c = ln.find(':');
-    if (c == std::string::npos)
-      continue;
-    std::string key = llm_trim(ln.substr(0, c));
-    std::string val = llm_trim(ln.substr(c + 1));
-    // 引号值：双引号（历史 model_path 风格）与单引号（code_pattern 正则风格，
-    // 2026-09-30）都要支持——只认双引号会让正则值带壳匹配失败。
-    if (!val.empty() && (val[0] == '"' || val[0] == '\'')) {
-      size_t e = val.find(val[0], 1);
-      val = (e == std::string::npos) ? val.substr(1) : val.substr(1, e - 1);
-    } else {  // 行内注释（引号内的 # 不视为注释）
-      size_t h = val.find('#');
-      if (h != std::string::npos)
-        val = llm_trim(val.substr(0, h));
-    }
-    LlmParamSet &p = g_yaml_params;
-    if (key == "enabled") { p.has_enabled = true; p.enabled = (val == "true"); }
-    else if (key == "code_pattern") { p.has_code_pattern = true; p.code_pattern = val; }
-    // 旧键 min_code_len / max_code_len 仍解析（兼容历史 yaml），但触发判定只用
-    // code_pattern（2026-09-30 定案）；等价换算：min=4,max=0 ⇒ code_pattern '.{4}'
-    else if (key == "min_code_len") { p.has_min_code_len = true; p.min_code_len = atoi(val.c_str()); }
-    else if (key == "max_code_len") { p.has_max_code_len = true; p.max_code_len = atoi(val.c_str()); }
-    else if (key == "expected_length_weight") { p.has_elw = true; p.elw = atof(val.c_str()); }
-    else if (key == "freq_beta") { p.has_freq_beta = true; p.freq_beta = atof(val.c_str()); }
-    else if (key == "min_tokens") { p.has_min_tokens = true; p.min_tokens = atoi(val.c_str()); }
-    else if (key == "max_tokens") { p.has_max_tokens = true; p.max_tokens = atoi(val.c_str()); }
-    else if (key == "max_candidates") { p.has_max_cand = true; p.max_cand = atoi(val.c_str()); }
-    else if (key == "cpu_cores") { p.has_cpu_cores = true; p.cpu_cores = atoi(val.c_str()); }
-    else if (key == "debug_fusion") { p.has_debug_fusion = true; p.debug_fusion = (val == "true"); }
-    else if (key == "model_path") { p.has_model_path = true; p.model_path = val; }
-  }
-  fclose(f);
-}
-
-static unsigned long long llm_yaml_stamp() {
-  char path[MAX_PATH];
-  if (!llm_global_file(path, sizeof(path)))
-    return 0;
-  WIN32_FILE_ATTRIBUTE_DATA fa;
-  if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fa))
-    return 0;  // 文件不存在 = 空指纹（删除全局配置 → 回退 schema/默认）
-  unsigned long long st =
-      ((unsigned long long)fa.ftLastWriteTime.dwHighDateTime << 32) |
-      (unsigned long long)fa.ftLastWriteTime.dwLowDateTime;
-  return st ^ ((unsigned long long)fa.nFileSizeLow << 1);
+  g_model_path = s.has_model_path ? s.model_path : default_model_path();
 }
 
 static void unload_model();  // 定义在后（enabled 关闭/路径变更时卸载，前置声明）
-
-// 热重载: 指纹变化 → 重读合并; enabled 开关与路径变更即时生效
-// （开 → 加载/重载；关 → 卸载释放内存。2026-09-01 修复：热路径此前
-// 只处理"关→开加载"，"开→关卸载"漏了——GUI 开关不重新部署时模型
-// 永远驻留，推理看起来"关不掉"）。
-static void llm_reload_global_if_changed() {
-  unsigned long long stamp = llm_yaml_stamp();
-  if (stamp == g_yaml_stamp)
-    return;
-  g_yaml_stamp = stamp;  // 先记指纹（坏文件不反复重试）
-  llm_load_global_params();
-  llm_apply_params();
-  log_msg("llm_rerank.yaml reloaded: enabled=%d elw=%.2f freq_beta=%.2f "
-          "debug_fusion=%d tok=%d/%d cand=%d cores=%d model=%s",
-          g_enabled ? 1 : 0, g_expected_length_weight, g_freq_beta,
-          g_debug_fusion ? 1 : 0, g_min_tokens, g_max_ctx_tokens,
-          g_max_candidates, g_n_threads, g_model_path.c_str());
-  if (g_enabled)
-    load_model_async();  // 路径变更时内部自动卸载重载；同路径已载为 no-op
-  else if (g_loaded.load() || g_loading.load())
-    unload_model();
-}
 
 // ============================================================
 // commit-history fallback state (engine thread only: OnCommit sink
@@ -1239,7 +1122,7 @@ static std::string dbg_num8(double v) {
 static void load_model_async() {
   // 路径变更自动重载（2026-09-01）：GUI/schema 改 model_path 而模型已
   // 加载时，旧模型驻留内存、新路径被无视——此处检测变更即卸载，随后
-  // 走正常加载。检测收敛在本函数，Apply 与 yaml 热路径调用点自动受益。
+  // 走正常加载。检测收敛在本函数，部署期 Apply 调用点自动受益。
   if (g_loaded.load() && g_loaded_from != g_model_path) {
     log_msg("model path changed: %s -> %s (reload)",
             g_loaded_from.c_str(), g_model_path.c_str());
@@ -1317,7 +1200,7 @@ static void load_model_async() {
 
 // release the loaded model (2GB) when rerank is disabled via schema
 // re-deploy. The filter is rebuilt on every deploy; the constructor's
-// enabled=false（Apply 与 yaml 热路径）及路径变更重载（load_model_async）
+// enabled=false（部署期 Apply）及路径变更重载（load_model_async）
 // 都会调用——关开关真正释放内存而不是驻留到进程退出。
 static void unload_model() {
   // filter rebuild can race an in-flight load (async thread); wait for it
@@ -2125,8 +2008,7 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
   // config lives in the scheme: the LLM-enabled scheme is maintained in the
   // rime-llm-ime project, while the published generic scheme stays clean.
   if (Config *config = engine_->schema()->config()) {
-    // schema llm_rerank 节快照（部署期固定）；三级合并与热重载见
-    // LlmParamSet 注释（schema > 全局 llm_rerank.yaml > 内置默认）
+    // schema llm_rerank 节快照（部署期固定，改配置 = 改方案 + 重新部署）
     LlmParamSet &p = g_schema_params;
     p = LlmParamSet();
     string s;
@@ -2158,8 +2040,6 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     if (config->GetInt("llm_rerank/max_tokens", &v)) { p.has_max_tokens = true; p.max_tokens = v; }
     if (config->GetInt("llm_rerank/max_candidates", &v)) { p.has_max_cand = true; p.max_cand = v; }
     if (config->GetInt("llm_rerank/cpu_cores", &v)) { p.has_cpu_cores = true; p.cpu_cores = v; }
-    llm_load_global_params();
-    g_yaml_stamp = llm_yaml_stamp();
     llm_apply_params();
     log_msg("config: enabled=%d code_pattern='%s' (min_code_len=%d max_code_len=%d 旧键不生效) "
             "expected_length_weight=%.2f freq_beta=%.2f debug_fusion=%d "
@@ -2536,8 +2416,7 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
   if (!translation)
     return translation;
 
-  llm_reload_global_if_changed();  // llm_rerank.yaml 热重载（GUI 保存即生效）
-
+  // 参数在部署期快照（方案 llm_rerank 节）——改配置需重新部署，无热重载
   if (!g_enabled)
     return translation;  // enabled=false -> pass-through
 

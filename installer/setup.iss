@@ -10,17 +10,17 @@
 ;   已有小狼毫 = 装入其目录原地升级：停服务 → 系统 TSF DLL 改名腾位替换
 ;               （.llm_old，加载中的镜像可改名——实测），不动注册表
 ;   参数零写入方案：装完任何方案由 librime 全局挂载 llm_filter（enabled
-;               默认 false；托盘 "LLM 重排设置" 开启，保存即热重载生效）。
+;               默认 false；托盘 "LLM 重排设置" 开启，保存即重新部署生效）。
 ;   模型下载页（2026-09-04 引入；2026-09-05 改版）：Ready 页后询问是否
 ;               下载模型，下拉候选默认"暂不下载"；显示"当前模型位置"——
-;               读 llm_rerank.yaml 的 model_path（配置过/修改过一次即显示），
-;               空置时为默认位置 %APPDATA%\Rime（不做本机模型扫描）。
-;               下载落点 = 当前位置；成功 → 追加式写 enabled: true（追加
-;               不改写原行：GUI 写的 yaml 是无 BOM UTF-8，Inno 按行读写会
-;               破坏中文注释；解析器后行覆盖前行，语义安全）。非 ASCII 的
-;               model_path 经 ANSI 读入会错码——按未配置处理（回落默认
-;               位置，用户可在 GUI 里选择真实路径）。GUI 自 2026-09-04 起
-;               不再提供下载。
+;               2026-09-30 起配置写在**方案 llm_rerank 节**（全局
+;               llm_rerank.yaml 已取消）：扫描 %APPDATA%\Rime\*.schema.yaml
+;               的 llm_rerank 节取 model_path，都没有则为默认位置
+;               %APPDATA%\Rime（不做本机模型扫描）。
+;               下载落点 = 当前位置；**不再写任何配置文件**——是否启用重排
+;               由用户在托盘 "LLM 重排设置" 里选方案 → 接入 LLM（写组件行 +
+;               配置节）决定。非 ASCII 的 model_path 经 ANSI 读入会错码——
+;               按未配置处理（回落默认位置，用户可在 GUI 里选择真实路径）。
 
 #define MyAppName "小狼毫 LLM 版"
 #define MyAppVer "2026.09.30-3"  ; 同日重打安装包在日期后加 -2/-3 序号（2026-09-11 用户定案，避免同号不同内容）
@@ -110,17 +110,10 @@ const
   ModelUrlStr = 'https://modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/resolve/master/Qwen3.5-0.8B-Q4_K_M.gguf';
   ModelFileName = 'Qwen3.5-0.8B-Q4_K_M.gguf';
 
-// ---- llm_rerank.yaml 追加（不重写原行；行尾 #13#10 保证与既有末行分隔，
-// 解析器空行跳过、后行覆盖前行。仅写 ASCII 行——见文件头说明） ----
-procedure YamlAppend(line: String);
-var
-  path: String;
-begin
-  path := ExpandConstant('{userappdata}\Rime');
-  ForceDirectories(path);
-  SaveStringToFile(path + '\llm_rerank.yaml', #13#10 + line, True);
-end;
-
+// ---- 取"当前模型位置"：扫描 %APPDATA%\Rime\*.schema.yaml 的 llm_rerank 节
+// 读 model_path（2026-09-30 起配置写在方案里，全局 llm_rerank.yaml 已取消）。
+// 无任何方案配置节 → 默认位置。文件为无 BOM UTF-8，Inno 按 ANSI 读入——非
+// ASCII 路径会错码，按未配置处理（回落默认位置，用户可在 GUI 里选真实路径）
 function IsAscii(s: String): Boolean;
 var
   i: Integer;
@@ -133,40 +126,63 @@ begin
     end;
 end;
 
-// 读 llm_rerank.yaml 的 model_path（配置过/修改过一次即有；平面文件，
-// 后行覆盖前行）。文件为无 BOM UTF-8，Inno 按 ANSI 读入——非 ASCII
-// 路径会错码，按未配置处理（回落默认位置，用户可在 GUI 里选真实路径）
-function YamlModelPath(): String;
+function SchemaModelPath(): String;
 var
+  fr: TFindRec;
+  dir, path, s, val, key: String;
   lines: TArrayOfString;
   i, c: Integer;
-  s, key, val: String;
+  inCfg: Boolean;
 begin
   Result := '';
-  if not LoadStringsFromFile(
-      ExpandConstant('{userappdata}\Rime\llm_rerank.yaml'), lines) then
+  dir := ExpandConstant('{userappdata}\Rime');
+  if not FindFirst(dir + '\*.schema.yaml', fr) then
     Exit;
-  for i := 0 to GetArrayLength(lines) - 1 do begin
-    s := lines[i];
-    c := Pos(':', s);
-    if c < 1 then Continue;
-    key := Trim(Copy(s, 1, c - 1));
-    val := Trim(Copy(s, c + 1, Length(s) - c));
-    if SameText(key, 'model_path') then begin
-      if (Length(val) >= 2) and (val[1] = '"') and
-         (val[Length(val)] = '"') then
-        val := Copy(val, 2, Length(val) - 2);
-      Result := val;  // 后行覆盖前行
-    end;
+  try
+    repeat
+      path := dir + '\' + fr.Name;
+      if LoadStringsFromFile(path, lines) then begin
+        inCfg := False;
+        for i := 0 to GetArrayLength(lines) - 1 do begin
+          s := lines[i];
+          if (not inCfg) then begin
+            if Pos('llm_rerank:', s) = 1 then
+              inCfg := True;
+            Continue;
+          end;
+          // 节内：缩进行继续，遇到顶层键即出节
+          if (Length(s) > 0) and (s[1] <> ' ') and (s[1] <> #9) then
+            inCfg := False;
+          if not inCfg then
+            Continue;
+          c := Pos(':', s);
+          if c < 1 then
+            Continue;
+          key := Trim(Copy(s, 1, c - 1));
+          val := Trim(Copy(s, c + 1, Length(s) - c));
+          if (Length(val) > 0) and (val[1] = '#') then
+            Continue;
+          if SameText(key, 'model_path') then begin
+            if (Length(val) >= 2) and ((val[1] = '"') or (val[1] = '''')) and
+               (val[Length(val)] = val[1]) then
+              val := Copy(val, 2, Length(val) - 2);
+            Result := val;
+          end;
+        end;
+      end;
+    until (Result <> '') or (not FindNext(fr));
+  finally
+    FindClose(fr);
   end;
   if (Result <> '') and (not IsAscii(Result)) then
     Result := '';
 end;
 
-// 当前生效的模型位置：yaml 显式配置优先，否则默认 %APPDATA%\Rime
+// 当前生效的模型位置：方案 llm_rerank 节里配了 model_path 就用它，否则默认
+// %APPDATA%\Rime（与 llm_filter 的默认一致）
 function CurModelPath(): String;
 begin
-  Result := YamlModelPath();
+  Result := SchemaModelPath();
   if Result = '' then
     Result := ExpandConstant('{userappdata}\Rime\') + ModelFileName;
 end;
@@ -183,7 +199,8 @@ begin
   lbl := TNewStaticText.Create(ModelPage.Surface);
   lbl.Parent := ModelPage.Surface;
   lbl.Caption := 'LLM 重排需要 GGUF 模型文件（Qwen3.5-0.8B-Q4_K_M，约 508 MB），' +
-      '放在下方"当前模型位置"。默认暂不下载；下载成功后自动开启重排。';
+      '放在下方"当前模型位置"。默认暂不下载；装完在托盘「LLM 重排设置」里' +
+      '选方案 → 接入 LLM 即启用（配置写在该方案的 llm_rerank 节）。';
   lbl.WordWrap := True;
   lbl.SetBounds(ScaleX(0), ScaleY(0), ScaleX(430), ScaleY(44));
   ModelCombo := TNewComboBox.Create(ModelPage.Surface);
@@ -215,16 +232,14 @@ begin
   if CurPageID = ModelPage.ID then begin
     idx := ModelCombo.ItemIndex;
     if idx = 1 then begin
-      // 下载分支：落点 = 当前显示位置（yaml 配置优先，否则默认）
+      // 下载分支：落点 = 当前显示位置（方案 llm_rerank 节配了就用它，否则默认）
       dest := CurModelPath();
       ForceDirectories(ExtractFileDir(dest));
       if FileExists(dest) then
         if MsgBox('已存在模型文件：' + dest + #13#10#13#10 +
-                  '是否重新下载覆盖？（选"否"则沿用现有文件并开启重排）',
-                  mbConfirmation, MB_YESNO) = IDNO then begin
-          YamlAppend('enabled: true');
-          Exit;
-        end;
+                  '是否重新下载覆盖？（选"否"则沿用现有文件）',
+                  mbConfirmation, MB_YESNO) = IDNO then
+          Exit;   // 不写任何配置：启用与否由用户在「LLM 重排设置」里决定
       ok := False;
       giveUp := False;
       repeat
@@ -245,8 +260,8 @@ begin
             mbError, MB_RETRYCANCEL) <> IDRETRY) then
           giveUp := True;
       until ok or giveUp;
-      if ok then
-        YamlAppend('enabled: true');  // 选了下载即视为要启用
+      // 下载成功不写配置（2026-09-30：配置在方案 llm_rerank 节里，
+      // 由「LLM 重排设置」→『接入 LLM』写入）
     end;
   end;
 end;

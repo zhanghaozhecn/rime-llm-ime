@@ -8,17 +8,20 @@
 // 用户目录与 %USERPROFILE%\gguf_models 的 .gguf + 浏览），新增模型状态
 // 行（文件存在性/大小）、打开用户文件夹、debug_fusion 诊断开关。
 #include <windows.h>
+#include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
 #include <objbase.h>
 #include <string>
 #include <vector>
+#include <deque>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cwchar>
 
+#pragma comment(lib, "comctl32.lib")  // 悬停提示（tooltips_class32）
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -73,17 +76,27 @@ struct Params {
 static Params g_p;
 static HWND g_hwnd;
 static HFONT g_font;
-static HFONT g_font_bold;  // 分节标题
-static HFONT g_font_hint;  // 灰色小字说明（比正文小一号）
+static HFONT g_font_hint;  // 灰色小字（状态副行 / 底部动态注）
+static HFONT g_font_help;  // 「?」徽标里的问号（小号加粗）
 static int g_ui_height = 0; // make_ui() 算出的内容总高（设备像素；用于定窗口高）
+// 悬停提示：g_tip = tooltips_class32 窗口；g_tips 存文案（deque：push_back
+// 不搬移已有元素，c_str() 指针长期有效——vector 会因扩容失效）
+static HWND g_tip = NULL;
+static std::deque<std::wstring> g_tips;
 
 // ---- 工具 ----
-static std::wstring yaml_path() {
+// RIME 用户文件夹（= 小狼毫右键"用户文件夹"；方案与模型都在这里）
+static std::wstring rime_user_dir() {
   wchar_t dir[MAX_PATH];
   if (!GetEnvironmentVariableW(L"APPDATA", dir, MAX_PATH))
     return std::wstring();
   return std::wstring(dir) + L"\\Rime";
 }
+
+// 旧全局配置 %APPDATA%\Rime\llm_rerank.yaml（2026-09-30 起废弃：配置回归
+// 方案 llm_rerank 节）。**只作一次性迁移**——方案节里没有 model_path 时，
+// 用它把老用户已配好的模型路径带进界面，保存即写入方案节。
+// （实现放在 trim/utf8_to_wide 之后：见下方 legacy_model_path）
 
 static std::wstring default_model_path() {
   // 默认 = RIME 用户文件夹根（2026-08-31 用户澄清：指小狼毫右键的用户
@@ -134,13 +147,15 @@ static std::string yaml_scalar(const std::string& s) {
   return q + "'";
 }
 
-// ---- llm_rerank.yaml 读写（与 llm_filter.cc 的扁平解析同构）----
-static void load_params() {
-  std::wstring dir = yaml_path();
-  if (dir.empty()) return;
+// 旧全局配置的一次性迁移读取（%APPDATA%\Rime\llm_rerank.yaml，已废弃）。
+// 只在该方案**没有 llm_rerank 节**时调用：把老用户配好的参数带进界面，
+// 点『接入 LLM』即写进方案节——运行期（llm_filter）完全不读这个文件。
+static bool load_legacy_params(Params* p) {
+  std::wstring dir = rime_user_dir();
+  if (dir.empty()) return false;
   FILE* f = NULL;
   _wfopen_s(&f, (dir + L"\\llm_rerank.yaml").c_str(), L"rb");
-  if (!f) return;
+  if (!f) return false;
   char line[512];
   while (fgets(line, sizeof(line), f)) {
     std::string ln = trim(line);
@@ -149,63 +164,128 @@ static void load_params() {
     if (c == std::string::npos) continue;
     std::string key = trim(ln.substr(0, c));
     std::string val = trim(ln.substr(c + 1));
-    // 双引号（历史 model_path 风格）与单引号（code_pattern 正则风格，2026-09-30）
-    // 都要去壳——只认双引号会让正则值带壳
-    if (!val.empty() && (val[0] == '"' || val[0] == '\'')) {
+    if (val.empty() || val[0] == '#') continue;
+    if (val[0] == '"' || val[0] == '\'') {
       size_t e = val.find(val[0], 1);
       val = (e == std::string::npos) ? val.substr(1) : val.substr(1, e - 1);
     } else {
       size_t h = val.find('#');
       if (h != std::string::npos) val = trim(val.substr(0, h));
     }
+    if (val.empty()) continue;
+    if (key == "enabled") p->enabled = (val == "true");
+    else if (key == "code_pattern") p->code_pattern = val;
+    else if (key == "expected_length_weight") p->elw = atof(val.c_str());
+    else if (key == "freq_beta") p->freq_beta = atof(val.c_str());
+    else if (key == "max_tokens") p->max_tokens = atoi(val.c_str());
+    else if (key == "max_candidates") p->max_candidates = atoi(val.c_str());
+    else if (key == "cpu_cores") p->cpu_cores = atoi(val.c_str());
+    else if (key == "debug_fusion") p->debug_fusion = (val == "true");
+    else if (key == "model_path") {
+      for (auto& ch : val)
+        if (ch == '/') ch = '\\';
+      p->model_path = utf8_to_wide(val);
+    }
+  }
+  fclose(f);
+  return true;
+}
+
+// ---- 方案内 llm_rerank: 配置节读写（2026-09-30 用户定案：两版统一回归
+// Rime 原生做法——配置作为节写在方案 schema.yaml 里，取消源码版全局
+// %APPDATA%\Rime\llm_rerank.yaml）----
+// 节内键序与插件版 installer\install_plugin.ps1 的 Get-LlmCfgLines /
+// Update-LlmSection **逐字一致**：enabled / code_pattern / max_tokens /
+// max_candidates / cpu_cores / freq_beta / expected_length_weight /
+// debug_fusion / model_path —— 两版方案配置节相同，仅组件行不同。
+static const char* kCfgSection = "llm_rerank:";
+
+// 节起始行下标（-1 = 无节）
+static int llm_section_start(const std::vector<std::string>& lines) {
+  for (size_t i = 0; i < lines.size(); ++i)
+    if (!lines[i].compare(0, strlen(kCfgSection), kCfgSection)) return (int)i;
+  return -1;
+}
+
+// 解析节内 key: value 到 g_p；返回是否有节。旧键（min/max_code_len、
+// min_tokens、com_context）有意忽略——保存时自然消失。
+static bool parse_llm_section(const std::vector<std::string>& lines) {
+  int start = llm_section_start(lines);
+  if (start < 0) return false;
+  for (size_t i = start + 1; i < lines.size(); ++i) {
+    const std::string& raw = lines[i];
+    if (raw.empty()) continue;
+    if (raw[0] != ' ' && raw[0] != '\t') break;  // 节结束（下一个顶层键）
+    std::string ln = trim(raw);
+    if (ln.empty() || ln[0] == '#') continue;
+    size_t c = ln.find(':');
+    if (c == std::string::npos) continue;
+    std::string key = trim(ln.substr(0, c));
+    std::string val = trim(ln.substr(c + 1));
+    if (val.empty() || val[0] == '#') continue;   // 注释占位行（空 model_path）
+    if (val[0] == '"' || val[0] == '\'') {        // 引号去壳（单/双都要）
+      size_t e = val.find(val[0], 1);
+      val = (e == std::string::npos) ? val.substr(1) : val.substr(1, e - 1);
+    } else {
+      size_t h = val.find('#');
+      if (h != std::string::npos) val = trim(val.substr(0, h));
+    }
+    if (val.empty()) continue;
     if (key == "enabled") g_p.enabled = (val == "true");
     else if (key == "code_pattern") g_p.code_pattern = val;
-    // 旧键 min_code_len / max_code_len 有意忽略（触发条件已改为 code_pattern，
-    // 2026-09-30）：保存时自然消失；等价换算 min=4,max=0 ⇒ '.{4}'
-    else if (key == "min_code_len") { /* 旧键忽略 */ }
-    else if (key == "max_code_len") { /* 旧键忽略 */ }
+    else if (key == "min_code_len" || key == "max_code_len" ||
+             key == "min_tokens" || key == "com_context") { /* 旧键忽略 */ }
     else if (key == "expected_length_weight") g_p.elw = atof(val.c_str());
     else if (key == "freq_beta") g_p.freq_beta = atof(val.c_str());
-    // 旧行 "min_tokens" 有意忽略（用户配置面移除，固定 C++ 默认 1，2026-09-30）
     else if (key == "max_tokens") g_p.max_tokens = atoi(val.c_str());
     else if (key == "max_candidates") g_p.max_candidates = atoi(val.c_str());
     else if (key == "cpu_cores") g_p.cpu_cores = atoi(val.c_str());
     else if (key == "debug_fusion") g_p.debug_fusion = (val == "true");
     else if (key == "model_path") g_p.model_path = utf8_to_wide(val);
   }
-  fclose(f);
+  return true;
 }
 
-static bool save_params() {
-  std::wstring dir = yaml_path();
-  if (dir.empty()) return false;
-  CreateDirectoryW(dir.c_str(), NULL);
-  std::wstring model = shown_model();
+// 节内容（含 "llm_rerank:" 行本身；model_path 为空写注释占位，与插件版同款）
+static std::vector<std::string> build_llm_section() {
+  std::vector<std::string> sec;
   char buf[64];
-  std::string out;
-  out += "# LLM 重排全局配置（WeaselLLMSetup 写入；llm_filter 热重载即时生效）\n";
-  out += "# 优先级：方案内 llm_rerank 节 > 本文件 > 内置默认\n";
-  out += g_p.enabled ? "enabled: true\n" : "enabled: false\n";
-  out += "code_pattern: " + yaml_scalar(g_p.code_pattern) + "\n";
-  sprintf_s(buf, "expected_length_weight: %.2f\n", g_p.elw); out += buf;
-  sprintf_s(buf, "freq_beta: %.2f\n", g_p.freq_beta); out += buf;
-  sprintf_s(buf, "max_tokens: %d\n", g_p.max_tokens); out += buf;
-  sprintf_s(buf, "max_candidates: %d\n", g_p.max_candidates); out += buf;
-  sprintf_s(buf, "cpu_cores: %d\n", g_p.cpu_cores); out += buf;
-  out += g_p.debug_fusion ? "debug_fusion: true\n" : "debug_fusion: false\n";
-  out += "model_path: " + wide_to_utf8(model) + "\n";
-  std::wstring tmp = dir + L"\\llm_rerank.yaml.tmp";
-  FILE* f = NULL;
-  _wfopen_s(&f, tmp.c_str(), L"wb");
-  if (!f) return false;
-  fwrite(out.data(), 1, out.size(), f);
-  fclose(f);
-  // 原子替换：热重载按 mtime|size 指纹感知；tmp 同目录保证同卷 rename
-  if (!MoveFileExW(tmp.c_str(), (dir + L"\\llm_rerank.yaml").c_str(),
-                   MOVEFILE_REPLACE_EXISTING)) {
-    DeleteFileW(tmp.c_str());
-    return false;
+  sec.push_back(kCfgSection);
+  sec.push_back(g_p.enabled ? "  enabled: true" : "  enabled: false");
+  sec.push_back("  code_pattern: " + yaml_scalar(g_p.code_pattern));
+  sprintf_s(buf, "  max_tokens: %d", g_p.max_tokens); sec.push_back(buf);
+  sprintf_s(buf, "  max_candidates: %d", g_p.max_candidates); sec.push_back(buf);
+  sprintf_s(buf, "  cpu_cores: %d", g_p.cpu_cores); sec.push_back(buf);
+  sprintf_s(buf, "  freq_beta: %.2f", g_p.freq_beta); sec.push_back(buf);
+  sprintf_s(buf, "  expected_length_weight: %.2f", g_p.elw); sec.push_back(buf);
+  sec.push_back(g_p.debug_fusion ? "  debug_fusion: true" : "  debug_fusion: false");
+  if (!g_p.model_path.empty()) {
+    std::string p = wide_to_utf8(g_p.model_path);
+    bool quote = p.find(' ') != std::string::npos;
+    for (auto& ch : p) if (ch == '\\') ch = '/';
+    sec.push_back("  model_path: " + (quote ? ("\"" + p + "\"") : p));
+  } else {
+    sec.push_back("  # model_path: <绝对路径；默认 = " +
+                  wide_to_utf8(rime_user_dir()) +
+                  "\\Qwen3.5-0.8B-Q4_K_M.gguf>");
   }
+  return sec;
+}
+
+// 原位重写节内容（节必须已存在——没节说明方案未接入 LLM）；返回是否成功
+static bool update_llm_section(std::vector<std::string>* lines) {
+  int start = llm_section_start(*lines);
+  if (start < 0) return false;
+  int end = start + 1;
+  while (end < (int)lines->size() && !(*lines)[end].empty() &&
+         ((*lines)[end][0] == ' ' || (*lines)[end][0] == '\t'))
+    end++;
+  std::vector<std::string> sec = build_llm_section();
+  std::vector<std::string> out;
+  out.insert(out.end(), lines->begin(), lines->begin() + start);
+  out.insert(out.end(), sec.begin(), sec.end());
+  out.insert(out.end(), lines->begin() + end, lines->end());
+  *lines = out;
   return true;
 }
 
@@ -440,7 +520,7 @@ static void trigger_redeploy() {
 static void scan_schemas() {
   HWND combo = GetDlgItem(g_hwnd, IDC_SCHEMA);
   SendMessageW(combo, CB_RESETCONTENT, 0, 0);
-  std::wstring dir = yaml_path();
+  std::wstring dir = rime_user_dir();
   if (dir.empty()) return;
   WIN32_FIND_DATAW fd;
   HANDLE h = FindFirstFileW((dir + L"\\*.schema.yaml").c_str(), &fd);
@@ -458,10 +538,86 @@ static std::wstring selected_schema_path(bool* ok) {
   wchar_t name[MAX_PATH];
   if (GetDlgItemTextW(g_hwnd, IDC_SCHEMA, name, MAX_PATH) && name[0]) {
     *ok = true;
-    return yaml_path() + L"\\" + name;
+    return rime_user_dir() + L"\\" + name;
   }
   *ok = false;
   return std::wstring();
+}
+
+static const wchar_t* base_name(const std::wstring& path) {
+  const wchar_t* p = wcsrchr(path.c_str(), L'\\');
+  return p ? p + 1 : path.c_str();
+}
+
+static void params_to_ui();  // fwd decl（定义在下方）
+static void ui_to_params();  // fwd decl（定义在下方）
+
+// 把选中方案的 llm_rerank 节读进界面（选方案/刷新/接入/剥离后调用）。
+// 无节 → 界面上是默认值 + 提示"未接入"；模型路径若方案节里没有而旧全局
+// 配置里有，则带过来（一次性迁移，保存即写入方案节）。
+static void load_schema_params() {
+  if (!g_hwnd) return;
+  bool ok = false;
+  std::wstring path = selected_schema_path(&ok);
+  if (!ok) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
+               L"请先在下拉框选择方案文件（%%APPDATA%%\\Rime\\*.schema.yaml）");
+    return;
+  }
+  g_p = Params();  // 先落默认值
+  bool had_bom = false;
+  std::vector<std::string> lines;
+  bool has_section = read_lines(path, &had_bom, &lines) && parse_llm_section(lines);
+  // 方案节里还没有配置 → 用旧全局 llm_rerank.yaml 一次性迁移界面值
+  // （该文件已废弃：运行期不读它，只有这里为老用户带出参数）
+  bool migrated = false;
+  if (!has_section) migrated = load_legacy_params(&g_p);
+  if (has_section) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"已加载 %s 的 llm_rerank 配置节",
+               base_name(path));
+  } else if (migrated) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
+               L"[未接入] %s 没有 llm_rerank 节——已带出旧全局配置的值，"
+               L"点『接入 LLM』写进方案",
+               base_name(path));
+  } else {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
+               L"[未接入] %s 里没有 llm_rerank 节——显示默认值，点『接入 LLM』写入",
+               base_name(path));
+  }
+  params_to_ui();
+}
+
+// 保存界面参数 → 选中方案的 llm_rerank 节（节必须已存在）+ 触发重新部署
+static void save_schema_params() {
+  bool ok = false;
+  std::wstring path = selected_schema_path(&ok);
+  if (!ok) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"[失败] 请先选择方案文件");
+    return;
+  }
+  bool had_bom = false;
+  std::vector<std::string> lines;
+  if (!read_lines(path, &had_bom, &lines)) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"[失败] 读取方案失败：%s", path.c_str());
+    return;
+  }
+  ui_to_params();
+  if (!update_llm_section(&lines)) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"[失败] 方案内没有 llm_rerank 配置节——请先点『接入 LLM』");
+    return;
+  }
+  if (!write_lines(path, had_bom, lines)) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"[失败] 写入方案失败：%s", path.c_str());
+    return;
+  }
+  set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已保存到 %s，正在重新部署…",
+             base_name(path));
+  refresh_model_status();  // 模型路径可能刚改
+  trigger_redeploy();
+  set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+             L"已保存到 %s 并触发重新部署——部署完成后参数生效", base_name(path));
 }
 
 static void on_schema_add() {
@@ -478,24 +634,27 @@ static void on_schema_add() {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"读取方案失败：%s", path.c_str());
     return;
   }
-  int removed = strip_llm(&lines);
+  int removed = strip_llm(&lines);  // 组件行 + 旧 llm_rerank 节一并剥净
   std::wstring where;
   if (!insert_llm_filter(&lines, &where)) {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
                L"[失败] 方案内未找到 engine/filters 块，无法插入组件");
     return;
   }
-  if (!write_lines(path, had_bom, lines)) {
-    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"写入方案失败：%s", path.c_str());
-    return;
-  }
+  // 配置节内容取界面当前值（界面值 = 该方案原节或默认）；接入 = 重新启用意图
+  ui_to_params();
+  g_p.enabled = true;
+  if (!lines.empty() && !lines.back().empty()) lines.push_back("");
+  std::vector<std::string> sec = build_llm_section();
+  lines.insert(lines.end(), sec.begin(), sec.end());
   if (!write_lines(path, had_bom, lines)) {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"写入方案失败：%s", path.c_str());
     return;
   }
   wchar_t msg[512];
-  swprintf_s(msg, L"已接入 llm_filter（%s）%s", where.c_str(),
+  swprintf_s(msg, L"已接入 llm_filter（%s）+ llm_rerank 配置节%s", where.c_str(),
              removed ? L"，旧 LLM 组件已剥离" : L"");
+  load_schema_params();  // 回读（节已是权威值）
   set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), msg);
   trigger_redeploy();
 }
@@ -523,6 +682,7 @@ static void on_schema_remove() {
   write_lines(path, had_bom, lines);
   wchar_t msg[128];
   swprintf_s(msg, L"已移除 LLM 组件（含配置节）共 %d 行", removed);
+  load_schema_params();  // 回默认值 + "未接入" 提示
   set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), msg);
   trigger_redeploy();
 }
@@ -597,180 +757,228 @@ static HWND mk(int cls, const wchar_t* text, DWORD style, int x, int y, int w,
 // 布局铁律：任何控件的矩形不得与其他控件相交——不透明子控件按 z 序
 // 覆盖先画者，会把被覆盖控件的文字"局部擦除"成叠字残片（2026-08-27
 // 叠字事故根因：勾选框 w430 与下行标签矩形相交 + 空状态静态框横贯首行）。
-// 2026-09-30 改版（用户反馈"丑、自解释性不强"）：
-//   ① 分组改用 BS_GROUPBOX 容器（原生分组框，替代"加粗裸文字"标题）；
-//   ② 每组标题自带"这组是干什么的"说明；每个参数补单位/范围/取值示例；
-//   ③ **列宽按文字实测宽度计算**（tw() 用 GetTextExtentPoint32）——不再靠
-//      估算，杜绝"标签被下一控件截断"（上一版就是估算出了截断）；
-//   ④ 分组框高度 = 内容末尾 + 内边距（bump），不再手写魔数；
-//   ⑤ 清单加 dpiAware=system（此前无感知 → 高 DPI 下位图拉伸发虚，
-//      描边发黑发糊，正是用户说的"黑边框很丑"）。
-// 新增控件请沿用 tw() 排栅格；改完务必截图核对（scripts\_shot_gui.ps1）。
+// 2026-09-30 第一次改版（"丑、自解释性不强"）：分组改 BS_GROUPBOX、
+//   列宽按 tw() 实测、清单加 dpiAware（位图拉伸发虚 = 黑边框很丑的根因）。
+// 2026-09-30 第二次改版（用户定案）：**一个配置项一行，说明不直出**——
+//   每行 = 标签 + 输入框 + 右对齐「?」徽标，说明只在鼠标悬停时弹出
+//   （tooltips_class32 + TTF_SUBCLASS，见 tip_init/tip_add/mk_help）。
+// 新增控件请沿用 tw() 排栅格与 HX 徽标列；改完务必截图核对。
 static HWND mk_group(const wchar_t* title, int x, int y, int w, int h);
 static HWND mk_hint(const wchar_t* text, int x, int y, int w);
+static HWND mk_help(int x, int y, const wchar_t* tip);  // 「?」徽标
+static void tip_add(HWND ctl, const wchar_t* text);     // 控件挂悬停提示
+static void tip_init();                                 // tooltips_class32 窗口
 static int  tw(const wchar_t* s, HFONT f);   // 文字像素宽
 static int  ts(int v);                        // DPI 缩放
-static int  g_group_bottom = 0;               // 当前分组框的最大内容底边
 
-// 一行：标签 + 输入框（标签宽度按实测，输入框紧随其后）
-static void row_edit(int& y, const wchar_t* label, int id, int box_w,
-                     const wchar_t* hint) {
-  int lw = tw(label, g_font);
-  mk(1, label, 0, ts(24), y + ts(3), lw + ts(4), ts(20), 0);
-  mk(2, L"", WS_BORDER | WS_TABSTOP, ts(24) + lw + ts(10), y, ts(box_w), ts(22), id);
-  y += ts(36);
-  if (hint && *hint) {
-    mk_hint(hint, ts(24), y, ts(548));
-    y += ts(22);
-  }
-  if (y > g_group_bottom) g_group_bottom = y;
+// ---- 参数说明文案（与插件版 install_plugin.ps1 的 $tip* 逐字对齐）----
+// \n 手工断行：tooltips_class32 未设最大宽度时单行会长到出屏（另有
+// TTM_SETMAXTIPWIDTH 兜底自动折行）。注意路径里的 \ 要写成 \\。
+static const wchar_t* const TIP_ENABLED =
+    L"总开关：开 = 加载模型参与候选重排；关 = 卸载模型释放内存。\n"
+    L"保存后立即生效，无需重新部署。";
+static const wchar_t* const TIP_MODEL =
+    L"GGUF 模型文件路径（留空 = 用户文件夹里的默认名）。\n"
+    L"下拉列出用户文件夹与本机 gguf_models 下的模型；\n"
+    L"换模型保存后会自动卸载并重载。";
+static const wchar_t* const TIP_BROWSE = L"浏览…：选择 .gguf 模型文件。";
+static const wchar_t* const TIP_SCHEMA =
+    L"配置就写在选中的方案文件里（用户文件夹根目录的 *.schema.yaml）。\n"
+    L"先选方案、再改参数；右侧按钮负责接入 / 剥离 LLM 组件与配置节。";
+static const wchar_t* const TIP_SCHEMAREF =
+    L"重新扫描用户文件夹里的方案文件，并重新读入当前方案的参数。";
+static const wchar_t* const TIP_SCHEMAADD =
+    L"接入 LLM：把 llm_filter 组件行 + llm_rerank 配置节写进选中方案\n"
+    L"（先剥旧版组件再插入，可跨版转换），并自动重新部署。";
+static const wchar_t* const TIP_SCHEMAREM =
+    L"剥离：删掉选中方案里的 llm_filter 组件行与 llm_rerank 配置节，\n"
+    L"并自动重新部署。";
+static const wchar_t* const TIP_CODE_PAT =
+    L"触发条件：编码串全串正则匹配，只有匹配上的编码才交给 LLM 重排\n"
+    L"（写法与 Rime speller/auto_select_pattern 一致）。\n"
+    L"默认 .{4} = 恰 4 码。例：\n"
+    L"　.{4,} 4 码以上　　.{3,4} 3~4 码\n"
+    L"　[abcde]{4} 指定首码　　空 = 不限制\n"
+    L"含 \\ 的写法要用单引号，如 '\\d{4}'。";
+static const wchar_t* const TIP_MAX_TOK =
+    L"上文长度上限：取光标前多少个 token 作为重排依据（默认 10）。\n"
+    L"越大越准，但每次都更慢。";
+static const wchar_t* const TIP_MAX_CAND =
+    L"每次按键参与 LLM 打分的候选数上限（默认 5）。\n"
+    L"一般不用改——调大更准但更慢。";
+static const wchar_t* const TIP_CORES =
+    L"推理用的 CPU 线程数（默认 4）。不要超过本机物理核；\n"
+    L"可用 ..\\rime-llm-rerank\\cpp\\build_bench_threads.bat 实测最优值。";
+static const wchar_t* const TIP_BETA =
+    L"用户词频权重 β（默认 1.5，0 = 关闭）。\n"
+    L"融合分 = CE 分 + β·log(1+词频计数) + elw·词长加成\n"
+    L"越常上屏的词加分越多；加分在 log 域，可翻盘 LLM 的分差。";
+static const wchar_t* const TIP_ELW =
+    L"预期词长权重 elw（默认 0.2，0 = 关闭）。\n"
+    L"融合分 = CE 分 + β·log(1+词频计数) + elw·词长加成\n"
+    L"按 词长 = 码长÷2 给候选加成，只对两码一字的方案有意义；\n"
+    L"成熟机器建议 0。";
+static const wchar_t* const TIP_DEBUG =
+    L"诊断日志：开启后每次重排都往用户文件夹写 rime_llm_debug.txt\n"
+    L"（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。";
+static const wchar_t* const TIP_SAVE =
+    L"把上面的参数写进选中方案文件的 llm_rerank 配置节（键名与该节里相同），\n"
+    L"随后自动触发重新部署——部署完成即生效（配置在方案里，不再有全局文件）。";
+static const wchar_t* const TIP_CLOSE = L"关闭窗口（不保存未保存的改动）。";
+static const wchar_t* const TIP_OPENDIR =
+    L"打开小狼毫用户文件夹（%APPDATA%\\Rime）——模型与方案文件都在这里。";
+
+// 一行 = 标签 + 输入框 + 行末「?」徽标（全界面共用一个标签列宽与徽标列）
+static void row_input(int& y, int label_w, const wchar_t* label, int id,
+                      int box_w, DWORD style, const wchar_t* tip, int hx) {
+  mk(1, label, 0, ts(24), y + ts(3), label_w + ts(4), ts(20), 0);
+  HWND e = mk(2, L"", WS_BORDER | WS_TABSTOP | style, ts(24) + label_w + ts(10),
+              y, ts(box_w), ts(22), id);
+  tip_add(e, tip);
+  mk_help(hx, y + ts(2), tip);
+  y += ts(30);
 }
 
 static void make_ui() {
   g_font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
                        CLEARTYPE_QUALITY, 0, L"Segoe UI");
-  g_font_bold = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
-                            0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
   g_font_hint = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                             0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+  g_font_help = CreateFontW(-13, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+                            0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+  tip_init();
 
-  const int PAD = ts(12);                 // 分组框外边距
-  const int CW = ts(584);                 // 分组框宽（内容宽 = CW - 2*IPAD）
-  const int IPAD = ts(12);                // 分组框内边距
+  const int PAD = ts(12);   // 分组框外边距（左右对称：客户区 620 - 2×12 = 596）
+  const int CW = ts(596);   // 分组框宽
+  const int LX = ts(24);    // 组内左起点（PAD + 12）
+  const int HX = ts(576);   // 「?」徽标列（全界面统一，行右对齐）
+  const int RX = ts(566);   // 组内行内容右边界（给徽标列留位）
   int y = ts(8);
+
+  // ═══ 方案接入（语义同 installer\schema_add.ps1）——放最前：
+  // 配置写在方案里，**先选方案再改参数**（2026-09-30 用户定案，与插件版同序）═══
+  {
+    int gy = y; y += ts(26);
+    const wchar_t* lbl = L"方案文件:";
+    int lw = tw(lbl, g_font);
+    mk(1, lbl, 0, LX, y + ts(3), lw + ts(4), ts(20), 0);
+    int x = LX + lw + ts(10);
+    int wRef = tw(L"刷新", g_font) + ts(24);
+    int wAdd = tw(L"接入 LLM", g_font) + ts(24);
+    int wRem = tw(L"剥离", g_font) + ts(24);
+    int comboW = RX - x - wRef - wAdd - wRem - ts(18);
+    HWND cmb = mk(3, L"", CBS_DROPDOWNLIST | WS_TABSTOP, x, y - ts(3), comboW,
+                  ts(200), IDC_SCHEMA);
+    tip_add(cmb, TIP_SCHEMA);
+    x += comboW + ts(6);
+    tip_add(mk(0, L"刷新", WS_TABSTOP, x, y - ts(3), wRef, ts(26), IDC_SCHEMAREF),
+            TIP_SCHEMAREF);
+    x += wRef + ts(4);
+    tip_add(mk(0, L"接入 LLM", WS_TABSTOP, x, y - ts(3), wAdd, ts(26), IDC_SCHEMAADD),
+            TIP_SCHEMAADD);
+    x += wAdd + ts(4);
+    tip_add(mk(0, L"剥离", WS_TABSTOP, x, y - ts(3), wRem, ts(26), IDC_SCHEMAREM),
+            TIP_SCHEMAREM);
+    mk_help(HX, y + ts(2), TIP_SCHEMA);
+    y += ts(30);
+    mk(1, L"", 0, LX, y, ts(528), ts(18), IDC_SCHEMSTAT);
+    y += ts(20);
+    mk_group(L"方案接入", PAD, gy, CW, y - gy + ts(8));
+  }
+  y += ts(10);
 
   // ═══ 总控：开关 + 模型路径 ═══════════════════════════════
   {
-    int gy = y; y += ts(26); g_group_bottom = y;
-    mk(0, L"启用 LLM 重排（保存后立即生效，无需重新部署）",
-       BS_AUTOCHECKBOX | WS_TABSTOP, ts(24), y, tw(L"启用 LLM 重排（保存后立即生效，无需重新部署）", g_font) + ts(28), ts(22), IDC_ENABLED);
-    y += ts(28);
+    int gy = y; y += ts(26);
+    HWND cb = mk(0, L"启用 LLM 重排", BS_AUTOCHECKBOX | WS_TABSTOP, LX, y,
+                 tw(L"启用 LLM 重排", g_font) + ts(26), ts(22), IDC_ENABLED);
+    tip_add(cb, TIP_ENABLED);
+    mk_help(HX, y + ts(2), TIP_ENABLED);
+    y += ts(30);
     const wchar_t* lbl = L"模型路径:";
     int lw = tw(lbl, g_font);
-    mk(1, lbl, 0, ts(24), y + ts(3), lw + ts(4), ts(20), 0);
-    int ex = ts(24) + lw + ts(10);
+    mk(1, lbl, 0, LX, y + ts(3), lw + ts(4), ts(20), 0);
+    int ex = LX + lw + ts(10);
     int btnW = tw(L"浏览…", g_font) + ts(26);
-    int comboW = (ts(24) + ts(548) - btnW - ts(8)) - ex;
-    mk(3, L"", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_TABSTOP, ex, y - ts(3), comboW,
-       ts(200), IDC_MODEL);
-    mk(0, L"浏览…", WS_TABSTOP, ex + comboW + ts(8), y - ts(3), btnW, ts(26),
-       IDC_BROWSE);
+    int comboW = (RX - btnW - ts(8)) - ex;
+    HWND cmb = mk(3, L"", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_TABSTOP, ex,
+                  y - ts(3), comboW, ts(200), IDC_MODEL);
+    tip_add(cmb, TIP_MODEL);
+    tip_add(mk(0, L"浏览…", WS_TABSTOP, ex + comboW + ts(8), y - ts(3), btnW,
+               ts(26), IDC_BROWSE), TIP_BROWSE);
+    mk_help(HX, y + ts(2), TIP_MODEL);
     y += ts(30);
-    mk(1, L"", 0, ts(24), y, ts(140), ts(18), IDC_MSTATUS);
+    mk(1, L"", 0, LX, y, ts(140), ts(18), IDC_MSTATUS);
     // 第二段（灰色小字，紧跟状态后）：ID 供 refresh_model_status 填字
-    HWND mh = mk_hint(L"", ts(24) + ts(144), y, ts(404));
+    HWND mh = mk_hint(L"", LX + ts(144), y, ts(404));
     SetWindowLongPtrW(mh, GWLP_ID, IDC_MSTATUS_HINT);
     y += ts(20);
-    mk_group(L"总控", PAD, gy, CW, y - gy + ts(6));
+    mk_group(L"总控", PAD, gy, CW, y - gy + ts(8));
   }
   y += ts(10);
 
-  // ═══ 方案接入（语义同 installer\schema_add.ps1）═══
+  // ═══ 触发条件（单行）════════════════════════════════════
   {
-    int gy = y; y += ts(26); g_group_bottom = y;
-    const wchar_t* lbl = L"方案文件:";
-    int lw = tw(lbl, g_font);
-    mk(1, lbl, 0, ts(24), y + ts(3), lw + ts(4), ts(20), 0);
-    int x = ts(24) + lw + ts(10);
-    int wRef = tw(L"刷新", g_font) + ts(22);
-    int wAdd = tw(L"接入 LLM", g_font) + ts(22);
-    int wRem = tw(L"剥离", g_font) + ts(22);
-    int comboW = ts(24) + ts(548) - x - wRef - wAdd - wRem - ts(24);
-    mk(3, L"", CBS_DROPDOWNLIST | WS_TABSTOP, x, y - ts(3), comboW, ts(200), IDC_SCHEMA);
-    x += comboW + ts(8);
-    mk(0, L"刷新", WS_TABSTOP, x, y - ts(3), wRef, ts(26), IDC_SCHEMAREF);
-    x += wRef + ts(4);
-    mk(0, L"接入 LLM", WS_TABSTOP, x, y - ts(3), wAdd, ts(26), IDC_SCHEMAADD);
-    x += wAdd + ts(4);
-    mk(0, L"剥离", WS_TABSTOP, x, y - ts(3), wRem, ts(26), IDC_SCHEMAREM);
-    y += ts(30);
-    mk(1, L"", 0, ts(24), y, ts(548), ts(18), IDC_SCHEMSTAT);
-    y += ts(20);
-    mk_group(L"方案接入 —— 把 llm_filter 写进选中方案并自动重新部署", PAD, gy, CW, y - gy + ts(6));
+    int gy = y; y += ts(26);
+    row_input(y, tw(L"编码匹配:", g_font), L"编码匹配:", IDC_CODE_PAT, 240, 0,
+              TIP_CODE_PAT, HX);
+    mk_group(L"触发条件", PAD, gy, CW, y - gy + ts(8));
   }
   y += ts(10);
 
-  // ═══ 触发条件 ════════════════════════════════════════════
+  // ═══ 推理规模 + 候选排序融合：五个参数各一行，标签列用同一个实测宽度
+  // （2026-09-30 第二次定案：融合分不再平铺公式——两个权重按普通配置项列出，
+  //  公式移进「?」悬停说明，避免"公式反而更难懂"）═══
   {
-    int gy = y; y += ts(26); g_group_bottom = y;
-    mk(1, L"编码匹配:", 0, ts(24), y + ts(3), ts(76), ts(20), 0);
-    mk(2, L"", WS_BORDER | WS_TABSTOP, ts(24) + ts(76) + ts(10), y, ts(240), ts(22),
-       IDC_CODE_PAT);
-    y += ts(30);
-    mk_hint(L"正则（全串匹配）：", ts(24), y, ts(120));
-    mk_hint(L".{4} 仅 4 码　.{4,} 4 码以上　.{3,4} 3-4 码　[abcde]{4} 指定首码　空 = 不限",
-            ts(24) + ts(116), y, ts(432));
-    y += ts(22);
-    mk_group(L"触发条件 —— 哪些编码才交给 LLM 重排", PAD, gy, CW, y - gy + ts(6));
-  }
-  y += ts(10);
-
-  // ═══ 推理规模 ════════════════════════════════════════════
-  {
-    int gy = y; y += ts(26); g_group_bottom = y;
-    row_edit(y, L"上文 token 上限:", IDC_MAX_TOK, 54,
-             L"取光标前多少 token 当上文（默认 10，越大越准但更慢）");
-    {
-      const wchar_t* lbl = L"参与打分的候选数:";
-      int lw = tw(lbl, g_font);
-      mk(1, lbl, 0, ts(24), y + ts(3), lw + ts(4), ts(20), 0);
-      mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, ts(24) + lw + ts(10), y, ts(54),
-         ts(22), IDC_MAX_CAND);
-      y += ts(34);
+    struct { const wchar_t* label; int id; const wchar_t* tip; } rows[] = {
+        {L"上文 token 上限:", IDC_MAX_TOK, TIP_MAX_TOK},
+        {L"参与打分的候选数:", IDC_MAX_CAND, TIP_MAX_CAND},
+        {L"CPU 线程数:", IDC_CORES, TIP_CORES},
+        {L"用户词频权重:", IDC_FREQ_W, TIP_BETA},
+        {L"预期词长权重:", IDC_ELW, TIP_ELW}};
+    int lw = 0;
+    for (int i = 0; i < 5; ++i) {
+      int w = tw(rows[i].label, g_font);
+      if (w > lw) lw = w;
     }
-    {
-      const wchar_t* lbl = L"CPU 线程数:";
-      int lw = tw(lbl, g_font);
-      mk(1, lbl, 0, ts(24), y + ts(3), lw + ts(4), ts(20), 0);
-      mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, ts(24) + lw + ts(10), y, ts(54),
-         ts(22), IDC_CORES);
-      y += ts(30);
-    }
-    mk_hint(L"候选数一般不用改（CPU 线程数 ≤ 本机物理核，默认 4）", ts(24), y, ts(548));
-    y += ts(20);
-    mk_group(L"推理规模 —— 每次按键算多少、用几个线程", PAD, gy, CW, y - gy + ts(6));
-  }
-  y += ts(10);
+    int gy = y; y += ts(26);
+    for (int i = 0; i < 3; ++i)
+      row_input(y, lw, rows[i].label, rows[i].id, 64, ES_NUMBER, rows[i].tip, HX);
+    mk_group(L"推理规模", PAD, gy, CW, y - gy + ts(8));
+    y += ts(10);
 
-  // ═══ 候选排序融合：公式两行，β/elw 与作用项对齐 ═══════════
-  {
-    int gy = y; y += ts(26); g_group_bottom = y;
-    int ex = ts(24) + ts(112) + ts(8);      // 输入框列（配合左侧公式标签）
-    mk(1, L"融合分 = score +", 0, ts(24), y + ts(3), ts(112), ts(20), 0);
-    mk(2, L"", WS_BORDER | WS_TABSTOP, ex, y, ts(56), ts(22), IDC_FREQ_W);
-    mk(1, L"·log(1+eff)", 0, ex + ts(64), y + ts(3), ts(120), ts(20), 0);
-    y += ts(30);
-    mk_hint(L"β = 词频权重，0 = 关闭（越常上屏的词加分越多，可翻盘 LLM 分差）", ts(24), y, ts(548));
-    y += ts(22);
-    mk(1, L"+", SS_RIGHT, ts(24), y + ts(3), ts(112), ts(20), 0);
-    mk(2, L"", WS_BORDER | WS_TABSTOP, ex, y, ts(56), ts(22), IDC_ELW);
-    mk(1, L"·span·匹配词长", 0, ex + ts(64), y + ts(3), ts(140), ts(20), 0);
-    y += ts(30);
-    mk_hint(L"elw = 预期词长权重，0 = 关闭（仅两码一字方案：词长 = 码长÷2 的候选加成）",
-            ts(24), y, ts(548));
-    y += ts(20);
-    mk_group(L"候选排序融合 —— 最终分数怎么合成", PAD, gy, CW, y - gy + ts(6));
+    gy = y; y += ts(26);
+    for (int i = 3; i < 5; ++i)
+      row_input(y, lw, rows[i].label, rows[i].id, 64, 0, rows[i].tip, HX);
+    mk_group(L"候选排序融合", PAD, gy, CW, y - gy + ts(8));
   }
   y += ts(12);
 
   // ═══ 诊断 + 保存 ═════════════════════════════════════════
-  mk(0, L"诊断日志 debug_fusion（逐块评分明细写入用户文件夹；排障用，平时关闭）",
-     BS_AUTOCHECKBOX | WS_TABSTOP, ts(24), y, ts(548), ts(22), IDC_DEBUG);
-  y += ts(24);
-  mk_hint(L"开启后持续写 rime_llm_debug.txt，排障完建议关闭", ts(24), y, ts(548));
-  y += ts(24);
-  mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, ts(24), y, ts(110), ts(32), IDC_SAVE);
-  mk(0, L"关闭", WS_TABSTOP, ts(24) + ts(118), y, ts(76), ts(32), IDC_CLOSE);
-  mk(1, L"", 0, ts(24) + ts(202), y + ts(6), ts(180), ts(20), IDC_STATUS);
-  mk(0, L"打开用户文件夹", WS_TABSTOP, ts(24) + ts(548) - ts(126), y, ts(126), ts(32),
-     IDC_OPENDIR);
-  y += ts(32);
-  mk_hint(L"参数键名与 llm_rerank.yaml 相同", ts(24), y, ts(200));
+  {
+    HWND cb = mk(0, L"诊断日志 debug_fusion", BS_AUTOCHECKBOX | WS_TABSTOP, LX, y,
+                 tw(L"诊断日志 debug_fusion", g_font) + ts(26), ts(22), IDC_DEBUG);
+    tip_add(cb, TIP_DEBUG);
+    mk_help(HX, y + ts(2), TIP_DEBUG);
+    y += ts(30);
+  }
+  y += ts(4);
+  tip_add(mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, LX, y, ts(110),
+             ts(32), IDC_SAVE), TIP_SAVE);
+  tip_add(mk(0, L"关闭", WS_TABSTOP, LX + ts(118), y, ts(76), ts(32), IDC_CLOSE),
+          TIP_CLOSE);
+  tip_add(mk(0, L"打开用户文件夹", WS_TABSTOP, RX - ts(126), y, ts(126),
+             ts(32), IDC_OPENDIR), TIP_OPENDIR);
+  y += ts(34);
+  // 状态行独占一行（保存/部署消息较长，放按钮行右侧会被截断）
+  mk(1, L"", 0, LX, y, ts(540), ts(20), IDC_STATUS);
+  y += ts(22);
   SYSTEM_INFO si;
   GetSystemInfo(&si);
-  wchar_t note2[160];
-  swprintf_s(note2, L"改动保存后立即生效（本机逻辑核 %lu）", si.dwNumberOfProcessors);
-  mk_hint(note2, ts(24) + ts(210), y, ts(340));
+  wchar_t note[200];
+  swprintf_s(note, L"参数写入选中方案；保存后自动重新部署生效　|　本机逻辑核 %lu",
+             si.dwNumberOfProcessors);
+  mk_hint(note, LX, y, ts(560));
   y += ts(22);
   g_ui_height = y + ts(10);          // 内容总高（调用方据此定窗口高度）
 }
@@ -810,12 +1018,75 @@ static HWND mk_group(const wchar_t* title, int x, int y, int w, int h) {
   return c;
 }
 
-// 灰色小字说明（"这组干什么 / 这个参数填什么"）
+// 灰色小字（状态副行 / 底部动态注）
 static HWND mk_hint(const wchar_t* text, int x, int y, int w) {
   HWND c = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, w, 18,
                          g_hwnd, NULL, NULL, NULL);
   SendMessageW(c, WM_SETFONT, (WPARAM)g_font_hint, TRUE);
   return c;
+}
+
+// ---- 悬停提示（2026-09-30：说明只在这里出现，界面不直出）----
+// tooltips_class32 + TTF_IDISHWND|TTF_SUBCLASS：由 tooltip 自己 subclass
+// 目标控件收鼠标消息，父窗口不用转发任何消息。清单已声明 comctl32 v6，
+// 界面上是圆角气泡样式。
+static void tip_init() {
+  g_tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL,
+                          WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, 0, 0, 0, 0,
+                          g_hwnd, NULL, NULL, NULL);
+  if (!g_tip) return;
+  SetWindowPos(g_tip, HWND_TOPMOST, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+  SendMessageW(g_tip, WM_SETFONT, (WPARAM)g_font_hint, TRUE);
+  // 最大宽度 = 手工断行之外的兜底：超宽自动折行，绝不长到出屏
+  SendMessageW(g_tip, TTM_SETMAXTIPWIDTH, 0, ts(480));
+  SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_INITIAL, MAKELPARAM(300, 0));
+}
+
+static void tip_add(HWND ctl, const wchar_t* text) {
+  if (!g_tip || !ctl || !text || !*text) return;
+  g_tips.push_back(text);          // deque：指针不会被后续 push_back 搬走
+  TOOLINFOW ti;
+  ZeroMemory(&ti, sizeof(ti));
+  ti.cbSize = sizeof(ti);
+  ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+  ti.hwnd = g_hwnd;
+  ti.uId = (UINT_PTR)ctl;
+  ti.lpszText = (LPWSTR)g_tips.back().c_str();
+  SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
+
+// 「?」徽标：SS_OWNERDRAW 小圆 + 问号，自身挂悬停提示（WM_DRAWITEM 里画）。
+// 坑：静态控件**不带 SS_NOTIFY 时 WM_NCHITTEST 返回 HTTRANSPARENT**（鼠标
+// 消息直接穿透给父窗口）→ tooltip 的 TTF_SUBCLASS 永远收不到 WM_MOUSEMOVE，
+// 悬停没反应（2026-09-30 实测：徽标画得出、提示不出）。故必须带 SS_NOTIFY。
+static HWND mk_help(int x, int y, const wchar_t* tip) {
+  HWND c = CreateWindowW(L"STATIC", L"?",
+                         WS_CHILD | WS_VISIBLE | SS_OWNERDRAW | SS_NOTIFY, x, y,
+                         ts(18), ts(18), g_hwnd, NULL, NULL, NULL);
+  tip_add(c, tip);
+  return c;
+}
+
+// WM_DRAWITEM（ODT_STATIC）：画浅蓝圆底 + 深蓝问号。
+// 窗口类背景是 COLOR_WINDOW（白），故先用白刷擦底再画圆。
+static void draw_help(const DRAWITEMSTRUCT* d) {
+  RECT r = d->rcItem;
+  FillRect(d->hDC, &r, (HBRUSH)GetStockObject(WHITE_BRUSH));
+  HBRUSH fill = CreateSolidBrush(RGB(228, 235, 244));
+  HPEN edge = CreatePen(PS_SOLID, 1, RGB(150, 172, 200));
+  HGDIOBJ ob = SelectObject(d->hDC, fill);
+  HGDIOBJ op = SelectObject(d->hDC, edge);
+  Ellipse(d->hDC, r.left, r.top, r.right, r.bottom);
+  SelectObject(d->hDC, ob);
+  SelectObject(d->hDC, op);
+  DeleteObject(fill);
+  DeleteObject(edge);
+  SetBkMode(d->hDC, TRANSPARENT);
+  SetTextColor(d->hDC, RGB(45, 78, 120));
+  HGDIOBJ of = SelectObject(d->hDC, g_font_help);
+  DrawTextW(d->hDC, L"?", 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+  SelectObject(d->hDC, of);
 }
 
 static void on_browse() {
@@ -846,7 +1117,7 @@ static void on_browse() {
 }
 
 static void on_open_dir() {
-  std::wstring dir = yaml_path();
+  std::wstring dir = rime_user_dir();
   if (dir.empty()) {
     set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"无法定位用户文件夹（APPDATA 缺失）");
     return;
@@ -860,9 +1131,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
       g_hwnd = h;
       make_ui();
-      load_params();
-      params_to_ui();
-      scan_schemas();
+      scan_schemas();        // 填方案下拉（默认选第一个）
+      load_schema_params();  // 读该方案的 llm_rerank 节 → 界面
       // 内容高由 make_ui() 算出 → 此刻按它校正窗口尺寸（设计宽 620 + 内容高）
       if (g_ui_height > 0) {
         RECT cr = {0, 0, ts(620), g_ui_height};
@@ -881,26 +1151,32 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         refresh_model_status();  // 手输/下拉选择/浏览返回即刷新
         return 0;
       }
+      // 切换方案 = 切换配置（配置节在方案里，2026-09-30 定案）
+      if (LOWORD(wp) == IDC_SCHEMA && HIWORD(wp) == CBN_SELCHANGE) {
+        load_schema_params();
+        return 0;
+      }
       switch (LOWORD(wp)) {
         case IDC_BROWSE: on_browse(); return 0;
         case IDC_OPENDIR: on_open_dir(); return 0;
-        case IDC_SCHEMAREF: scan_schemas(); return 0;
+        case IDC_SCHEMAREF: scan_schemas(); load_schema_params(); return 0;
         case IDC_SCHEMAADD: on_schema_add(); return 0;
         case IDC_SCHEMAREM: on_schema_remove(); return 0;
-        case IDC_SAVE: {
-          ui_to_params();
-          if (save_params())
-            set_status(GetDlgItem(h, IDC_STATUS), L"已保存，立即生效");
-          else
-            set_status(GetDlgItem(h, IDC_STATUS), L"保存失败（无法写入用户目录）");
-          return 0;
-        }
+        case IDC_SAVE: save_schema_params(); return 0;
         case IDC_CLOSE: DestroyWindow(h); return 0;
         case IDCANCEL:            // IsDialogMessage 把 ESC 映射为 IDCANCEL
           DestroyWindow(h);
           return 0;
       }
       break;
+    case WM_DRAWITEM: {
+      const DRAWITEMSTRUCT* d = (const DRAWITEMSTRUCT*)lp;
+      if (d && d->CtlType == ODT_STATIC) {  // 只有「?」徽标是 owner-draw static
+        draw_help(d);
+        return TRUE;
+      }
+      break;
+    }
     case WM_DESTROY:
       PostQuitMessage(0);
       return 0;
@@ -911,6 +1187,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   // 主线程 STA：Vista+ 打开/保存对话框内部走 COM，缺初始化会静默失败
   CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+  // 悬停提示（tooltips_class32）需要初始化 common controls
+  INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_WIN95_CLASSES};
+  InitCommonControlsEx(&icc);
   WNDCLASSW wc = {0};
   wc.lpfnWndProc = WndProc;
   wc.hInstance = inst;

@@ -1,6 +1,8 @@
 @echo off
 REM build_llm_setup.bat - WeaselLLMSetup.exe x64 Release (cl direct build, no vcxproj)
-REM LLM rerank settings GUI: reads/writes %APPDATA%\Rime\llm_rerank.yaml (hot reload).
+REM LLM rerank settings GUI: reads/writes the llm_rerank section of the selected
+REM   %APPDATA%\Rime\*.schema.yaml, then triggers a re-deploy (config lives in
+REM   the scheme since 2026-09-30 - the global llm_rerank.yaml is gone).
 REM Manifest: explicit (v6 common controls + system DPI awareness) - see
 REM   weasel\WeaselLLMSetup\WeaselLLMSetup.manifest. Without the DPI setting the
 REM   dialog is bitmap-stretched on scaled displays (blurry dark edges).
