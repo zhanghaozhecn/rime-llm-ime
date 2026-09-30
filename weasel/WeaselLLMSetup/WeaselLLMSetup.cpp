@@ -58,7 +58,9 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 struct Params {
   bool enabled = false;
   int min_code_len = 4, max_code_len = 0;
-  int min_tokens = 1, max_tokens = 10, cpu_cores = 4;
+  // min_tokens 不再暴露给用户（2026-09-30 定案：最少上文 token 恒为 1，
+  // 代码内默认值保留，yaml/schema 里的旧行读取时忽略、写入时不再产出）
+  int max_tokens = 10, cpu_cores = 4;
   double elw = 0.2, freq_beta = 1.5;
   int max_candidates = 5;
   bool debug_fusion = false;
@@ -139,7 +141,7 @@ static void load_params() {
     else if (key == "max_code_len") g_p.max_code_len = atoi(val.c_str());
     else if (key == "expected_length_weight") g_p.elw = atof(val.c_str());
     else if (key == "freq_beta") g_p.freq_beta = atof(val.c_str());
-    else if (key == "min_tokens") g_p.min_tokens = atoi(val.c_str());
+    // 旧行 "min_tokens" 有意忽略（用户配置面移除，固定 C++ 默认 1，2026-09-30）
     else if (key == "max_tokens") g_p.max_tokens = atoi(val.c_str());
     else if (key == "max_candidates") g_p.max_candidates = atoi(val.c_str());
     else if (key == "cpu_cores") g_p.cpu_cores = atoi(val.c_str());
@@ -163,7 +165,6 @@ static bool save_params() {
   sprintf_s(buf, "max_code_len: %d # 0=不限制\n", g_p.max_code_len); out += buf;
   sprintf_s(buf, "expected_length_weight: %.2f\n", g_p.elw); out += buf;
   sprintf_s(buf, "freq_beta: %.2f\n", g_p.freq_beta); out += buf;
-  sprintf_s(buf, "min_tokens: %d\n", g_p.min_tokens); out += buf;
   sprintf_s(buf, "max_tokens: %d\n", g_p.max_tokens); out += buf;
   sprintf_s(buf, "max_candidates: %d\n", g_p.max_candidates); out += buf;
   sprintf_s(buf, "cpu_cores: %d\n", g_p.cpu_cores); out += buf;
@@ -507,7 +508,7 @@ static void ui_to_params() {
   wchar_t buf[512];
   struct { int id; int* v; } ints[] = {
       {IDC_MIN_CODE, &g_p.min_code_len}, {IDC_MAX_CODE, &g_p.max_code_len},
-      {IDC_MIN_TOK, &g_p.min_tokens},   {IDC_MAX_TOK, &g_p.max_tokens},
+      {IDC_MAX_TOK, &g_p.max_tokens},
       {IDC_CORES, &g_p.cpu_cores},
       {IDC_MAX_CAND, &g_p.max_candidates}};
   for (auto& r : ints) {
@@ -534,7 +535,7 @@ static void params_to_ui() {
   wchar_t buf[64];
   struct { int id; int v; } rows[] = {
       {IDC_MIN_CODE, g_p.min_code_len}, {IDC_MAX_CODE, g_p.max_code_len},
-      {IDC_MIN_TOK, g_p.min_tokens},    {IDC_MAX_TOK, g_p.max_tokens},
+      {IDC_MAX_TOK, g_p.max_tokens},
       {IDC_CORES, g_p.cpu_cores},       {IDC_MAX_CAND, g_p.max_candidates}};
   for (auto& r : rows) {
     swprintf_s(buf, L"%d", r.v);
@@ -598,47 +599,45 @@ static void make_ui() {
   mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 193, 52, 22, IDC_MIN_CODE);
   mk(1, L"最大编码长度（0=不限）", 0, 200, 196, 168, 20, 0);
   mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 374, 193, 52, 22, IDC_MAX_CODE);
-  mk(1, L"最少上文 token", 0, 15, 226, 106, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 223, 52, 22, IDC_MIN_TOK);
   // ── 推理规模 ─────────────────────────────────
-  hdr = mk(1, L"推理规模 —— 每次算多少、多快", 0, 15, 254, 340, 18, 0);
+  hdr = mk(1, L"推理规模 —— 每次算多少、多快", 0, 15, 226, 340, 18, 0);
   SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
-  mk(1, L"上文 token 上限", 0, 15, 278, 106, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 275, 52, 22, IDC_MAX_TOK);
-  mk(1, L"候选数上限", 0, 200, 278, 96, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 374, 275, 52, 22, IDC_MAX_CAND);
-  mk(1, L"CPU 线程数", 0, 15, 308, 98, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 305, 52, 22, IDC_CORES);
+  mk(1, L"上文 token 上限", 0, 15, 250, 106, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 247, 52, 22, IDC_MAX_TOK);
+  mk(1, L"候选数上限", 0, 200, 250, 96, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 374, 247, 52, 22, IDC_MAX_CAND);
+  mk(1, L"CPU 线程数", 0, 15, 280, 98, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 277, 52, 22, IDC_CORES);
   // ── 候选排序融合：公式两行，β/elw 挖空与作用项对齐（两框同列 x=127）──
-  hdr = mk(1, L"候选排序融合 —— 分数怎么合成", 0, 15, 336, 380, 18, 0);
+  hdr = mk(1, L"候选排序融合 —— 分数怎么合成", 0, 15, 308, 380, 18, 0);
   SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
-  mk(1, L"融合分 = score + ", 0, 15, 360, 108, 20, 0);
-  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 357, 50, 22, IDC_FREQ_W);
-  mk(1, L"·log(1+eff)", 0, 181, 360, 82, 20, 0);
-  mk(1, L"+", SS_RIGHT, 15, 388, 108, 20, 0);
-  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 385, 50, 22, IDC_ELW);
-  mk(1, L"·span·匹配词长", 0, 181, 388, 130, 20, 0);
+  mk(1, L"融合分 = score + ", 0, 15, 332, 108, 20, 0);
+  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 329, 50, 22, IDC_FREQ_W);
+  mk(1, L"·log(1+eff)", 0, 181, 332, 82, 20, 0);
+  mk(1, L"+", SS_RIGHT, 15, 360, 108, 20, 0);
+  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 357, 50, 22, IDC_ELW);
+  mk(1, L"·span·匹配词长", 0, 181, 360, 130, 20, 0);
   mk(1, L"β = 词频系数（0=关闭）；elw = 预期词长权重（0=关闭）",
-     0, 15, 416, 420, 18, 0);
+     0, 15, 388, 420, 18, 0);
   mk(1, L"elw 仅两码一字方案生效：词长=码长/2 的候选获得 span×elw 加成",
-     0, 15, 436, 480, 18, 0);
+     0, 15, 408, 480, 18, 0);
   // ── 保存 / 状态 ──────────────────────────────
-  mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, 15, 462, 110, 30,
+  mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, 15, 434, 110, 30,
      IDC_SAVE);
-  mk(0, L"关闭", WS_TABSTOP, 133, 462, 70, 30, IDC_CLOSE);
-  mk(0, L"打开用户文件夹", WS_TABSTOP, 440, 464, 114, 26, IDC_OPENDIR);
-  mk(1, L"", 0, 213, 468, 215, 18, IDC_STATUS);
+  mk(0, L"关闭", WS_TABSTOP, 133, 434, 70, 30, IDC_CLOSE);
+  mk(0, L"打开用户文件夹", WS_TABSTOP, 440, 436, 114, 26, IDC_OPENDIR);
+  mk(1, L"", 0, 213, 440, 215, 18, IDC_STATUS);
   SYSTEM_INFO si;
   GetSystemInfo(&si);
   wchar_t note2[128];
   swprintf_s(note2,
              L"参数键名与 llm_rerank.yaml 相同；修改保存后立即生效（本机逻辑核 %lu）",
              si.dwNumberOfProcessors);
-  mk(1, note2, 0, 15, 498, 539, 18, 0);
+  mk(1, note2, 0, 15, 470, 539, 18, 0);
   // ── 排障 ────────────────────────────────────
   // 诊断开关（2026-09-04 GUI 化；此前仅 yaml 手改）：排障时逐步评分
   mk(0, L"诊断日志 debug_fusion（逐块评分明细写用户文件夹 rime_llm_debug.txt）",
-     BS_AUTOCHECKBOX | WS_TABSTOP, 15, 522, 539, 22, IDC_DEBUG);
+     BS_AUTOCHECKBOX | WS_TABSTOP, 15, 494, 539, 22, IDC_DEBUG);
 }
 
 static void on_browse() {
@@ -737,7 +736,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   HWND h = CreateWindowExW(WS_EX_APPWINDOW, L"WeaselLLMSetup",
                            L"LLM 重排设置 — 小狼毫", WS_OVERLAPPEDWINDOW &
                                ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 585, 592, NULL, NULL,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 585, 564, NULL, NULL,
                            inst, NULL);
   ShowWindow(h, show);
   UpdateWindow(h);
