@@ -6,7 +6,7 @@
 # 下拉停留默认第一项 = 活方案 pdsp.schema.yaml；已从 .source 恢复。）
 # 结构照搬已验证可行的分步手动调试（单消息类 + 顶层顺序 + 固定等待）。
 $ErrorActionPreference = "Stop"
-$exe = "D:\rime-llm-ime\bin\WeaselLLMSetup.exe"
+$exe = (Resolve-Path (Join-Path $PSScriptRoot "..\bin\WeaselLLMSetup.exe")).Path   # 相对本脚本定位，免绝对路径
 $sandbox = Join-Path $env:TEMP ("llmsetup_sandbox_" + [Guid]::NewGuid().ToString("N").Substring(0, 8))
 $test = Join-Path $sandbox "Rime\zz_test_gui.schema.yaml"
 

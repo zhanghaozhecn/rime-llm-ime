@@ -1,4 +1,4 @@
-﻿# 构建产物
+# 构建产物
 build/
 output/
 msbuild/
@@ -24,6 +24,8 @@ Thumbs.db
 Desktop.ini
 
 # bench_threads 运行时生成的结果文件
+# 注意：bench_threads（.cpp/.bat/exe）的规范源在插件版 ..\rime-llm-rerank\cpp\，
+#       本仓库不再放副本（2026-09-30 去重，子项目互不共享文件）
 bench_threads_result.txt
 
 # scripts/ 白名单：只发布构建/部署/测试工具，本机专用脚本（gbk 历史脚本、
@@ -49,10 +51,6 @@ scripts/*
 !scripts/probe_uia_ctx.cpp
 !scripts/build_probe_uia_ctx.bat
 !scripts/run_test_rime.bat
-!scripts/test_llm_context.cpp
-!scripts/build_test_llm_context.bat
-!scripts/bench_threads.cpp
-!scripts/build_bench_threads.bat
 !scripts/build_llm_setup.bat
 !scripts/build_setup.bat
 !scripts/build_pkg.bat
