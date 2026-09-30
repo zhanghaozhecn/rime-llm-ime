@@ -41,6 +41,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_MIN_TOK      1013
 #define IDC_MAX_TOK      1014
 #define IDC_CORES        1015
+#define IDC_CODE_PAT     1016   // 编码匹配正则（2026-09-30 取代 min/max_code_len）
 #define IDC_ELW          1021
 #define IDC_FREQ_W       1022
 #define IDC_DEBUG        1023
@@ -57,7 +58,9 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 struct Params {
   bool enabled = false;
-  int min_code_len = 4, max_code_len = 0;
+  // 编码匹配正则（2026-09-30 取代 min_code_len/max_code_len）：全串匹配，
+  // 语义同 Rime speller/auto_select_pattern。默认恰 4 码。
+  std::string code_pattern = ".{4}";
   // min_tokens 不再暴露给用户（2026-09-30 定案：最少上文 token 恒为 1，
   // 代码内默认值保留，yaml/schema 里的旧行读取时忽略、写入时不再产出）
   int max_tokens = 10, cpu_cores = 4;
@@ -114,6 +117,20 @@ static std::string trim(const std::string& s) {
   return s.substr(a, b - a + 1);
 }
 
+// YAML 标量转义（2026-09-30，code_pattern 引入）：
+// 含特殊字符（{[}]:,#&*!|>%@`"' 空格 或反斜杠）时用**单引号**包起——
+// 双引号标量里 \d 这类非法转义在 YAML 里会直接报错，单引号则原样保留正则。
+static std::string yaml_scalar(const std::string& s) {
+  if (!s.empty() && s.find_first_of("{}[]:,#&*!|>%@`\"' \\") == std::string::npos)
+    return s;  // 安全裸标量
+  std::string q = "'";
+  for (char ch : s) {
+    if (ch == '\'') q += "''";  // 单引号内的单引号写两遍
+    else q += ch;
+  }
+  return q + "'";
+}
+
 // ---- llm_rerank.yaml 读写（与 llm_filter.cc 的扁平解析同构）----
 static void load_params() {
   std::wstring dir = yaml_path();
@@ -129,16 +146,21 @@ static void load_params() {
     if (c == std::string::npos) continue;
     std::string key = trim(ln.substr(0, c));
     std::string val = trim(ln.substr(c + 1));
-    if (!val.empty() && val[0] == '"') {
-      size_t e = val.find('"', 1);
+    // 双引号（历史 model_path 风格）与单引号（code_pattern 正则风格，2026-09-30）
+    // 都要去壳——只认双引号会让正则值带壳
+    if (!val.empty() && (val[0] == '"' || val[0] == '\'')) {
+      size_t e = val.find(val[0], 1);
       val = (e == std::string::npos) ? val.substr(1) : val.substr(1, e - 1);
     } else {
       size_t h = val.find('#');
       if (h != std::string::npos) val = trim(val.substr(0, h));
     }
     if (key == "enabled") g_p.enabled = (val == "true");
-    else if (key == "min_code_len") g_p.min_code_len = atoi(val.c_str());
-    else if (key == "max_code_len") g_p.max_code_len = atoi(val.c_str());
+    else if (key == "code_pattern") g_p.code_pattern = val;
+    // 旧键 min_code_len / max_code_len 有意忽略（触发条件已改为 code_pattern，
+    // 2026-09-30）：保存时自然消失；等价换算 min=4,max=0 ⇒ '.{4}'
+    else if (key == "min_code_len") { /* 旧键忽略 */ }
+    else if (key == "max_code_len") { /* 旧键忽略 */ }
     else if (key == "expected_length_weight") g_p.elw = atof(val.c_str());
     else if (key == "freq_beta") g_p.freq_beta = atof(val.c_str());
     // 旧行 "min_tokens" 有意忽略（用户配置面移除，固定 C++ 默认 1，2026-09-30）
@@ -161,8 +183,7 @@ static bool save_params() {
   out += "# LLM 重排全局配置（WeaselLLMSetup 写入；llm_filter 热重载即时生效）\n";
   out += "# 优先级：方案内 llm_rerank 节 > 本文件 > 内置默认\n";
   out += g_p.enabled ? "enabled: true\n" : "enabled: false\n";
-  sprintf_s(buf, "min_code_len: %d\n", g_p.min_code_len); out += buf;
-  sprintf_s(buf, "max_code_len: %d # 0=不限制\n", g_p.max_code_len); out += buf;
+  out += "code_pattern: " + yaml_scalar(g_p.code_pattern) + "\n";
   sprintf_s(buf, "expected_length_weight: %.2f\n", g_p.elw); out += buf;
   sprintf_s(buf, "freq_beta: %.2f\n", g_p.freq_beta); out += buf;
   sprintf_s(buf, "max_tokens: %d\n", g_p.max_tokens); out += buf;
@@ -507,13 +528,21 @@ static void ui_to_params() {
   g_p.debug_fusion = SendMessageW(GetDlgItem(g_hwnd, IDC_DEBUG), BM_GETCHECK, 0, 0) == BST_CHECKED;
   wchar_t buf[512];
   struct { int id; int* v; } ints[] = {
-      {IDC_MIN_CODE, &g_p.min_code_len}, {IDC_MAX_CODE, &g_p.max_code_len},
       {IDC_MAX_TOK, &g_p.max_tokens},
       {IDC_CORES, &g_p.cpu_cores},
       {IDC_MAX_CAND, &g_p.max_candidates}};
   for (auto& r : ints) {
     GetDlgItemTextW(g_hwnd, r.id, buf, 64);
     *r.v = (int)wcstol(buf, NULL, 10);
+  }
+  // 编码匹配正则（原样收，不做数值解析；空串 = 不限制）。
+  // 正则语法本身是 ASCII，按 ASCII 收窄即可（中文只在注释里，不入模式）
+  GetDlgItemTextW(g_hwnd, IDC_CODE_PAT, buf, 512);
+  {
+    std::string pat;
+    for (const wchar_t* p = buf; *p; ++p)
+      if (*p < 128) pat += (char)*p;
+    g_p.code_pattern = trim(pat);
   }
   struct { int id; double* v; } dbls[] = {{IDC_ELW, &g_p.elw},
                                           {IDC_FREQ_W, &g_p.freq_beta}};
@@ -532,9 +561,9 @@ static void params_to_ui() {
   SendMessageW(GetDlgItem(g_hwnd, IDC_DEBUG), BM_SETCHECK,
                g_p.debug_fusion ? BST_CHECKED : BST_UNCHECKED, 0);
   SetDlgItemTextW(g_hwnd, IDC_MODEL, shown_model().c_str());
+  SetDlgItemTextW(g_hwnd, IDC_CODE_PAT, utf8_to_wide(g_p.code_pattern).c_str());
   wchar_t buf[64];
   struct { int id; int v; } rows[] = {
-      {IDC_MIN_CODE, g_p.min_code_len}, {IDC_MAX_CODE, g_p.max_code_len},
       {IDC_MAX_TOK, g_p.max_tokens},
       {IDC_CORES, g_p.cpu_cores},       {IDC_MAX_CAND, g_p.max_candidates}};
   for (auto& r : rows) {
@@ -595,49 +624,49 @@ static void make_ui() {
   // ── 触发条件 ─────────────────────────────────
   hdr = mk(1, L"触发条件 —— 何时打分", 0, 15, 172, 300, 18, 0);
   SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
-  mk(1, L"最小编码长度", 0, 15, 196, 96, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 193, 52, 22, IDC_MIN_CODE);
-  mk(1, L"最大编码长度（0=不限）", 0, 200, 196, 168, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 374, 193, 52, 22, IDC_MAX_CODE);
+  mk(1, L"编码匹配（正则，全串）", 0, 15, 196, 160, 20, 0);
+  mk(2, L"", WS_BORDER | WS_TABSTOP, 180, 193, 150, 22, IDC_CODE_PAT);
+  mk(1, L"4 码 .{4}｜4 码以上 .{4,}｜3-4 码 .{3,4}｜[abcde]{4}｜空 = 不限",
+     0, 15, 218, 539, 18, 0);
   // ── 推理规模 ─────────────────────────────────
-  hdr = mk(1, L"推理规模 —— 每次算多少、多快", 0, 15, 226, 340, 18, 0);
+  hdr = mk(1, L"推理规模 —— 每次算多少、多快", 0, 15, 244, 340, 18, 0);
   SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
-  mk(1, L"上文 token 上限", 0, 15, 250, 106, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 247, 52, 22, IDC_MAX_TOK);
-  mk(1, L"候选数上限", 0, 200, 250, 96, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 374, 247, 52, 22, IDC_MAX_CAND);
-  mk(1, L"CPU 线程数", 0, 15, 280, 98, 20, 0);
-  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 277, 52, 22, IDC_CORES);
+  mk(1, L"上文 token 上限", 0, 15, 268, 106, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 265, 52, 22, IDC_MAX_TOK);
+  mk(1, L"候选数上限", 0, 200, 268, 96, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 374, 265, 52, 22, IDC_MAX_CAND);
+  mk(1, L"CPU 线程数", 0, 15, 298, 98, 20, 0);
+  mk(2, L"", WS_BORDER | ES_NUMBER | WS_TABSTOP, 125, 295, 52, 22, IDC_CORES);
   // ── 候选排序融合：公式两行，β/elw 挖空与作用项对齐（两框同列 x=127）──
-  hdr = mk(1, L"候选排序融合 —— 分数怎么合成", 0, 15, 308, 380, 18, 0);
+  hdr = mk(1, L"候选排序融合 —— 分数怎么合成", 0, 15, 326, 380, 18, 0);
   SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font_bold, TRUE);
-  mk(1, L"融合分 = score + ", 0, 15, 332, 108, 20, 0);
-  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 329, 50, 22, IDC_FREQ_W);
-  mk(1, L"·log(1+eff)", 0, 181, 332, 82, 20, 0);
-  mk(1, L"+", SS_RIGHT, 15, 360, 108, 20, 0);
-  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 357, 50, 22, IDC_ELW);
-  mk(1, L"·span·匹配词长", 0, 181, 360, 130, 20, 0);
+  mk(1, L"融合分 = score + ", 0, 15, 350, 108, 20, 0);
+  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 347, 50, 22, IDC_FREQ_W);
+  mk(1, L"·log(1+eff)", 0, 181, 350, 82, 20, 0);
+  mk(1, L"+", SS_RIGHT, 15, 378, 108, 20, 0);
+  mk(2, L"", WS_BORDER | WS_TABSTOP, 127, 375, 50, 22, IDC_ELW);
+  mk(1, L"·span·匹配词长", 0, 181, 378, 130, 20, 0);
   mk(1, L"β = 词频系数（0=关闭）；elw = 预期词长权重（0=关闭）",
-     0, 15, 388, 420, 18, 0);
+     0, 15, 406, 420, 18, 0);
   mk(1, L"elw 仅两码一字方案生效：词长=码长/2 的候选获得 span×elw 加成",
-     0, 15, 408, 480, 18, 0);
+     0, 15, 426, 480, 18, 0);
   // ── 保存 / 状态 ──────────────────────────────
-  mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, 15, 434, 110, 30,
+  mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, 15, 452, 110, 30,
      IDC_SAVE);
-  mk(0, L"关闭", WS_TABSTOP, 133, 434, 70, 30, IDC_CLOSE);
-  mk(0, L"打开用户文件夹", WS_TABSTOP, 440, 436, 114, 26, IDC_OPENDIR);
-  mk(1, L"", 0, 213, 440, 215, 18, IDC_STATUS);
+  mk(0, L"关闭", WS_TABSTOP, 133, 452, 70, 30, IDC_CLOSE);
+  mk(0, L"打开用户文件夹", WS_TABSTOP, 440, 454, 114, 26, IDC_OPENDIR);
+  mk(1, L"", 0, 213, 458, 215, 18, IDC_STATUS);
   SYSTEM_INFO si;
   GetSystemInfo(&si);
   wchar_t note2[128];
   swprintf_s(note2,
              L"参数键名与 llm_rerank.yaml 相同；修改保存后立即生效（本机逻辑核 %lu）",
              si.dwNumberOfProcessors);
-  mk(1, note2, 0, 15, 470, 539, 18, 0);
+  mk(1, note2, 0, 15, 488, 539, 18, 0);
   // ── 排障 ────────────────────────────────────
   // 诊断开关（2026-09-04 GUI 化；此前仅 yaml 手改）：排障时逐步评分
   mk(0, L"诊断日志 debug_fusion（逐块评分明细写用户文件夹 rime_llm_debug.txt）",
-     BS_AUTOCHECKBOX | WS_TABSTOP, 15, 494, 539, 22, IDC_DEBUG);
+     BS_AUTOCHECKBOX | WS_TABSTOP, 15, 512, 539, 22, IDC_DEBUG);
 }
 
 static void on_browse() {
@@ -736,7 +765,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   HWND h = CreateWindowExW(WS_EX_APPWINDOW, L"WeaselLLMSetup",
                            L"LLM 重排设置 — 小狼毫", WS_OVERLAPPEDWINDOW &
                                ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 585, 564, NULL, NULL,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 585, 582, NULL, NULL,
                            inst, NULL);
   ShowWindow(h, show);
   UpdateWindow(h);

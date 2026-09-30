@@ -16,6 +16,7 @@ using System.Runtime.InteropServices;
 public class W {
   [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr h, int id);
   [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll", EntryPoint="SendMessageW", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessageStr(IntPtr h, uint m, IntPtr w, string s);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int n);
 }
 "@
@@ -139,6 +140,28 @@ engine:
   $st = Click-Remove $hw
   Assert "重复剥离提示未发现" ($st -match "未发现")
   Write-Host ("  status: " + $st)
+
+  # phase7: 参数保存写出 llm_rerank.yaml（2026-09-30 起触发条件 = code_pattern 正则；
+  # 旧键 min/max_code_len 与 min_tokens 都不应再产出）
+  Write-Host "== phase7: 保存参数 → llm_rerank.yaml =="
+  $yaml = Join-Path $sandbox "Rime\llm_rerank.yaml"
+  if (Test-Path $yaml) { Remove-Item $yaml -Force }   # 确保是本次保存写出
+  # 写入一个带特殊字符的正则（YAML 单引号风格 + 花括号）
+  $txt = [W]::GetDlgItem($hw, 1016)                    # IDC_CODE_PAT
+  [W]::SendMessage($txt, 0x000C, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # WM_SETTEXT ""（先清空）
+  [W]::SendMessageStr($txt, 0x000C, [IntPtr]::Zero, "[abcde]{4}") | Out-Null # WM_SETTEXT 目标值
+  [W]::SendMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # IDC_SAVE
+  Start-Sleep -Milliseconds 900
+  Assert "llm_rerank.yaml 已写出" (Test-Path $yaml)
+  if (Test-Path $yaml) {
+    $y = Get-Content $yaml -Encoding UTF8
+    Assert "code_pattern 单引号写出 [abcde]{4}" (($y | Where-Object { $_ -match "^code_pattern: '\[abcde\]\{4\}'" }).Count -eq 1)
+    Assert "旧键 min_code_len 不再产出" (($y | Where-Object { $_ -match '^min_code_len:' }).Count -eq 0)
+    Assert "旧键 max_code_len 不再产出" (($y | Where-Object { $_ -match '^max_code_len:' }).Count -eq 0)
+    Assert "旧键 min_tokens 不再产出" (($y | Where-Object { $_ -match '^min_tokens:' }).Count -eq 0)
+    Write-Host "  --- llm_rerank.yaml ---"
+    $y | ForEach-Object { Write-Host ("    " + $_) }
+  }
 }
 finally {
   Get-Process WeaselLLMSetup -ErrorAction SilentlyContinue | Stop-Process -Force

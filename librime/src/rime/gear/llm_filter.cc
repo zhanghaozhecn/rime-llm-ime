@@ -36,6 +36,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <boost/regex.hpp>  // code_pattern：与 speller/auto_select_pattern 同引擎同语义
 
 #include "llama.h"
 
@@ -61,9 +62,12 @@ static std::atomic<bool> g_loading{false};
 
 // schema llm_rerank/ section (defaults match the old project):
 //   enabled: true|false — false disables rerank entirely (pass-through)
-//   min_code_len: input code length below this -> no rerank
-//   max_code_len: input code length above this -> no rerank (0 = unlimited);
-//                 [min, max] = rerank trigger window
+//   code_pattern: 编码串**全串**正则匹配（2026-09-30 取代 min/max_code_len）；
+//                 语义与引擎同 speller/auto_select_pattern（boost::regex_match）。
+//                 例：'.{4}' 恰 4 码 / '.{4,}' 4 码以上 / '.{3,4}' / '[abcde]{4}'；
+//                 空串 = 不限制；非法模式回退默认 '.{4}' 并写日志。
+//   min_code_len / max_code_len: **旧键，已不生效**（解析保留仅为兼容历史
+//                 yaml；等价换算 min=4,max=0 ⇒ code_pattern '.{4}'）
 //   expected_length_weight: >0 = bonus candidates whose word length equals
 //                 floor(code_len/2) (两码一字), weighted by current score span
 //   freq_beta: 用户词频对数融合 fused = score + β·log(1+eff)（score=原始
@@ -99,8 +103,17 @@ static std::string default_model_path() {
 static std::string g_model_path;  // 空 = 未配置，load_model 时按默认兜底
 static std::string g_loaded_from; // 当前已加载模型来自的路径（变更检测）
 static bool g_enabled = false;  // CPU only; GPU build retired (not published)
-static int g_min_code_len = 4;
-static int g_max_code_len = 0;  // 0 = no upper limit (plugin-version parity)
+// 触发条件（2026-09-30 起）：编码串是否匹配 code_pattern，**全串匹配**，
+// 语义与引擎同 Rime 自身的 speller/auto_select_pattern（boost::regex_match）。
+// 取代旧的两个整数键 min_code_len / max_code_len（用户配置面已移除；解析端
+// 保留 has_min/max 字段仅为兼容历史 yaml，本过滤层不再读它们）。
+// 默认 ".{4}" = 恰 4 码，与旧默认（min=4, max=0 不限）生产主路径一致。
+static const char *kDefaultCodePattern = ".{4}";
+static std::string g_code_pattern = kDefaultCodePattern;
+static boost::regex g_code_re;          // 编译缓存（llm_apply_params 时重建）
+static bool g_code_re_ok = true;        // 模式非法 → false（回退默认成功后仍为 true）
+static int g_min_code_len = 4;          // 保留：仅日志/兼容，不再作为用户配置项
+static int g_max_code_len = 0;          // 保留：同上（0 = 无上限）
 static double g_expected_length_weight = 0.2;  // 预期词长加权 (冷启动标定 2026-09-03; 两版统一)
 // 用户词频对数融合 (2026-09-02): fused = score + β·log(1+eff), 默认 β=1.5
 // (本机打字真实窗回放标定: β∈[1,2] 平台, 大 β 为标签偏好假象; 见 Collect 段)
@@ -132,8 +145,9 @@ static int g_max_candidates = 5;   // candidates participating in scoring
 // 加载；model_path 热改不重载模型，需重启会话）。engine 线程调用。 ====
 struct LlmParamSet {
   bool has_enabled = false;      bool enabled = false;
-  bool has_min_code_len = false; int min_code_len = 4;
-  bool has_max_code_len = false; int max_code_len = 0;
+  bool has_min_code_len = false; int min_code_len = 4;   // 旧键：解析保留、不再生效
+  bool has_max_code_len = false; int max_code_len = 0;   // 旧键：解析保留、不再生效
+  bool has_code_pattern = false; std::string code_pattern;  // 2026-09-30 新键
   bool has_elw = false;          double elw = 0.2;
   bool has_freq_beta = false;    double freq_beta = 1.5;
   bool has_min_tokens = false;   int min_tokens = 1;
@@ -151,12 +165,31 @@ static void load_model_async();      // fwd decl（定义在下方）
 static void llm_apply_params() {
   const LlmParamSet &s = g_schema_params, &y = g_yaml_params;
   g_enabled = s.has_enabled ? s.enabled : (y.has_enabled ? y.enabled : false);
-  g_min_code_len = s.has_min_code_len
-                       ? s.min_code_len
-                       : (y.has_min_code_len ? y.min_code_len : 4);
-  g_max_code_len = s.has_max_code_len
-                       ? s.max_code_len
-                       : (y.has_max_code_len ? y.max_code_len : 0);
+  // 触发条件：code_pattern（三级优先级）。空串 = 不限制（总是匹配）。
+  g_code_pattern = s.has_code_pattern
+                       ? s.code_pattern
+                       : (y.has_code_pattern ? y.code_pattern : kDefaultCodePattern);
+  g_code_re_ok = true;
+  if (!g_code_pattern.empty()) {
+    try {
+      g_code_re = boost::regex(g_code_pattern);
+    } catch (const std::exception &e) {
+      log_msg("code_pattern invalid ('%s': %s) -> fallback '%s'",
+              g_code_pattern.c_str(), e.what(), kDefaultCodePattern);
+      g_code_pattern = kDefaultCodePattern;
+      try {
+        g_code_re = boost::regex(g_code_pattern);
+      } catch (...) {
+        g_code_re_ok = false;  // 默认模式都编不过（理论上不会）→ 全部透传
+      }
+    }
+  }
+  // 旧键 min/max_code_len 仍解析（兼容历史 yaml），但**不再参与触发判定**；
+  // 仅保留数值以免日志/兼容字段为空。
+  g_min_code_len = s.has_min_code_len ? s.min_code_len
+                                      : (y.has_min_code_len ? y.min_code_len : 4);
+  g_max_code_len = s.has_max_code_len ? s.max_code_len
+                                      : (y.has_max_code_len ? y.max_code_len : 0);
   g_expected_length_weight =
       s.has_elw ? s.elw : (y.has_elw ? y.elw : 0.2);
   g_freq_beta = s.has_freq_beta ? s.freq_beta
@@ -224,16 +257,21 @@ static void llm_load_global_params() {
       continue;
     std::string key = llm_trim(ln.substr(0, c));
     std::string val = llm_trim(ln.substr(c + 1));
-    if (!val.empty() && val[0] == '"') {  // 引号值: 取到闭引号
-      size_t e = val.find('"', 1);
+    // 引号值：双引号（历史 model_path 风格）与单引号（code_pattern 正则风格，
+    // 2026-09-30）都要支持——只认双引号会让正则值带壳匹配失败。
+    if (!val.empty() && (val[0] == '"' || val[0] == '\'')) {
+      size_t e = val.find(val[0], 1);
       val = (e == std::string::npos) ? val.substr(1) : val.substr(1, e - 1);
-    } else {  // 行内注释
+    } else {  // 行内注释（引号内的 # 不视为注释）
       size_t h = val.find('#');
       if (h != std::string::npos)
         val = llm_trim(val.substr(0, h));
     }
     LlmParamSet &p = g_yaml_params;
     if (key == "enabled") { p.has_enabled = true; p.enabled = (val == "true"); }
+    else if (key == "code_pattern") { p.has_code_pattern = true; p.code_pattern = val; }
+    // 旧键 min_code_len / max_code_len 仍解析（兼容历史 yaml），但触发判定只用
+    // code_pattern（2026-09-30 定案）；等价换算：min=4,max=0 ⇒ code_pattern '.{4}'
     else if (key == "min_code_len") { p.has_min_code_len = true; p.min_code_len = atoi(val.c_str()); }
     else if (key == "max_code_len") { p.has_max_code_len = true; p.max_code_len = atoi(val.c_str()); }
     else if (key == "expected_length_weight") { p.has_elw = true; p.elw = atof(val.c_str()); }
@@ -2106,6 +2144,11 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
       p.debug_fusion = b;
     }
     int v = 0;
+    std::string sv;
+    if (config->GetString("llm_rerank/code_pattern", &sv)) {
+      p.has_code_pattern = true;
+      p.code_pattern = sv;
+    }
     if (config->GetInt("llm_rerank/min_code_len", &v)) { p.has_min_code_len = true; p.min_code_len = v; }
     if (config->GetInt("llm_rerank/max_code_len", &v)) { p.has_max_code_len = true; p.max_code_len = v; }
     double dw = 0.0;
@@ -2118,12 +2161,12 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     llm_load_global_params();
     g_yaml_stamp = llm_yaml_stamp();
     llm_apply_params();
-    log_msg("config: enabled=%d min_code_len=%d max_code_len=%d "
+    log_msg("config: enabled=%d code_pattern='%s' (min_code_len=%d max_code_len=%d 旧键不生效) "
             "expected_length_weight=%.2f freq_beta=%.2f debug_fusion=%d "
             "min_tokens=%d "
             "max_tokens=%d max_candidates=%d cpu_cores=%d "
             "model=%s",
-            g_enabled ? 1 : 0, g_min_code_len, g_max_code_len,
+            g_enabled ? 1 : 0, g_code_pattern.c_str(), g_min_code_len, g_max_code_len,
             g_expected_length_weight, g_freq_beta, g_debug_fusion ? 1 : 0,
             g_min_tokens,
             g_max_ctx_tokens, g_max_candidates, g_n_threads,
@@ -2508,10 +2551,17 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
     comctx::ensure_started();
 #endif
 
-  size_t code_len = engine_->context() ? engine_->context()->input().size() : 0;
-  if ((int)code_len < g_min_code_len ||
-      (g_max_code_len > 0 && (int)code_len > g_max_code_len))
-    return translation;  // code length outside [min_code_len, max_code_len]
+  {
+    // 触发条件（2026-09-30）：编码串全串匹配 code_pattern（与 speller/
+    // auto_select_pattern 同引擎同语义）。空模式 = 不限制。
+    const std::string &code = engine_->context()->input();
+    bool matched = true;
+    if (!g_code_pattern.empty()) {
+      matched = g_code_re_ok && boost::regex_match(code, g_code_re);
+    }
+    if (!matched)
+      return translation;  // code outside code_pattern
+  }
 
   // context source: TSF caret text, or commit history fallback
   auto [ctx, src] = GetContextTextPair();
