@@ -39,6 +39,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_OPENDIR      1004
 #define IDC_MSTATUS      1005
 #define IDC_MSTATUS_HINT 1006   // 模型状态第二行（灰色小字）
+#define IDC_DOWNLOAD     1007   // 下载模型（2026-10-01 用户定案：从安装器移到配置 GUI）
 // 数值参数（列1/列2 各自顺序）
 #define IDC_MIN_CODE     1011
 #define IDC_MAX_CODE     1012
@@ -52,8 +53,6 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_MAX_CAND     1024
 // 方案接入（2026-09-29 GUI 化，语义同 installer\schema_add.ps1）
 #define IDC_SCHEMA       1031
-#define IDC_SCHEMAREF    1032
-#define IDC_SCHEMAADD    1033
 #define IDC_SCHEMAREM    1034
 #define IDC_SCHEMSTAT    1035
 #define IDC_SAVE         1101
@@ -74,6 +73,10 @@ struct Params {
   std::wstring model_path;  // 显示值（空 = 默认路径）
 };
 static Params g_p;
+// 方案下拉的"已加载项"序号 + 抑制标志（2026-10-01：切换方案时若有未保存改动，
+// 选"否"要把下拉拨回这一项且不再触发重读）
+static std::wstring g_loaded_name;   // 当前已读入界面的方案文件名（切换取消时按名拨回）
+static bool g_sel_guard = false;
 static HWND g_hwnd;
 static HFONT g_font;
 static HFONT g_font_hint;  // 灰色小字（状态副行 / 底部动态注）
@@ -85,8 +88,26 @@ static HWND g_tip = NULL;
 static std::deque<std::wstring> g_tips;
 
 // ---- 工具 ----
-// RIME 用户文件夹（= 小狼毫右键"用户文件夹"；方案与模型都在这里）
+// Rime 用户文件夹（= 小狼毫右键"用户文件夹"；方案与模型都在这里）。
+// 优先级：环境变量 RIME_LLM_USER_DIR（便携/测试显式指定）→ 注册表 RimeUserDir
+//（便携模式/自定义位置的小狼毫写的就是它）→ %APPDATA%\Rime
+//（2026-10-01：此前硬编码 APPDATA，便携部署下 GUI 显示的默认路径会与运行期不符）
 static std::wstring rime_user_dir() {
+  wchar_t env[MAX_PATH] = L"";
+  if (GetEnvironmentVariableW(L"RIME_LLM_USER_DIR", env, MAX_PATH) && env[0] &&
+      GetFileAttributesW(env) != INVALID_FILE_ATTRIBUTES)
+    return std::wstring(env);
+  HKEY k = NULL;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Rime\\Weasel", 0, KEY_READ, &k) ==
+      ERROR_SUCCESS) {
+    wchar_t v[MAX_PATH] = L"";
+    DWORD cb = sizeof(v), type = 0;
+    LONG r = RegQueryValueExW(k, L"RimeUserDir", NULL, &type, (LPBYTE)v, &cb);
+    RegCloseKey(k);
+    if (r == ERROR_SUCCESS && type == REG_SZ && v[0] &&
+        GetFileAttributesW(v) != INVALID_FILE_ATTRIBUTES)
+      return std::wstring(v);
+  }
   wchar_t dir[MAX_PATH];
   if (!GetEnvironmentVariableW(L"APPDATA", dir, MAX_PATH))
     return std::wstring();
@@ -102,14 +123,23 @@ static std::wstring default_model_path() {
   // 默认 = RIME 用户文件夹根（2026-08-31 用户澄清：指小狼毫右键的用户
   // 文件夹——方案配置所在处，模型直接放根、不套子文件夹；8-27 曾误用
   // %USERPROFILE%\gguf_models\。自定义位置在 GUI/schema 里显式填）
-  wchar_t dir[MAX_PATH];
-  if (GetEnvironmentVariableW(L"APPDATA", dir, MAX_PATH))
-    return std::wstring(dir) + L"\\Rime\\Qwen3.5-0.8B-Q4_K_M.gguf";
+  // 2026-10-01：改用 rime_user_dir()（注册表 RimeUserDir 优先），与运行期
+  // 默认（deployer().user_data_dir）在便携部署下保持一致
+  std::wstring dir = rime_user_dir();
+  if (!dir.empty()) return dir + L"\\Qwen3.5-0.8B-Q4_K_M.gguf";
   return L"Qwen3.5-0.8B-Q4_K_M.gguf";
 }
 
 static std::wstring shown_model() {
   return g_p.model_path.empty() ? default_model_path() : g_p.model_path;
+}
+
+// 绝对路径判定（③ 用）：X:\ / X:/ / \\server\share
+static bool is_abs_path(const std::wstring& p) {
+  if (p.size() >= 3 && iswalpha(p[0]) && p[1] == L':' && (p[2] == L'\\' || p[2] == L'/'))
+    return true;
+  if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\') return true;
+  return false;
 }
 
 static std::string wide_to_utf8(const std::wstring& w) {
@@ -357,8 +387,7 @@ static void scan_models(HWND combo) {
   GetWindowTextW(combo, cur, 512);
   wchar_t base[MAX_PATH];
   std::wstring dirs[2];
-  if (GetEnvironmentVariableW(L"APPDATA", base, MAX_PATH))
-    dirs[0] = std::wstring(base) + L"\\Rime";
+  dirs[0] = rime_user_dir();   // 注册表 RimeUserDir 优先（便携部署）
   if (GetEnvironmentVariableW(L"USERPROFILE", base, MAX_PATH))
     dirs[1] = std::wstring(base) + L"\\gguf_models";
   int added = 0;
@@ -380,18 +409,27 @@ static void scan_models(HWND combo) {
 }
 
 // 模型状态行：开关开着但文件不存在是最常见的静默失败——实时反映
+// （2026-10-01：小于完整体量的文件不再显示成"已就绪"——半截模型会让重排
+//   静默失效且用户找不到原因）
+static const unsigned long long kModelMinBytes = 100ULL * 1024 * 1024;
 static void refresh_model_status() {
   wchar_t buf[512];
   GetDlgItemTextW(g_hwnd, IDC_MODEL, buf, 512);
   unsigned long long sz = 0;
   if (buf[0] && file_size(buf, &sz)) {
-    set_status(GetDlgItem(g_hwnd, IDC_MSTATUS), L"模型已就绪：%llu MB", sz >> 20);
-    set_status(GetDlgItem(g_hwnd, IDC_MSTATUS_HINT), L"");
+    if (sz >= kModelMinBytes) {
+      set_status(GetDlgItem(g_hwnd, IDC_MSTATUS), L"模型已就绪：%llu MB", sz >> 20);
+      set_status(GetDlgItem(g_hwnd, IDC_MSTATUS_HINT), L"");
+    } else {
+      set_status(GetDlgItem(g_hwnd, IDC_MSTATUS), L"模型文件可疑：仅 %llu MB", sz >> 20);
+      set_status(GetDlgItem(g_hwnd, IDC_MSTATUS_HINT),
+                 L"疑似未下完或损坏（完整约 508MB）——点“下载模型”会删除后重下，或点“浏览…”换一个");
+    }
   } else {
     // 拆两行：主状态（正文）+ 后续操作（灰色小字）——一行放不下会被截断
     set_status(GetDlgItem(g_hwnd, IDC_MSTATUS), L"模型文件不存在");
     set_status(GetDlgItem(g_hwnd, IDC_MSTATUS_HINT),
-               L"重跑安装包可下载，或点“浏览…”选已有的 .gguf");
+               L"点“下载模型”下载（ModelScope 断点续传），或点“浏览…”选已有的 .gguf");
   }
 }
 
@@ -447,6 +485,25 @@ static bool is_list_item(const std::string& ln, const char* item) {
   if (ln.compare(i, n, item) != 0) return false;
   i += n;
   return ln.find_first_not_of(" \t", i) == std::string::npos;
+}
+
+// ── 外部改动保护（2026-10-01 用户定案）────────────────────────────
+// 文件内容指纹（FNV-1a 64）；同内容重写/触摸文件不会误报"被外部修改"
+static std::wstring g_file_stamp;
+static std::wstring file_stamp(const std::wstring& path) {
+  FILE* f = NULL;
+  _wfopen_s(&f, path.c_str(), L"rb");
+  if (!f) return std::wstring();
+  unsigned long long h = 1469598103934665603ULL;
+  int c;
+  while ((c = fgetc(f)) != EOF) {
+    h ^= (unsigned char)c;
+    h *= 1099511628211ULL;
+  }
+  fclose(f);
+  wchar_t buf[32];
+  swprintf_s(buf, L"%016llX", h);
+  return std::wstring(buf);
 }
 
 // 剥离两版 LLM 组件行与 llm_rerank 节（含节前空行）；返回删除行数
@@ -523,6 +580,30 @@ static bool insert_llm_filter(std::vector<std::string>* lines,
                            : (simplifier >= 0 ? L"simplifier 之后" : L"filters 块末尾");
   lines->insert(lines->begin() + (at >= 0 ? at : filt_end) + 1, "    - llm_filter");
   return true;
+}
+
+// 方案是否需要"重建接入"（缺节 / 缺本版组件行 / 残留插件版组件行）
+static bool schema_needs_rebuild(const std::vector<std::string>& lines, wchar_t* why) {
+  bool has_sec = llm_section_start(lines) >= 0;
+  bool has_filter = false, has_plugin = false;
+  for (auto& ln : lines) {
+    std::string t = trim(ln);
+    if (t == "llm_filter" || t == "- llm_filter") has_filter = true;
+    if (t.find("lua_processor@*llm_processor") != std::string::npos ||
+        t.find("lua_filter@*llm_filter") != std::string::npos)
+      has_plugin = true;
+  }
+  std::vector<std::wstring> parts;
+  if (!has_sec) parts.push_back(L"无配置节");
+  if (!has_filter) parts.push_back(L"缺 llm_filter 组件行");
+  if (has_plugin) parts.push_back(L"残留插件版组件行");
+  std::wstring w;
+  for (size_t i = 0; i < parts.size(); i++) {
+    if (i) w += L"、";
+    w += parts[i];
+  }
+  if (why) wcscpy_s(why, 128, w.c_str());
+  return !w.empty();
 }
 
 // 触发重新部署：WeaselRoot 注册表定位 WeaselDeployer，15s 有界等待
@@ -757,25 +838,31 @@ static void load_schema_params() {
   // （该文件已废弃：运行期不读它，只有这里为老用户带出参数）
   bool migrated = false;
   if (!has_section) migrated = load_legacy_params(&g_p);
+  // 无节 = 该方案还没接入：默认勾上「启用」，让『保存并生效』一步完成接入
+  // （用户取消勾选再保存 = 显式写入 enabled: false）
+  if (!has_section && !migrated) g_p.enabled = true;
   if (has_section) {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"已加载 %s 的 llm_rerank 配置节",
                base_name(path));
   } else if (selected_is_shared()) {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
-               L"[未接入] %s 是程序文件夹里的预装方案——点『接入 LLM』或『保存并生效』"
-               L"会先复制到用户文件夹再写入",
+               L"[未接入] %s 是程序文件夹里的预装方案——点『保存并生效』会先复制到用户文件夹，"
+               L"再补组件行 + 配置节",
                base_name(path));
   } else if (migrated) {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
                L"[未接入] %s 没有 llm_rerank 节——已带出旧全局配置的值，"
-               L"点『接入 LLM』写进方案",
+               L"点『保存并生效』写进方案",
                base_name(path));
   } else {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
-               L"[未接入] %s 里没有 llm_rerank 节——显示默认值，点『接入 LLM』写入",
+               L"[未接入] %s 里没有 llm_rerank 节——显示默认值（已默认勾选启用），"
+               L"点『保存并生效』即接入",
                base_name(path));
   }
   params_to_ui();
+  g_file_stamp = file_stamp(path);   // 外部改动保护：记下读入时的文件指纹
+  g_loaded_name = base_name(path);
 }
 
 // 保存界面参数 → 选中方案的 llm_rerank 节（节必须已存在）+ 触发重新部署
@@ -801,10 +888,47 @@ static void save_schema_params() {
     return;
   }
   ui_to_params();
-  if (!update_llm_section(&lines)) {
+  // ③ 模型路径必须是绝对路径（运行期直接交给 llama——不做 %VAR% 展开、不解析
+  //    相对路径，相对值会按服务进程 cwd 解析，几乎必然加载失败）
+  if (!g_p.model_path.empty() && !is_abs_path(g_p.model_path)) {
     set_status(GetDlgItem(g_hwnd, IDC_STATUS),
-               L"[失败] 方案内没有 llm_rerank 配置节——请先点『接入 LLM』");
-    log_error(L"[保存] 方案内没有 llm_rerank 配置节：%s", path.c_str());
+               L"[失败] 『模型路径』必须是绝对路径（如 D:\\gguf_models\\xxx.gguf）或留空用默认：%s",
+               g_p.model_path.c_str());
+    log_error(L"[保存] 模型路径不是绝对路径，拒绝保存：%s", g_p.model_path.c_str());
+    return;
+  }
+  // 外部改动保护（2026-10-01）：读入后文件又被别处改过 → 先问再覆盖，避免陈旧界面值冲掉外部编辑
+  // （预装方案刚被复制过来时指纹基准是程序文件夹那份，故 copied 时跳过比对）
+  if (!copied && !g_file_stamp.empty() && file_stamp(path) != g_file_stamp) {
+    if (MessageBoxW(g_hwnd,
+                    L"方案文件已被外部修改。\n\n用界面上的值覆盖它？（选『否』= 丢弃界面改动并重新读取）",
+                    L"文件已变更", MB_YESNO | MB_ICONWARNING) != IDYES) {
+      load_schema_params();
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已取消保存并重新读取磁盘上的方案");
+      return;
+    }
+  }
+  // 保存 = 自适应（2026-10-01 用户定案，替代原「接入 LLM」+「保存」两按钮）：
+  //   缺节 / 缺本版组件行 / 残留另一版组件行 → 重建接入（剥净 + 插组件 + 按界面值写节）
+  //   否则                                    → 只重写节
+  wchar_t why[128] = L"";
+  bool need_rebuild = schema_needs_rebuild(lines, why);
+  if (need_rebuild) {
+    int removed = strip_llm(&lines);          // 剥净两版组件行 + 旧节
+    std::wstring where;
+    if (!insert_llm_filter(&lines, &where)) {
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+                 L"[失败] 方案内未找到 engine/filters 块，无法补齐组件行");
+      log_error(L"[保存] 未找到 engine/filters 块：%s", path.c_str());
+      return;
+    }
+    if (!lines.empty() && !lines.back().empty()) lines.push_back("");
+    std::vector<std::string> sec = build_llm_section();
+    lines.insert(lines.end(), sec.begin(), sec.end());
+    (void)removed;
+  } else if (!update_llm_section(&lines)) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"[失败] 重写 llm_rerank 节失败：%s", path.c_str());
+    log_error(L"[保存] update_llm_section 失败：%s", path.c_str());
     return;
   }
   if (!write_lines(path, had_bom, lines)) {
@@ -812,65 +936,26 @@ static void save_schema_params() {
     log_error(L"[保存] 写入方案失败：%s", path.c_str());
     return;
   }
-  set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已保存到 %s，正在重新部署…",
-             base_name(path));
+  g_file_stamp = file_stamp(path);
+  load_schema_params();   // 回读：方案接入组状态行从"未接入"变"已加载"，界面与磁盘一致
+  set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"正在重新部署…");
   refresh_model_status();  // 模型路径可能刚改
   trigger_redeploy();
+  const wchar_t* act = need_rebuild ? L"已接入并保存" : L"已保存";
+  wchar_t note[256] = L"";
+  if (copied && need_rebuild)
+    swprintf_s(note, L"（原为程序文件夹预装方案，已复制到用户文件夹；补齐了组件行：%s）", why);
+  else if (copied)
+    swprintf_s(note, L"（原为程序文件夹预装方案，已复制到用户文件夹）");
+  else if (need_rebuild)
+    swprintf_s(note, L"（补齐了组件行：%s）", why);
   set_status(GetDlgItem(g_hwnd, IDC_STATUS),
-             copied ? L"已保存到 %s（原为程序文件夹预装方案，已复制到用户文件夹）并触发重新部署——部署完成后参数生效"
-                    : L"已保存到 %s 并触发重新部署——部署完成后参数生效",
-             base_name(path));
+             L"%s %s%s 并触发重新部署——部署完成后参数生效", act, base_name(path), note);
 }
 
-static void on_schema_add() {
-  bool ok;
-  std::wstring path = selected_schema_path(&ok);
-  if (!ok) {
-    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
-               L"请先在下拉框选择方案文件（%APPDATA%\\Rime\\*.schema.yaml）");
-    return;
-  }
-  bool copied = false;
-  std::wstring name = base_name(path);
-  path = ensure_user_schema(path, &copied);   // 预装方案先落到用户文件夹
-  if (copied) {
-    scan_schemas();
-    select_schema_named(name);
-  }
-  bool had_bom;
-  std::vector<std::string> lines;
-  if (!read_lines(path, &had_bom, &lines)) {
-    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"读取方案失败：%s", path.c_str());
-    log_error(L"[接入] 读取方案失败：%s", path.c_str());
-    return;
-  }
-  int removed = strip_llm(&lines);  // 组件行 + 旧 llm_rerank 节一并剥净
-  std::wstring where;
-  if (!insert_llm_filter(&lines, &where)) {
-    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
-               L"[失败] 方案内未找到 engine/filters 块，无法插入组件");
-    log_error(L"[接入] 未找到 engine/filters 块：%s", path.c_str());
-    return;
-  }
-  // 配置节内容取界面当前值（界面值 = 该方案原节或默认）；接入 = 重新启用意图
-  ui_to_params();
-  g_p.enabled = true;
-  if (!lines.empty() && !lines.back().empty()) lines.push_back("");
-  std::vector<std::string> sec = build_llm_section();
-  lines.insert(lines.end(), sec.begin(), sec.end());
-  if (!write_lines(path, had_bom, lines)) {
-    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"写入方案失败：%s", path.c_str());
-    log_error(L"[接入] 写入方案失败：%s", path.c_str());
-    return;
-  }
-  wchar_t msg[512];
-  swprintf_s(msg, L"已接入 llm_filter（%s）+ llm_rerank 配置节%s%s", where.c_str(),
-             removed ? L"，旧 LLM 组件已剥离" : L"",
-             copied ? L"（原为程序文件夹预装方案，已复制到用户文件夹）" : L"");
-  load_schema_params();  // 回读（节已是权威值）
-  set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), msg);
-  trigger_redeploy();
-}
+// on_schema_add 已删除（2026-10-01 用户定案：并入『保存并生效』的自适应重建，
+// 见 save_schema_params；CLI/脚本侧的 schema_add.ps1 仍在，供无人值守安装用）
+
 
 static void on_schema_remove() {
   bool ok;
@@ -942,6 +1027,27 @@ static void ui_to_params() {
   g_p.model_path = (wcscmp(buf, def.c_str()) == 0) ? std::wstring() : buf;
 }
 
+// 界面签名 / 脏标记（2026-10-01）：与"上次读入界面时"的签名比对——用于
+// "打开下拉时是否重读当前文件"（有未保存改动就不覆盖用户输入）。
+// 比挂 TextChanged 事件简单可靠：跨线程/程序化赋值都不会误判。
+static std::wstring g_ui_sig;
+static std::wstring ui_signature() {
+  std::wstring s;
+  s += SendMessageW(GetDlgItem(g_hwnd, IDC_ENABLED), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
+  s += SendMessageW(GetDlgItem(g_hwnd, IDC_DEBUG), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
+  const int ids[] = {IDC_MODEL,   IDC_CODE_PAT, IDC_MAX_TOK, IDC_MAX_CAND,
+                     IDC_CORES,   IDC_FREQ_W,   IDC_ELW};
+  wchar_t buf[512];
+  for (int id : ids) {
+    buf[0] = 0;
+    GetDlgItemTextW(g_hwnd, id, buf, 512);
+    s += buf;
+    s += L"|";
+  }
+  return s;
+}
+static bool ui_dirty() { return g_hwnd && ui_signature() != g_ui_sig; }
+
 static void params_to_ui() {
   SendMessageW(GetDlgItem(g_hwnd, IDC_ENABLED), BM_SETCHECK,
                g_p.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -963,6 +1069,7 @@ static void params_to_ui() {
   SetDlgItemTextW(g_hwnd, IDC_ELW, buf);
   scan_models(GetDlgItem(g_hwnd, IDC_MODEL));
   refresh_model_status();
+  g_ui_sig = ui_signature();   // 脏标记基准（打开下拉是否重读当前文件）
 }
 
 // ---- 控件创建 ----
@@ -1004,18 +1111,19 @@ static const wchar_t* const TIP_MODEL =
     L"下拉列出用户文件夹与本机 gguf_models 下的模型；\n"
     L"换模型保存后会自动卸载并重载。";
 static const wchar_t* const TIP_BROWSE = L"浏览…：选择 .gguf 模型文件。";
+static const wchar_t* const TIP_DOWNLOAD =
+    L"下载模型：ModelScope 断点续传（curl -C -），落点 = 左边的模型路径框\n"
+    L"（留空 = 用户文件夹里的默认名 Qwen3.5-0.8B-Q4_K_M.gguf）。\n"
+    L"失败会保留 .download 分片，再点一次即续传。";
 static const wchar_t* const TIP_SCHEMA =
     L"配置就写在选中的方案文件里。下拉列出**用户文件夹** %APPDATA%\\Rime 与\n"
-    L"**程序文件夹** <小狼毫目录>\\data（预装方案，带「（程序）」后缀）两处的 *.schema.yaml。\n"
+    L"**程序文件夹** <小狼毫目录>\\data（预装方案，带「（程序）」后缀）两处的 *.schema.yaml；\n"
+    L"**打开下拉即重扫两处**（外部新增/删除方案后无需手动刷新），界面无改动时还会重读当前文件。\n"
     L"预装方案在写入前会自动复制到用户文件夹（Rime 解析顺序：用户文件夹优先）。";
-static const wchar_t* const TIP_SCHEMAREF =
-    L"重新扫描两处方案文件（用户文件夹 + 程序文件夹），并重新读入当前方案的参数。";
-static const wchar_t* const TIP_SCHEMAADD =
-    L"接入 LLM：把 llm_filter 组件行 + llm_rerank 配置节写进选中方案\n"
-    L"（先剥旧版组件再插入，可跨版转换），并自动重新部署。";
 static const wchar_t* const TIP_SCHEMAREM =
-    L"剥离：删掉选中方案里的 llm_filter 组件行与 llm_rerank 配置节，\n"
-    L"并自动重新部署。";
+    L"剥离：把选中方案里的 LLM 组件行与 llm_rerank 配置节整个删掉\n"
+    L"（方案回到未接入状态），并自动重新部署。\n"
+    L"日常只想改参数请用『保存并生效』。";
 static const wchar_t* const TIP_CODE_PAT =
     L"触发条件：编码串全串正则匹配，只有匹配上的编码才交给 LLM 重排\n"
     L"（写法与 Rime speller/auto_select_pattern 一致）。\n"
@@ -1046,7 +1154,9 @@ static const wchar_t* const TIP_DEBUG =
     L"（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。";
 static const wchar_t* const TIP_SAVE =
     L"把上面的参数写进选中方案文件的 llm_rerank 配置节（键名与该节里相同），\n"
-    L"随后自动触发重新部署——部署完成即生效（配置在方案里，不再有全局文件）。";
+    L"随后自动触发重新部署——部署完成即生效（配置在方案里，不再有全局文件）。\n"
+    L"方案还没接入（缺配置节 / 缺组件行 / 残留插件版组件行）时，\n"
+    L"本按钮会先剥净再补齐组件行 + 写入配置节（原「接入 LLM」已并入这里）。";
 static const wchar_t* const TIP_CLOSE = L"关闭窗口（不保存未保存的改动）。";
 static const wchar_t* const TIP_OPENDIR =
     L"打开小狼毫用户文件夹（%APPDATA%\\Rime）——模型与方案文件都在这里。";
@@ -1086,22 +1196,12 @@ static void make_ui() {
     int lw = tw(lbl, g_font);
     mk(1, lbl, 0, LX, y + ts(3), lw + ts(4), ts(20), 0);
     int x = LX + lw + ts(10);
-    int wRef = tw(L"刷新", g_font) + ts(24);
-    int wAdd = tw(L"接入 LLM", g_font) + ts(24);
-    int wRem = tw(L"剥离", g_font) + ts(24);
-    int comboW = RX - x - wRef - wAdd - wRem - ts(18);
+    // 2026-10-01 用户定案：删「刷新」（打开下拉即重扫两处方案）与「接入 LLM」
+    // （并入『保存并生效』的自适应重建）；『剥离』挪到保存按钮右侧 → 本行只剩下拉
+    int comboW = RX - x - ts(18);
     HWND cmb = mk(3, L"", CBS_DROPDOWNLIST | WS_TABSTOP, x, y - ts(3), comboW,
                   ts(200), IDC_SCHEMA);
     tip_add(cmb, TIP_SCHEMA);
-    x += comboW + ts(6);
-    tip_add(mk(0, L"刷新", WS_TABSTOP, x, y - ts(3), wRef, ts(26), IDC_SCHEMAREF),
-            TIP_SCHEMAREF);
-    x += wRef + ts(4);
-    tip_add(mk(0, L"接入 LLM", WS_TABSTOP, x, y - ts(3), wAdd, ts(26), IDC_SCHEMAADD),
-            TIP_SCHEMAADD);
-    x += wAdd + ts(4);
-    tip_add(mk(0, L"剥离", WS_TABSTOP, x, y - ts(3), wRem, ts(26), IDC_SCHEMAREM),
-            TIP_SCHEMAREM);
     mk_help(HX, y + ts(2), TIP_SCHEMA);
     y += ts(30);
     mk(1, L"", 0, LX, y, ts(528), ts(18), IDC_SCHEMSTAT);
@@ -1123,12 +1223,16 @@ static void make_ui() {
     mk(1, lbl, 0, LX, y + ts(3), lw + ts(4), ts(20), 0);
     int ex = LX + lw + ts(10);
     int btnW = tw(L"浏览…", g_font) + ts(26);
-    int comboW = (RX - btnW - ts(8)) - ex;
+    int dlW = tw(L"下载模型", g_font) + ts(26);
+    // 2026-10-01 用户定案：模型下载功能两版统一，放这一行（源码版安装器不再提示下载）
+    int comboW = (RX - btnW - dlW - ts(16)) - ex;
     HWND cmb = mk(3, L"", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_TABSTOP, ex,
                   y - ts(3), comboW, ts(200), IDC_MODEL);
     tip_add(cmb, TIP_MODEL);
     tip_add(mk(0, L"浏览…", WS_TABSTOP, ex + comboW + ts(8), y - ts(3), btnW,
                ts(26), IDC_BROWSE), TIP_BROWSE);
+    tip_add(mk(0, L"下载模型", WS_TABSTOP, ex + comboW + btnW + ts(12), y - ts(3),
+               dlW, ts(26), IDC_DOWNLOAD), TIP_DOWNLOAD);
     mk_help(HX, y + ts(2), TIP_MODEL);
     y += ts(30);
     mk(1, L"", 0, LX, y, ts(140), ts(18), IDC_MSTATUS);
@@ -1186,9 +1290,12 @@ static void make_ui() {
     y += ts(30);
   }
   y += ts(4);
+  // 2026-10-01 用户定案：『剥离』= 保存的破坏性补充，并排放在保存右侧
   tip_add(mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, LX, y, ts(110),
              ts(32), IDC_SAVE), TIP_SAVE);
-  tip_add(mk(0, L"关闭", WS_TABSTOP, LX + ts(118), y, ts(76), ts(32), IDC_CLOSE),
+  tip_add(mk(0, L"剥离", WS_TABSTOP, LX + ts(114), y, ts(76), ts(32), IDC_SCHEMAREM),
+          TIP_SCHEMAREM);
+  tip_add(mk(0, L"关闭", WS_TABSTOP, LX + ts(198), y, ts(76), ts(32), IDC_CLOSE),
           TIP_CLOSE);
   tip_add(mk(0, L"打开用户文件夹", WS_TABSTOP, RX - ts(126), y, ts(126),
              ts(32), IDC_OPENDIR), TIP_OPENDIR);
@@ -1313,6 +1420,171 @@ static void draw_help(const DRAWITEMSTRUCT* d) {
   SelectObject(d->hDC, of);
 }
 
+// ── 下载模型（2026-10-01 用户定案：功能两版统一，从安装器移到配置 GUI）──────
+// 与插件版逐字同源：curl.exe（Win10 1803+ 自带）断点续传 -L -C - -o <目标>.download，
+// 轮询分片大小打进度；完成后剥掉 .download 后缀转正；失败保留分片可重试续传。
+static const wchar_t* const kModelUrl =
+    L"https://modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/resolve/master/Qwen3.5-0.8B-Q4_K_M.gguf";
+static HANDLE g_dl_proc = NULL;
+static std::wstring g_dl_tmp, g_dl_target;
+#define DL_TIMER_ID 1
+
+static unsigned long long file_size_ull(const std::wstring& path) {
+  unsigned long long sz = 0;
+  return file_size(path, &sz) ? sz : 0;
+}
+
+// ② 上次遗留的 curl（关窗没杀干净 / 异常退出）会和新的一次同时写同一个分片。
+// 每次起下载前记 <分片>.pid；下次起下载时按它结束旧进程（分片保留，续传接管）。
+static bool terminate_pid_if_curl(DWORD pid) {
+  if (!pid) return false;
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, pid);
+  if (!h) return false;
+  wchar_t path[MAX_PATH] = L"";
+  DWORD n = MAX_PATH;
+  bool is_curl = QueryFullProcessImageNameW(h, 0, path, &n) && wcsstr(path, L"curl.exe");
+  DWORD code = 0;
+  bool alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+  bool killed = false;
+  if (is_curl && alive) killed = TerminateProcess(h, 1) != 0;
+  CloseHandle(h);
+  return killed;
+}
+
+static bool kill_stale_curl(const std::wstring& tmp) {
+  std::wstring pf = tmp + L".pid";
+  FILE* f = NULL;
+  _wfopen_s(&f, pf.c_str(), L"rb");
+  if (!f) return false;
+  char buf[64] = "";
+  size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  if (!got) return false;
+  DWORD pid = (DWORD)strtoul(buf, NULL, 10);
+  DeleteFileW(pf.c_str());
+  return terminate_pid_if_curl(pid);
+}
+
+static void write_dl_pid(DWORD pid) {
+  if (g_dl_tmp.empty()) return;
+  FILE* f = NULL;
+  _wfopen_s(&f, (g_dl_tmp + L".pid").c_str(), L"wb");
+  if (!f) return;
+  fprintf(f, "%lu", (unsigned long)pid);
+  fclose(f);
+}
+
+static void download_finish(bool ok, DWORD code) {
+  if (g_dl_proc) { CloseHandle(g_dl_proc); g_dl_proc = NULL; }
+  KillTimer(g_hwnd, DL_TIMER_ID);
+  if (!g_dl_tmp.empty()) DeleteFileW((g_dl_tmp + L".pid").c_str());
+  if (ok) {
+    // >100MB 才认（与插件版同一判据）：避免把错误页面/半截文件当模型转正
+    unsigned long long sz = file_size_ull(g_dl_tmp);
+    if (sz > 100ULL * 1024 * 1024 && MoveFileExW(g_dl_tmp.c_str(), g_dl_target.c_str(),
+                                                MOVEFILE_REPLACE_EXISTING)) {
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"模型下载完成（%llu MB）→ %s",
+                 sz >> 20, g_dl_target.c_str());
+      log_error(L"[下载] 完成：%s（%llu MB）", g_dl_target.c_str(), sz >> 20);
+    } else {
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+                 L"[失败] 下载内容异常（%llu MB）或转正失败，分片保留可重试续传",
+                 sz >> 20);
+      log_error(L"[下载] 内容异常或转正失败：%s（%llu 字节）", g_dl_tmp.c_str(), sz);
+    }
+  } else {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"[失败] 模型下载失败（curl 退出码 %lu）——分片已保留，再点可续传；"
+               L"或手动下载：%s", code, kModelUrl);
+    log_error(L"[下载] curl 退出码 %lu；分片保留：%s", code, g_dl_tmp.c_str());
+  }
+  refresh_model_status();
+}
+
+static void on_download_model() {
+  if (g_dl_proc) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已有下载在进行中…");
+    return;
+  }
+  wchar_t buf[512];
+  GetDlgItemTextW(g_hwnd, IDC_MODEL, buf, 512);
+  std::wstring target = buf;
+  if (target.empty()) {   // 留空 = 用户文件夹里的默认名（与 llm_filter 兜底一致）
+    std::wstring dir = rime_user_dir();
+    if (dir.empty()) {
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"[失败] 无法定位用户文件夹（APPDATA 缺失）");
+      log_error(L"[下载] APPDATA 缺失，无法定默认落点");
+      return;
+    }
+    target = dir + L"\\Qwen3.5-0.8B-Q4_K_M.gguf";
+  }
+  for (wchar_t* c = &target[0]; *c; ++c)
+    if (*c == L'/') *c = L'\\';
+  unsigned long long exist = 0;
+  if (file_size(target, &exist)) {
+    if (exist >= kModelMinBytes) {
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"模型已存在（%llu MB），无需下载：%s",
+                 exist >> 20, target.c_str());
+      return;
+    }
+    // ① 小于完整体量 = 疑似半截/损坏：不再当成"已存在"跳过，确认后删除重下
+    wchar_t q[768];
+    swprintf_s(q, L"目标路径已有文件，但只有 %llu MB（疑似未下完或损坏）：\n%s\n\n"
+                  L"删除它并重新下载？", exist >> 20, target.c_str());
+    if (MessageBoxW(g_hwnd, q, L"模型文件可疑", MB_YESNO | MB_ICONWARNING) != IDYES) {
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已取消下载（保留现有文件）");
+      return;
+    }
+    if (!DeleteFileW(target.c_str())) {
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+                 L"[失败] 无法删除可疑文件（可能被占用）：%s", target.c_str());
+      log_error(L"[下载] 删除可疑文件失败：%s（err=%lu）", target.c_str(), GetLastError());
+      return;
+    }
+  }
+  size_t slash = target.find_last_of(L'\\');
+  if (slash != std::wstring::npos) CreateDirectoryW(target.substr(0, slash).c_str(), NULL);
+  g_dl_target = target;
+  g_dl_tmp = target + L".download";
+  // ② 同目标还有上次遗留的 curl（关窗时旧版没杀干净 / 异常退出）→ 结束它再接管，
+  //    否则同一分片会有两个写入者（断点续传也救不了）
+  if (kill_stale_curl(g_dl_tmp))
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已结束上次遗留的下载进程，由本次续传接管…");
+  std::wstring cmd = L"curl.exe -L -C - -s -S -o \"" + g_dl_tmp + L"\" \"" + kModelUrl + L"\"";
+  std::vector<wchar_t> cl(cmd.begin(), cmd.end());
+  cl.push_back(0);
+  STARTUPINFOW si = {sizeof(si)};
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_HIDE;
+  PROCESS_INFORMATION pi;
+  if (!CreateProcessW(NULL, cl.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL,
+                      &si, &pi)) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"[失败] 无法启动 curl.exe（Win10 1803+ 自带）——可手动下载：%s", kModelUrl);
+    log_error(L"[下载] CreateProcess(curl.exe) 失败：%lu", GetLastError());
+    return;
+  }
+  CloseHandle(pi.hThread);
+  g_dl_proc = pi.hProcess;
+  write_dl_pid(pi.dwProcessId);
+  SetTimer(g_hwnd, DL_TIMER_ID, 700, NULL);
+  set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"开始下载模型 → %s（断点续传）",
+             target.c_str());
+}
+
+// 进度轮询（下载期间每秒级刷新状态行；结束时收尾）
+static void on_download_tick() {
+  if (!g_dl_proc) { KillTimer(g_hwnd, DL_TIMER_ID); return; }
+  DWORD code = 0;
+  if (WaitForSingleObject(g_dl_proc, 0) == WAIT_OBJECT_0) {
+    GetExitCodeProcess(g_dl_proc, &code);
+    download_finish(code == 0, code);
+    return;
+  }
+  set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"下载中… %llu MB（目标 %s，约 508 MB）",
+             file_size_ull(g_dl_tmp) >> 20, g_dl_target.c_str());
+}
+
 static void on_browse() {
   wchar_t buf[512];
   GetDlgItemTextW(g_hwnd, IDC_MODEL, buf, 512);
@@ -1380,14 +1652,32 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       }
       // 切换方案 = 切换配置（配置节在方案里，2026-09-30 定案）
       if (LOWORD(wp) == IDC_SCHEMA && HIWORD(wp) == CBN_SELCHANGE) {
+        if (g_sel_guard) return 0;
+        // ④ 有未保存改动先问；选"否"把下拉拨回已加载的那一项，界面值原样保留
+        if (ui_dirty() && MessageBoxW(g_hwnd,
+                L"当前方案有未保存的改动。\n\n切换方案会丢弃这些改动，继续吗？",
+                L"未保存的改动", MB_YESNO | MB_ICONWARNING) != IDYES) {
+          // 按**名字**拨回而不是按序号：列表可能刚被重扫过（序号会错位）
+          g_sel_guard = true;
+          if (!g_loaded_name.empty()) select_schema_named(g_loaded_name);
+          g_sel_guard = false;
+          set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已取消切换（保留未保存的改动）");
+          return 0;
+        }
         load_schema_params();
+        return 0;
+      }
+      if (LOWORD(wp) == IDC_SCHEMA && HIWORD(wp) == CBN_DROPDOWN) {
+        // 打开下拉即重扫两处方案列表（外部新增/删除方案无需手动刷新）；
+        // 界面没有未保存改动时顺带重读当前文件（吸收外部编辑），有改动则只重扫列表
+        scan_schemas();
+        if (!ui_dirty()) load_schema_params();
         return 0;
       }
       switch (LOWORD(wp)) {
         case IDC_BROWSE: on_browse(); return 0;
+        case IDC_DOWNLOAD: on_download_model(); return 0;
         case IDC_OPENDIR: on_open_dir(); return 0;
-        case IDC_SCHEMAREF: scan_schemas(); load_schema_params(); return 0;
-        case IDC_SCHEMAADD: on_schema_add(); return 0;
         case IDC_SCHEMAREM: on_schema_remove(); return 0;
         case IDC_SAVE: save_schema_params(); return 0;
         case IDC_CLOSE: DestroyWindow(h); return 0;
@@ -1404,7 +1694,15 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       }
       break;
     }
+    case WM_TIMER:
+      if (wp == DL_TIMER_ID) { on_download_tick(); return 0; }
+      break;
     case WM_DESTROY:
+      KillTimer(h, DL_TIMER_ID);
+      // ② 关窗连带结束 curl：它每次都是新进程，留着会和下次下载同时写同一个分片。
+      //    分片本身保留 → 下次点『下载模型』照样断点续传。
+      if (g_dl_proc) { TerminateProcess(g_dl_proc, 0); CloseHandle(g_dl_proc); g_dl_proc = NULL; }
+      if (!g_dl_tmp.empty()) kill_stale_curl(g_dl_tmp);
       PostQuitMessage(0);
       return 0;
   }

@@ -1,8 +1,8 @@
 ; setup.iss — 小狼毫 LLM 版安装包（Inno Setup，2026-08-27 直接安装版）
 ; 编译（开发机，installer\ 目录）: ..\scripts\build_pkg.bat 或
 ;   ISCC.exe setup.iss
-; 产物: dist\weasel-llm-setup-<版本>.exe（约 15MB，不含模型——装后托盘
-; "LLM 重排设置" 首次提示下载，GUI 内断点续传）。
+; 产物: dist\weasel-llm-setup-<版本>.exe（约 15MB，不含模型——模型在配置 GUI 里下：
+; 托盘 "LLM 重排设置" → 总控 → 「下载模型」，curl 断点续传；安装器不再询问）。
 ;
 ; 安装策略:
 ;   全新机器  = 复制文件（app + data + WeaselSetup）→ WeaselSetup.exe /s
@@ -11,16 +11,11 @@
 ;               （.llm_old，加载中的镜像可改名——实测），不动注册表
 ;   参数零写入方案：装完任何方案由 librime 全局挂载 llm_filter（enabled
 ;               默认 false；托盘 "LLM 重排设置" 开启，保存即重新部署生效）。
-;   模型下载页（2026-09-04 引入；2026-09-05 改版）：Ready 页后询问是否
-;               下载模型，下拉候选默认"暂不下载"；显示"当前模型位置"——
-;               2026-09-30 起配置写在**方案 llm_rerank 节**（全局
-;               llm_rerank.yaml 已取消）：扫描 %APPDATA%\Rime\*.schema.yaml
-;               的 llm_rerank 节取 model_path，都没有则为默认位置
-;               %APPDATA%\Rime（不做本机模型扫描）。
-;               下载落点 = 当前位置；**不再写任何配置文件**——是否启用重排
-;               由用户在托盘 "LLM 重排设置" 里选方案 → 接入 LLM（写组件行 +
-;               配置节）决定。非 ASCII 的 model_path 经 ANSI 读入会错码——
-;               按未配置处理（回落默认位置，用户可在 GUI 里选择真实路径）。
+;   模型下载（2026-10-01 用户定案：两版统一到配置 GUI）：安装器**不再有**
+;               下载页；托盘「LLM 重排设置」→ 总控 → 「下载模型」（与插件版
+;               同一套 curl 断点续传，落点 = 模型路径框，失败保留 .download
+;               分片可续传）。是否启用重排由用户在 GUI 里选方案 → 保存并生效
+;               （写组件行 + 方案 llm_rerank 节）决定。
 
 #define MyAppName "小狼毫 LLM 版"
 #define MyAppVer "2026.09.30-5"  ; 同日重打安装包在日期后加 -2/-3/-4/-5 序号（2026-09-11 用户定案，避免同号不同内容）
@@ -100,171 +95,9 @@ Type: filesandordirs; Name: "{app}"
 [Code]
 var
   FreshInstall: Boolean;
-  ModelPage: TWizardPage;
-  ModelCombo: TNewComboBox;
-  CurPathLbl: TNewStaticText;
-  DownloadPage: TDownloadWizardPage;
 
-const
-  // 与插件版 GUI 同源（unsloth 镜像，ModelScope 国内直连）
-  ModelUrlStr = 'https://modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/resolve/master/Qwen3.5-0.8B-Q4_K_M.gguf';
-  ModelFileName = 'Qwen3.5-0.8B-Q4_K_M.gguf';
-
-// ---- 取"当前模型位置"：扫描 %APPDATA%\Rime\*.schema.yaml 的 llm_rerank 节
-// 读 model_path（2026-09-30 起配置写在方案里，全局 llm_rerank.yaml 已取消）。
-// 无任何方案配置节 → 默认位置。文件为无 BOM UTF-8，Inno 按 ANSI 读入——非
-// ASCII 路径会错码，按未配置处理（回落默认位置，用户可在 GUI 里选真实路径）
-function IsAscii(s: String): Boolean;
-var
-  i: Integer;
-begin
-  Result := True;
-  for i := 1 to Length(s) do
-    if Ord(s[i]) > 127 then begin
-      Result := False;
-      Exit;
-    end;
-end;
-
-function SchemaModelPath(): String;
-var
-  fr: TFindRec;
-  dir, path, s, val, key: String;
-  lines: TArrayOfString;
-  i, c: Integer;
-  inCfg: Boolean;
-begin
-  Result := '';
-  dir := ExpandConstant('{userappdata}\Rime');
-  if not FindFirst(dir + '\*.schema.yaml', fr) then
-    Exit;
-  try
-    repeat
-      path := dir + '\' + fr.Name;
-      if LoadStringsFromFile(path, lines) then begin
-        inCfg := False;
-        for i := 0 to GetArrayLength(lines) - 1 do begin
-          s := lines[i];
-          if (not inCfg) then begin
-            if Pos('llm_rerank:', s) = 1 then
-              inCfg := True;
-            Continue;
-          end;
-          // 节内：缩进行继续，遇到顶层键即出节
-          if (Length(s) > 0) and (s[1] <> ' ') and (s[1] <> #9) then
-            inCfg := False;
-          if not inCfg then
-            Continue;
-          c := Pos(':', s);
-          if c < 1 then
-            Continue;
-          key := Trim(Copy(s, 1, c - 1));
-          val := Trim(Copy(s, c + 1, Length(s) - c));
-          if (Length(val) > 0) and (val[1] = '#') then
-            Continue;
-          if SameText(key, 'model_path') then begin
-            if (Length(val) >= 2) and ((val[1] = '"') or (val[1] = '''')) and
-               (val[Length(val)] = val[1]) then
-              val := Copy(val, 2, Length(val) - 2);
-            Result := val;
-          end;
-        end;
-      end;
-    until (Result <> '') or (not FindNext(fr));
-  finally
-    FindClose(fr);
-  end;
-  if (Result <> '') and (not IsAscii(Result)) then
-    Result := '';
-end;
-
-// 当前生效的模型位置：方案 llm_rerank 节里配了 model_path 就用它，否则默认
-// %APPDATA%\Rime（与 llm_filter 的默认一致）
-function CurModelPath(): String;
-begin
-  Result := SchemaModelPath();
-  if Result = '' then
-    Result := ExpandConstant('{userappdata}\Rime\') + ModelFileName;
-end;
-
-procedure InitializeWizard();
-var
-  lbl: TNewStaticText;
-  p: String;
-begin
-  DownloadPage := CreateDownloadPage(SetupMessage(msgWizardPreparing),
-                                     SetupMessage(msgPreparingDesc), nil);
-  ModelPage := CreateCustomPage(wpReady, '模型下载',
-      '是否现在获取 LLM 重排模型？（不下载也可完成安装）');
-  lbl := TNewStaticText.Create(ModelPage.Surface);
-  lbl.Parent := ModelPage.Surface;
-  lbl.Caption := 'LLM 重排需要 GGUF 模型文件（Qwen3.5-0.8B-Q4_K_M，约 508 MB），' +
-      '放在下方"当前模型位置"。默认暂不下载；装完在托盘「LLM 重排设置」里' +
-      '选方案 → 接入 LLM 即启用（配置写在该方案的 llm_rerank 节）。';
-  lbl.WordWrap := True;
-  lbl.SetBounds(ScaleX(0), ScaleY(0), ScaleX(430), ScaleY(44));
-  ModelCombo := TNewComboBox.Create(ModelPage.Surface);
-  ModelCombo.Parent := ModelPage.Surface;
-  ModelCombo.Style := csDropDownList;
-  ModelCombo.SetBounds(ScaleX(0), ScaleY(52), ScaleX(430), ScaleY(80));
-  ModelCombo.Items.Add('暂不下载（默认）— 之后可重跑安装包，或在设置中自行放置模型');
-  ModelCombo.Items.Add('下载 Qwen3.5-0.8B-Q4_K_M（约 508 MB，ModelScope）');
-  ModelCombo.ItemIndex := 0;
-  // 当前模型位置：读 yaml（配置过即显示），空置时为默认位置
-  CurPathLbl := TNewStaticText.Create(ModelPage.Surface);
-  CurPathLbl.Parent := ModelPage.Surface;
-  p := CurModelPath();
-  if FileExists(p) then
-    CurPathLbl.Caption := '当前模型位置：' + p + '（文件已存在）'
-  else
-    CurPathLbl.Caption := '当前模型位置：' + p + '（文件不存在）';
-  CurPathLbl.WordWrap := True;
-  CurPathLbl.SetBounds(ScaleX(0), ScaleY(88), ScaleX(430), ScaleY(40));
-end;
-
-function NextButtonClick(CurPageID: Integer): Boolean;
-var
-  idx: Integer;
-  dest, err: String;
-  ok, giveUp: Boolean;
-begin
-  Result := True;
-  if CurPageID = ModelPage.ID then begin
-    idx := ModelCombo.ItemIndex;
-    if idx = 1 then begin
-      // 下载分支：落点 = 当前显示位置（方案 llm_rerank 节配了就用它，否则默认）
-      dest := CurModelPath();
-      ForceDirectories(ExtractFileDir(dest));
-      if FileExists(dest) then
-        if MsgBox('已存在模型文件：' + dest + #13#10#13#10 +
-                  '是否重新下载覆盖？（选"否"则沿用现有文件）',
-                  mbConfirmation, MB_YESNO) = IDNO then
-          Exit;   // 不写任何配置：启用与否由用户在「LLM 重排设置」里决定
-      ok := False;
-      giveUp := False;
-      repeat
-        DownloadPage.Clear;
-        DownloadPage.Add(ModelUrlStr, ModelFileName, dest);
-        DownloadPage.Show;
-        try
-          DownloadPage.Download;
-          ok := True;
-        except
-          err := GetExceptionMessage;
-        end;
-        DownloadPage.Hide;
-        if (not ok) and (MsgBox(
-            '模型下载失败：' + err + #13#10 + #13#10 +
-            '选"重试"再试；选"取消"跳过——之后重跑安装包下载，或手动下载：'#13#10 +
-            ModelUrlStr + #13#10 + '放到：' + dest,
-            mbError, MB_RETRYCANCEL) <> IDRETRY) then
-          giveUp := True;
-      until ok or giveUp;
-      // 下载成功不写配置（2026-09-30：配置在方案 llm_rerank 节里，
-      // 由「LLM 重排设置」→『接入 LLM』写入）
-    end;
-  end;
-end;
+// 2026-10-01 用户定案：安装器不再有"模型下载"页（那一步挪进配置 GUI：托盘
+// 「LLM 重排设置」→ 总控 → 下载模型，与插件版同一套 curl 断点续传）。
 
 // 已有小狼毫 → 其目录原地升级；否则默认独立目录
 //（不用 FindFirst：探测用固定候选清单覆盖官方 0.17.x-0.19.x 与本包自身）

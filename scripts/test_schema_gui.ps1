@@ -13,13 +13,38 @@ $test = Join-Path $sandbox "Rime\zz_test_gui.schema.yaml"
 
 Add-Type @"
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 public class W {
   [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr h, int id);
   [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll", EntryPoint="SendMessageW", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessageStr(IntPtr h, uint m, IntPtr w, string s);
   [DllImport("user32.dll", EntryPoint="SendMessageW", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessageBuf(IntPtr h, uint m, IntPtr w, [Out][MarshalAs(UnmanagedType.LPWStr)] System.Text.StringBuilder s);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int n);
+  // 确认框查找（#32770 模态框属于 GUI 进程）+ 子控件枚举
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, EnumProc cb, IntPtr l);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, ref int pid);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
+  public static List<IntPtr> Children(IntPtr p) {
+    var found = new List<IntPtr>();
+    EnumChildWindows(p, delegate(IntPtr h, IntPtr l) { found.Add(h); return true; }, IntPtr.Zero);
+    return found;
+  }
+  public static IntPtr FindDialog(int pid) {
+    IntPtr hit = IntPtr.Zero;
+    EnumWindows(delegate(IntPtr h, IntPtr l) {
+      int p = 0; GetWindowThreadProcessId(h, ref p);
+      if (p != pid) return true;
+      var sb = new System.Text.StringBuilder(64);
+      GetClassName(h, sb, 64);
+      if (sb.ToString() == "#32770") { hit = h; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return hit;
+  }
 }
 "@
 
@@ -47,14 +72,74 @@ function Read-Ctl($hw, [int]$id) {
   [void][W]::SendMessageBuf($h, 0x000D, [IntPtr]($len + 1), $sb)             # WM_GETTEXT
   return $sb.ToString()
 }
-function Click-Add($hw) {
-  [W]::SendMessage($combo, 0x014E, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # CB_SETCURSEL(0)
-  [W]::SendMessage([W]::GetDlgItem($hw, 1033), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+# 保存并生效（1101）= 自适应：缺节/缺组件行时自动补齐（原「接入 LLM」已并入，2026-10-01）
+function Get-WText([IntPtr]$h) {
+  # 按句柄取文本（确认框里的按钮文案要用它）
+  if ($h -eq [IntPtr]::Zero) { return "" }
+  $len = [int][W]::SendMessage($h, 0x000E, [IntPtr]::Zero, [IntPtr]::Zero)
+  if ($len -le 0) { return "" }
+  $sb = New-Object System.Text.StringBuilder ($len + 2)
+  [void][W]::SendMessageBuf($h, 0x000D, [IntPtr]($len + 1), $sb)
+  return $sb.ToString()
+}
+# 点某个按钮（**必须 Post 不能 Send**：按钮处理里可能弹模态确认框，SendMessage 会把测试线程
+# 与 GUI 线程一起卡在框上，后面的 Dismiss-Prompt 永远执行不到）
+function Click-Ctl($hw, [int]$id, [string]$Dismiss = "") {
+  [void][W]::PostMessage([W]::GetDlgItem($hw, $id), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+  if ($Dismiss) { [void](Dismiss-Prompt $hw $Dismiss) }
+  Start-Sleep -Milliseconds 800
+}
+function Click-Save($hw) {
+  [void][W]::PostMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+  [void](Dismiss-Prompt $hw "是")   # 若因"文件已被外部修改"弹框 → 答"是"（用界面值覆盖）
   Start-Sleep -Milliseconds 900
   return (Read-Stat $hw)
 }
+function Click-Add($hw) {
+  [W]::SendMessage($combo, 0x014E, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # CB_SETCURSEL(0)
+  Reload-Params $hw           # 先重读（测试刚在外部改过文件；否则触发"文件已变更"确认框）
+  return (Click-Save $hw)     # 保存即自动接入（缺件补齐）
+}
+# 重读当前方案（刷新按钮已删）：向主窗口投 CBN_SELCHANGE —— 源码版直接读 CB_GETCURSEL，
+# 故合成通知即可触发 load_schema_params（不依赖原生控件是否真的发了通知）。
+# 界面有未保存改动时该动作会弹"未保存的改动"确认框（2026-10-01）→ 用 -Answer 自动应答。
+function Reload-Params($hw, [string]$Answer = "是") {
+  [void][W]::PostMessage($hw, 0x0111, [IntPtr](0x10000 * 1 + 1031), [IntPtr]$combo)   # WM_COMMAND(Post!), CBN_SELCHANGE
+  if ($Answer) { [void](Dismiss-Prompt $hw $Answer) }
+  Start-Sleep -Milliseconds 700
+}
+# 展开/收起方案下拉（触发 CBN_DROPDOWN(7)：重扫两处列表 + 界面无改动时重读当前文件）
+function Open-Dropdown($hw) {
+  [void][W]::PostMessage($hw, 0x0111, [IntPtr](0x10000 * 7 + 1031), [IntPtr]$combo)
+  Start-Sleep -Milliseconds 800
+}
+# 找 GUI 进程（不是测试进程！）的模态确认框（#32770）并点掉指定按钮。
+# 没弹框属正常（界面干净）→ 返回 $false，不抛异常，避免套件卡死在模态框上。
+function Dismiss-Prompt([IntPtr]$hw, [string]$ButtonText) {
+  $gpid = 0
+  [void][W]::GetWindowThreadProcessId($hw, [ref]$gpid)
+  $dlg = [IntPtr]::Zero
+  for ($i = 0; $i -lt 25; $i++) {
+    $dlg = [W]::FindDialog([int]$gpid)
+    if ($dlg -ne [IntPtr]::Zero) { break }
+    Start-Sleep -Milliseconds 200
+  }
+  if ($dlg -eq [IntPtr]::Zero) { return $false }
+  foreach ($h in [W]::Children($dlg)) {
+    if ((Get-WText $h) -eq $ButtonText) {
+      [void][W]::SendMessage($h, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)   # BM_CLICK
+      Start-Sleep -Milliseconds 400
+      return $true
+    }
+  }
+  # 按钮文案对不上（语言/ID 差异）→ 按 IDYES(6)/IDNO(7) 发 WM_COMMAND 兜底
+  $id = if ($ButtonText -eq "是") { 6 } else { 7 }
+  [void][W]::SendMessage($dlg, 0x0111, [IntPtr]$id, [IntPtr]::Zero)
+  Start-Sleep -Milliseconds 400
+  return $true
+}
 function Click-Remove($hw) {
-  [W]::SendMessage([W]::GetDlgItem($hw, 1034), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+  [void][W]::PostMessage([W]::GetDlgItem($hw, 1034), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
   Start-Sleep -Milliseconds 900
   return (Read-Stat $hw)
 }
@@ -90,6 +175,7 @@ function Assert([string]$name, [bool]$cond) {
 New-Item -ItemType Directory -Path (Join-Path $sandbox "Rime") -Force | Out-Null
 $env:APPDATA = $sandbox                       # 子进程 GUI 继承 → 读写全落沙箱
 $env:WEASEL_LLM_SETUP_NO_REDEPLOY = "1"       # 静默跳过重新部署（测试开关）
+$env:RIME_LLM_USER_DIR = Join-Path $sandbox "Rime"   # 用户目录钉在沙箱（GUI 优先注册表 RimeUserDir）
 try {
   @'
 schema:
@@ -107,12 +193,14 @@ engine:
   $hw = Get-Hwnd
   $combo = [W]::GetDlgItem($hw, 1031)
 
-  Write-Host "== phase1: 干净方案接入 =="
+  Write-Host "== phase1: 干净方案接入（保存并生效 = 自适应补齐）=="
   $st = Click-Add $hw
   Write-Host ("  status: " + $st)
   $f = Get-Content $test -Encoding UTF8
   $iU = 0; for ($i = 0; $i -lt $f.Count; $i++) { if ($f[$i] -match "uniquifier") { $iU = $i } }
-  Assert "状态行含'已接入'" ($st -match "已接入")
+  # 保存的自适应结果报在底部状态行（IDC_STATUS=1103）；方案接入组状态行变为"已加载"
+  Assert "底部状态行含'已接入并保存'" ((Read-Ctl $hw 1103) -match "已接入并保存")
+  Assert "方案接入组状态行变'已加载'" ((Read-Stat $hw) -match "已加载")
   Assert "llm_filter 恰 1 行" ((($f | Select-String "llm_filter").Count) -eq 1)
   Assert "插在 uniquifier 后" ($f[$iU + 1] -match "llm_filter")
   # 2026-09-30 起：接入 = 组件行 + llm_rerank 配置节（配置回归方案，两版同款）
@@ -200,7 +288,7 @@ engine:
   $txt = [W]::GetDlgItem($hw, 1016)                    # IDC_CODE_PAT
   [W]::SendMessage($txt, 0x000C, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # WM_SETTEXT ""（先清空）
   [W]::SendMessageStr($txt, 0x000C, [IntPtr]::Zero, "[abcde]{4}") | Out-Null # WM_SETTEXT 目标值
-  [W]::SendMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # IDC_SAVE
+  [void][W]::PostMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)  # IDC_SAVE
   Start-Sleep -Milliseconds 900
   $y = Get-Content $test -Encoding UTF8
   Assert "code_pattern 单引号写出 [abcde]{4}" (($y | Where-Object { $_ -match "^  code_pattern: '\[abcde\]\{4\}'$" }).Count -eq 1)
@@ -250,9 +338,8 @@ cpu_cores: 7
 debug_fusion: true
 model_path: d:/gguf_models/legacy.gguf
 '@ | Out-File -FilePath (Join-Path $sandbox "Rime\llm_rerank.yaml") -Encoding ascii
-  # 刷新 = 重扫方案 + 重读配置节（此时无节 → 走迁移）
-  [W]::SendMessage([W]::GetDlgItem($hw, 1032), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # IDC_SCHEMAREF
-  Start-Sleep -Milliseconds 700
+  # 重读配置节（刷新按钮已删 → 合成 CBN_SELCHANGE；此时无节 → 走旧全局配置迁移）
+  Reload-Params $hw
   $st = Read-Stat $hw
   Write-Host ("  status: " + $st)
   Assert "状态提示已带出旧全局配置" ($st -match '旧全局配置')
@@ -277,11 +364,11 @@ model_path: d:/gguf_models/legacy.gguf
   Write-Host "== phase9: 出错写错误日志（正常不写）=="
   $logFile = Join-Path (Split-Path $exe -Parent) "WeaselLLMSetup_error.log"
   if (Test-Path $logFile) { Remove-Item $logFile -Force }
-  [W]::SendMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # 正常保存
+  [void][W]::PostMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)  # 正常保存
   Start-Sleep -Milliseconds 700
   Assert "正常保存不写错误日志" (-not (Test-Path $logFile))
   Set-ItemProperty -Path $test -Name IsReadOnly -Value $true          # 方案只读 → 保存必失败
-  [W]::SendMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+  [void][W]::PostMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
   Start-Sleep -Milliseconds 700
   Assert "状态行出现失败" ((Read-Ctl $hw 1103) -match '失败')
   Assert "错误日志已生成" (Test-Path $logFile)
@@ -293,7 +380,7 @@ model_path: d:/gguf_models/legacy.gguf
   Set-ItemProperty -Path $test -Name IsReadOnly -Value $false
 
   # phase10: 程序文件夹预装方案可选中 + 写入前自动复制到用户文件夹
-  Write-Host "== phase10: 程序文件夹预装方案可选中 + 接入自动复制到用户文件夹 =="
+  Write-Host "== phase10: 程序文件夹预装方案可选中 + 保存即自动复制到用户文件夹并接入 =="
   $items = Get-ComboItems $combo
   Write-Host ("  方案下拉（{0} 项）: {1}" -f $items.Count, ($items -join ' | '))
   $prog = @($items | Where-Object { $_ -like "*（程序）" })
@@ -303,12 +390,11 @@ model_path: d:/gguf_models/legacy.gguf
   $sharedFile = Join-Path (Join-Path $root 'data') $progName
   $beforeHash = (Get-FileHash $sharedFile -Algorithm SHA256).Hash
   Select-ComboLast $combo
-  [W]::SendMessage([W]::GetDlgItem($hw, 1032), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # 刷新 → 重读状态
-  Start-Sleep -Milliseconds 700
+  Reload-Params $hw
   Assert ("已选中预装方案（实测 '$(Read-Ctl $hw 1031)'）") ((Read-Ctl $hw 1031) -like "*（程序）")
   Assert "选中预装方案时状态提示会先复制" ((Read-Stat $hw) -match '预装方案')
-  # 注意：不能走 Click-Add（它内部会把选择重置到第 0 项）；这里直接点『接入 LLM』
-  [W]::SendMessage([W]::GetDlgItem($hw, 1033), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+  # 注意：不能走 Click-Add（它内部会把选择重置到第 0 项）；这里直接点「保存并生效」（= 复制 + 自动接入）
+  [void][W]::PostMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
   Start-Sleep -Milliseconds 1200
   $st = Read-Stat $hw
   Write-Host ("  status: " + $st)
@@ -322,6 +408,140 @@ model_path: d:/gguf_models/legacy.gguf
     Remove-Item $copied -Force
   }
   Assert "程序文件夹原件未被改动" ((Get-FileHash $sharedFile -Algorithm SHA256).Hash -eq $beforeHash)
+
+  # phase11: 保存的自适应重建（缺组件行也自动补齐）+ 打开下拉重扫列表 / 脏标记保护
+  Write-Host "== phase11: 保存自动补组件行 + 打开下拉重扫 + 脏标记保护 =="
+  # 先重扫列表（phase10 复制又删掉的预装方案副本会残留成死项），再按名选中沙箱方案
+  Open-Dropdown $hw
+  $idx = [int][W]::SendMessageStr($combo, 0x0158, [IntPtr]::Zero, "zz_test_gui.schema.yaml")
+  Assert ("按名找到沙箱方案（CB_FINDSTRINGEXACT=$idx）") ($idx -ge 0)
+  [W]::SendMessage($combo, 0x014E, [IntPtr]$idx, [IntPtr]::Zero) | Out-Null   # CB_SETCURSEL
+  Reload-Params $hw
+  Write-Host ("  选中方案: '" + (Read-Ctl $hw 1031) + "' | 方案接入组: " + (Read-Stat $hw))
+  Assert ("选中方案 = zz_test_gui（实测 '" + (Read-Ctl $hw 1031) + "'）") ((Read-Ctl $hw 1031) -eq "zz_test_gui.schema.yaml")
+  # (a) 节在、组件行被删 → 保存应自动补回 llm_filter
+  $txt = Get-Content $test -Raw -Encoding UTF8
+  $txt = ($txt -split "`r?`n" | Where-Object { $_ -notmatch '^\s+- llm_filter\s*$' }) -join "`r`n"
+  Set-Content $test -Value $txt -Encoding ascii -NoNewline
+  Reload-Params $hw
+  $st = Click-Save $hw
+  Write-Host ("  status: " + $st + " | 底部: " + (Read-Ctl $hw 1103))
+  $f11 = Get-Content $test -Encoding UTF8
+  Assert "缺组件行时保存自动补齐（底部状态含 已接入并保存）" ((Read-Ctl $hw 1103) -match '已接入并保存')
+  Assert "llm_filter 组件行已补回" (($f11 | Where-Object { $_ -match '^\s+- llm_filter\s*$' }).Count -eq 1)
+  Assert "配置节未重复" (($f11 | Where-Object { $_ -match '^llm_rerank:' }).Count -eq 1)
+  # (b) 打开下拉 → 重扫列表（外部新增方案出现）
+  $extra = Join-Path (Split-Path $test -Parent) "zz_extra.schema.yaml"
+  "schema:`r`n  schema_id: zz_extra`r`nengine:`r`n  filters:`r`n    - uniquifier`r`n" |
+    Out-File -FilePath $extra -Encoding ascii
+  Open-Dropdown $hw
+  $items = Get-ComboItems $combo
+  Write-Host ("  方案下拉（{0} 项）: {1}" -f $items.Count, ($items -join ' | '))
+  Assert "打开下拉后新方案已出现在列表" (@($items | Where-Object { $_ -eq 'zz_extra.schema.yaml' }).Count -eq 1)
+  Remove-Item $extra -Force
+  # (c) 脏标记：界面有未保存改动时，打开下拉不覆盖用户输入
+  $tok = [W]::GetDlgItem($hw, 1014)     # IDC_MAX_TOK
+  [void][W]::SendMessageStr($tok, 0x000C, [IntPtr]::Zero, "77")   # WM_SETTEXT
+  $raw = Get-Content $test -Raw -Encoding UTF8
+  Set-Content $test -Value ($raw -replace 'max_tokens: \d+', 'max_tokens: 55') -Encoding ascii -NoNewline
+  Open-Dropdown $hw
+  Assert ("未保存的界面输入未被冲掉（实测 '$(Read-Ctl $hw 1014)'）") ((Read-Ctl $hw 1014) -eq "77")
+  # (d) 切换方案时若有未保存改动：选"否"→ 保留改动、不重读；选"是"→ 丢弃并重读
+  Reload-Params $hw "否"
+  Assert ("切换被取消后界面值保留（实测 '$(Read-Ctl $hw 1014)'）") ((Read-Ctl $hw 1014) -eq "77")
+  Assert "取消提示出现在状态行" ((Read-Ctl $hw 1103) -match '已取消切换')
+  Reload-Params $hw "是"
+  $diag = "选中='" + (Read-Ctl $hw 1031) + "' 文件 max_tokens 行='" + (((Get-Content $test) | Where-Object { $_ -match 'max_tokens:' }) -join '/') + "'"
+  Write-Host ("  [诊断] " + $diag)
+  Assert ("确认切换后取磁盘值（实测 '$(Read-Ctl $hw 1014)'；$diag）") ((Read-Ctl $hw 1014) -eq "55")
+
+  # phase12: 五处薄弱点修复的覆盖（模型路径绝对化 / 可疑文件 / 下载前确认 / 遗留 curl 接管）
+  Write-Host "== phase12: 模型路径与下载的新校验 =="
+  # ⑤ 默认路径跟着"用户目录"（沙箱由 RIME_LLM_USER_DIR 指定）
+  # 两个干扰源都要先清掉：① 旧全局 llm_rerank.yaml 的迁移值 ② 方案节里 phase8 写进去的显式 model_path
+  Remove-Item (Join-Path $sandbox "Rime\llm_rerank.yaml") -Force -ErrorAction SilentlyContinue
+  $raw5 = Get-Content $test -Raw -Encoding UTF8
+  $raw5 = ($raw5 -split "`r?`n" | Where-Object { $_ -notmatch '^\s+#?\s*model_path:' }) -join "`r`n"
+  Set-Content $test -Value $raw5 -Encoding ascii -NoNewline
+  Reload-Params $hw
+  $modelCtl = [W]::GetDlgItem($hw, 1002)
+  $cur = Read-Ctl $hw 1002
+  $expectDefault = Join-Path (Join-Path $sandbox "Rime") "Qwen3.5-0.8B-Q4_K_M.gguf"
+  Write-Host ("  模型路径框 = " + $cur + "（方案节已无 model_path + 无旧全局 yaml）")
+  Assert ("默认模型路径 = 用户目录下的默认名（实测 '$cur'）") ($cur -eq $expectDefault)
+  # ① 指向一个明显偏小的 .gguf → 状态行报"可疑"（不再谎报已就绪）
+  $small = Join-Path (Join-Path $sandbox "Rime") "small.gguf"
+  [IO.File]::WriteAllBytes($small, (New-Object byte[] 2048))
+  [void][W]::SendMessageStr($modelCtl, 0x000C, [IntPtr]::Zero, $small)
+  # 跨进程 WM_SETTEXT 不会给 GUI 发编辑通知 → 手动投 CBN_EDITUPDATE，触发状态行刷新
+  [void][W]::PostMessage($hw, 0x0111, [IntPtr](0x10000 * 6 + 1002), $modelCtl)   # CBN_EDITUPDATE=6
+  Start-Sleep -Milliseconds 500
+  Assert ("小文件显示为可疑（实测 '$(Read-Ctl $hw 1005)'）") ((Read-Ctl $hw 1005) -match '可疑')
+  # ①b 已存在但偏小时点下载 → 先弹确认；选"否"→ 取消且不启动下载
+  $curlBefore = @(Get-Process curl -ErrorAction SilentlyContinue).Count
+  [void][W]::PostMessage([W]::GetDlgItem($hw, 1007), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+  Dismiss-Prompt $hw "否" | Out-Null
+  Start-Sleep -Milliseconds 400
+  Assert "取消下载提示出现在状态行" ((Read-Ctl $hw 1103) -match '已取消下载')
+  Assert ("未启动新的 curl（实测 {0} 个）" -f @(Get-Process curl -ErrorAction SilentlyContinue).Count) (@(Get-Process curl -ErrorAction SilentlyContinue).Count -eq $curlBefore)
+  Remove-Item $small -Force
+  # ③ 相对路径必须被拒绝（不落盘）
+  [void][W]::SendMessageStr($modelCtl, 0x000C, [IntPtr]::Zero, "model.gguf")
+  Start-Sleep -Milliseconds 300
+  $before12 = (Get-FileHash $test -Algorithm SHA1).Hash
+  [void][W]::PostMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+  Start-Sleep -Milliseconds 700
+  Assert ("相对路径保存被拒绝（实测 '" + (Read-Ctl $hw 1103) + "'）") ((Read-Ctl $hw 1103) -match '必须是绝对路径')
+  Assert "被拒绝时方案文件未被改写" ((Get-FileHash $test -Algorithm SHA1).Hash -eq $before12)
+  # 恢复成默认路径（界面干净化 → 后续动作不再弹确认）
+  [void][W]::SendMessageStr($modelCtl, 0x000C, [IntPtr]::Zero, $expectDefault)
+  Start-Sleep -Milliseconds 300
+  Click-Save $hw | Out-Null
+  Assert ("恢复默认路径后保存成功（实测 '" + (Read-Ctl $hw 1103) + "'）") ((Read-Ctl $hw 1103) -match '已保存|已接入并保存')
+
+  # ② 遗留 curl 接管：起一次下载 → 强杀 GUI（跳过关窗清理）→ 重开再点下载 → 旧进程被接管
+  if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+    Write-Host "  （跳过：本机无 curl.exe）"
+  } else {
+    $dlTarget = Join-Path (Join-Path $sandbox "Rime") "dl_test.gguf"
+    $procA = Start-Process -FilePath $exe -PassThru
+    $hwA = [IntPtr]::Zero
+    for ($t = 0; $t -lt 30; $t++) { Start-Sleep -Milliseconds 500; $procA.Refresh(); if ($procA.HasExited) { break }; if ($procA.MainWindowHandle -ne [IntPtr]::Zero) { $hwA = $procA.MainWindowHandle; break } }
+    if ($hwA -eq [IntPtr]::Zero) { throw "第二次启动 GUI 失败" }
+    Start-Sleep -Seconds 1
+    [void][W]::SendMessageStr([W]::GetDlgItem($hwA, 1002), 0x000C, [IntPtr]::Zero, $dlTarget)
+    Start-Sleep -Milliseconds 300
+    [void][W]::PostMessage([W]::GetDlgItem($hwA, 1007), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+    Start-Sleep -Seconds 3
+    $tmpA = $dlTarget + ".download"
+    Assert ("下载已启动：分片出现（{0} 字节）" -f $(if (Test-Path $tmpA) { (Get-Item $tmpA).Length } else { -1 })) (Test-Path $tmpA)
+    Assert "下载已启动：pid 文件出现" (Test-Path ($tmpA + ".pid"))
+    # 强杀 GUI（TerminateProcess 不经 WM_DESTROY）→ 模拟"关窗没清干净"的遗留 curl
+    [void](Stop-Process -Id $procA.Id -Force)
+    Start-Sleep -Seconds 1
+    $orphanPid = (Get-Content ($tmpA + ".pid") -ErrorAction SilentlyContinue | Select-Object -First 1)
+    $nOrphan = @(Get-Process curl -ErrorAction SilentlyContinue).Count
+    Write-Host ("  [诊断] 遗留 curl PID=$orphanPid（curl 进程数 $nOrphan）")
+    Assert ("强杀 GUI 后 curl 成为遗留进程（{0} 个）" -f $nOrphan) ($nOrphan -ge 1)
+    # 重开 GUI → 再点下载 → 旧的应被结束、本次接管
+    $procB = Start-Process -FilePath $exe -PassThru
+    $hwB = [IntPtr]::Zero
+    for ($t = 0; $t -lt 30; $t++) { Start-Sleep -Milliseconds 500; $procB.Refresh(); if ($procB.HasExited) { break }; if ($procB.MainWindowHandle -ne [IntPtr]::Zero) { $hwB = $procB.MainWindowHandle; break } }
+    Start-Sleep -Seconds 1
+    [void][W]::SendMessageStr([W]::GetDlgItem($hwB, 1002), 0x000C, [IntPtr]::Zero, $dlTarget)
+    Start-Sleep -Milliseconds 300
+    [void][W]::PostMessage([W]::GetDlgItem($hwB, 1007), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+    Start-Sleep -Seconds 2
+    # 状态行会被进度行覆盖，故按 .pid 换人 + 旧进程消失来判定"接管"（比抓提示文本可靠）
+    $newPid = (Get-Content ($tmpA + ".pid") -ErrorAction SilentlyContinue | Select-Object -First 1)
+    Write-Host ("  [诊断] 接管后 pid 文件 = $newPid（旧 $orphanPid）")
+    Assert ("接管后 pid 文件已换成新进程（旧 $orphanPid → 新 $newPid）") ($newPid -and ("$newPid" -ne "$orphanPid"))
+    Assert ("旧下载进程已被结束（PID $orphanPid）") (-not (Get-Process -Id ([int]$orphanPid) -ErrorAction SilentlyContinue))
+    Assert ("接管后只剩本次一个 curl（实测 {0} 个）" -f @(Get-Process curl -ErrorAction SilentlyContinue).Count) (@(Get-Process curl -ErrorAction SilentlyContinue).Count -eq 1)
+    Get-Process curl -ErrorAction SilentlyContinue | Stop-Process -Force
+    [void](Stop-Process -Id $procB.Id -Force)
+    Remove-Item ($dlTarget + "*") -Force -ErrorAction SilentlyContinue
+  }
 }
 finally {
   Get-Process WeaselLLMSetup -ErrorAction SilentlyContinue | Stop-Process -Force
