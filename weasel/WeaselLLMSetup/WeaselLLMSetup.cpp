@@ -6,12 +6,13 @@
 // 2026-09-04 改版：模型下载移入安装包（装时可选、默认不下载），本界面
 // 只管配置——去掉下载按钮/首次下载提示；模型路径改下拉框（扫描 Rime
 // 用户目录与 %USERPROFILE%\gguf_models 的 .gguf + 浏览），新增模型状态
-// 行（文件存在性/大小）、打开用户文件夹、debug_fusion 诊断开关。
+// 行（文件存在性/大小）、debug_fusion 诊断开关。（「打开用户文件夹」按钮已于
+// 2026-10-01 按用户要求删除。）
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
-#include <shellapi.h>
 #include <objbase.h>
+#include <gdiplus.h>   // 抗锯齿圆（GDI 的 Ellipse/RoundRect 无 AA，小圆锯齿明显）
 #include <string>
 #include <vector>
 #include <deque>
@@ -25,7 +26,7 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
-#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "gdiplus.lib")   // 「?」圆徽标 / 按钮圆角（系统组件）
 #pragma comment(lib, "advapi32.lib")  // RegGetValue（WeaselRoot 定位部署器）
 // 视觉样式（Common Controls v6）：否则按钮/勾选框呈 Win2000 经典浮雕样式
 #pragma comment(linker, "\"/manifestdependency:type='win32' \
@@ -36,7 +37,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_ENABLED      1001
 #define IDC_MODEL        1002
 #define IDC_BROWSE       1003
-#define IDC_OPENDIR      1004
+// 1004 = 原「打开用户文件夹」（2026-10-01 按用户要求删除按钮，ID 留空不再使用）
 #define IDC_MSTATUS      1005
 #define IDC_MSTATUS_HINT 1006   // 模型状态第二行（灰色小字）
 #define IDC_DOWNLOAD     1007   // 下载模型（2026-10-01 用户定案：从安装器移到配置 GUI）
@@ -86,6 +87,7 @@ static int g_ui_height = 0; // make_ui() 算出的内容总高（设备像素；
 // 不搬移已有元素，c_str() 指针长期有效——vector 会因扩容失效）
 static HWND g_tip = NULL;
 static std::deque<std::wstring> g_tips;
+static ULONG_PTR g_gdip = 0;   // GDI+ 令牌（wWinMain 里 Startup；0 = 没起来 → 退回 GDI 画法）
 
 // ---- 工具 ----
 // Rime 用户文件夹（= 小狼毫右键"用户文件夹"；方案与模型都在这里）。
@@ -1083,6 +1085,52 @@ static HWND mk(int cls, const wchar_t* text, DWORD style, int x, int y, int w,
   return ctl;
 }
 
+// ── 自绘按钮（2026-10-01 用户定案：按钮换背景色、更显眼）────────────────
+// 主题按钮（common controls v6 清单）**忽略** WM_CTLCOLORBTN 与任何背景色，
+// 要上色只能 BS_OWNERDRAW + WM_DRAWITEM 自绘。按钮行为（点击/BM_CLICK/空格/
+// Tab 焦点）仍由按钮窗口类自己处理，自绘只接管"画"。
+// 悬停高亮要自己跟踪：鼠标消息发给按钮而不是父窗口 → 给每个自绘按钮挂一个
+// 子类化过程（TrackMouseEvent + WM_MOUSELEAVE），否则没有 hover 反馈。
+// 主按钮（保存并生效）= 深蓝白字；其余（浏览/下载模型/剥离/关闭）
+// = 浅蓝深字；两版配色逐值一致（插件版 install_plugin.ps1 的 $colBtn* / $colPri*）。
+static HWND g_hot_btn = NULL;   // 当前悬停的自绘按钮（NULL = 都不悬停）
+static const COLORREF kBtnAccent     = RGB(45, 108, 192);   // 主按钮底色
+static const COLORREF kBtnAccentHot  = RGB(62, 128, 214);
+static const COLORREF kBtnAccentDown = RGB(30, 84, 156);
+static const COLORREF kBtnAccentEdge = RGB(24, 70, 130);
+static const COLORREF kBtnSoft       = RGB(232, 240, 250);  // 次要按钮底色
+static const COLORREF kBtnSoftHot    = RGB(214, 229, 246);
+static const COLORREF kBtnSoftDown   = RGB(196, 216, 240);
+static const COLORREF kBtnSoftEdge   = RGB(157, 187, 220);
+static const COLORREF kBtnSoftFg     = RGB(31, 78, 121);
+
+static LRESULT CALLBACK btn_subclass(HWND h, UINT msg, WPARAM wp, LPARAM lp,
+                                     UINT_PTR id, DWORD_PTR ref) {
+  if (msg == WM_MOUSEMOVE) {
+    if (g_hot_btn != h) {
+      g_hot_btn = h;
+      InvalidateRect(h, NULL, FALSE);
+    }
+    TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, h, 0};
+    TrackMouseEvent(&tme);
+  } else if (msg == WM_MOUSELEAVE) {
+    if (g_hot_btn == h) {
+      g_hot_btn = NULL;
+      InvalidateRect(h, NULL, FALSE);
+    }
+  }
+  return DefSubclassProc(h, msg, wp, lp);
+}
+
+// 自绘按钮工厂：带 WS_TABSTOP（键盘可达）+ BS_OWNERDRAW（走 WM_DRAWITEM）。
+// **注意顺序**：创建 → tip_add → hook_button（子类化必须最后做）。tooltip 的
+// TTF_SUBCLASS 同样是子类化实现，而它会**吞掉 WM_MOUSEMOVE**（不向旧过程转发）——
+// 先子类化就永远收不到悬停消息（2026-10-01 实测：hover 色不变）。
+static HWND mk_button(const wchar_t* text, int x, int y, int w, int h, int id) {
+  return mk(0, text, WS_TABSTOP | BS_OWNERDRAW, x, y, w, h, id);
+}
+static void hook_button(HWND c) { SetWindowSubclass(c, btn_subclass, 1, 0); }
+
 // 布局铁律：任何控件的矩形不得与其他控件相交——不透明子控件按 z 序
 // 覆盖先画者，会把被覆盖控件的文字"局部擦除"成叠字残片（2026-08-27
 // 叠字事故根因：勾选框 w430 与下行标签矩形相交 + 空状态静态框横贯首行）。
@@ -1158,8 +1206,6 @@ static const wchar_t* const TIP_SAVE =
     L"方案还没接入（缺配置节 / 缺组件行 / 残留插件版组件行）时，\n"
     L"本按钮会先剥净再补齐组件行 + 写入配置节（原「接入 LLM」已并入这里）。";
 static const wchar_t* const TIP_CLOSE = L"关闭窗口（不保存未保存的改动）。";
-static const wchar_t* const TIP_OPENDIR =
-    L"打开小狼毫用户文件夹（%APPDATA%\\Rime）——模型与方案文件都在这里。";
 
 // 一行 = 标签 + 输入框 + 行末「?」徽标（全界面共用一个标签列宽与徽标列）
 static void row_input(int& y, int label_w, const wchar_t* label, int id,
@@ -1170,6 +1216,15 @@ static void row_input(int& y, int label_w, const wchar_t* label, int id,
   tip_add(e, tip);
   mk_help(hx, y + ts(2), tip);
   y += ts(30);
+}
+
+// 自绘按钮 + 悬停提示：**顺序固定** 创建 → tip_add → hook_button（见 mk_button 注释）
+static HWND mk_button_tip(const wchar_t* text, int x, int y, int w, int h, int id,
+                          const wchar_t* tip) {
+  HWND c = mk_button(text, x, y, w, h, id);
+  tip_add(c, tip);
+  hook_button(c);
+  return c;
 }
 
 static void make_ui() {
@@ -1229,10 +1284,10 @@ static void make_ui() {
     HWND cmb = mk(3, L"", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_TABSTOP, ex,
                   y - ts(3), comboW, ts(200), IDC_MODEL);
     tip_add(cmb, TIP_MODEL);
-    tip_add(mk(0, L"浏览…", WS_TABSTOP, ex + comboW + ts(8), y - ts(3), btnW,
-               ts(26), IDC_BROWSE), TIP_BROWSE);
-    tip_add(mk(0, L"下载模型", WS_TABSTOP, ex + comboW + btnW + ts(12), y - ts(3),
-               dlW, ts(26), IDC_DOWNLOAD), TIP_DOWNLOAD);
+    mk_button_tip(L"浏览…", ex + comboW + ts(8), y - ts(3), btnW, ts(26),
+                  IDC_BROWSE, TIP_BROWSE);
+    mk_button_tip(L"下载模型", ex + comboW + btnW + ts(12), y - ts(3), dlW,
+                  ts(26), IDC_DOWNLOAD, TIP_DOWNLOAD);
     mk_help(HX, y + ts(2), TIP_MODEL);
     y += ts(30);
     mk(1, L"", 0, LX, y, ts(140), ts(18), IDC_MSTATUS);
@@ -1290,15 +1345,22 @@ static void make_ui() {
     y += ts(30);
   }
   y += ts(4);
-  // 2026-10-01 用户定案：『剥离』= 保存的破坏性补充，并排放在保存右侧
-  tip_add(mk(0, L"保存并生效", WS_TABSTOP | BS_DEFPUSHBUTTON, LX, y, ts(110),
-             ts(32), IDC_SAVE), TIP_SAVE);
-  tip_add(mk(0, L"剥离", WS_TABSTOP, LX + ts(114), y, ts(76), ts(32), IDC_SCHEMAREM),
-          TIP_SCHEMAREM);
-  tip_add(mk(0, L"关闭", WS_TABSTOP, LX + ts(198), y, ts(76), ts(32), IDC_CLOSE),
-          TIP_CLOSE);
-  tip_add(mk(0, L"打开用户文件夹", WS_TABSTOP, RX - ts(126), y, ts(126),
-             ts(32), IDC_OPENDIR), TIP_OPENDIR);
+  // 2026-10-01 用户定案：①『剥离』= 保存的破坏性补充，并排放在保存右侧；
+  // ② 本行按钮**同宽**（宽度按最长的"保存并生效"实测，DPI 自适应）；
+  // ③ 一律自绘（mk_button）——主按钮深蓝白字，其余浅蓝深字；
+  // ④ 『打开用户文件夹』已按用户要求删除（要看用户文件夹走小狼毫托盘右键的「用户文件夹」）。
+  {
+    const wchar_t* bottom[3] = {L"保存并生效", L"剥离", L"关闭"};
+    const int ids[3] = {IDC_SAVE, IDC_SCHEMAREM, IDC_CLOSE};
+    const wchar_t* tips[3] = {TIP_SAVE, TIP_SCHEMAREM, TIP_CLOSE};
+    int bw = 0;
+    for (int i = 0; i < 3; ++i) {
+      int w = tw(bottom[i], g_font) + ts(26);
+      if (w > bw) bw = w;
+    }
+    for (int i = 0; i < 3; ++i)   // 左起紧排
+      mk_button_tip(bottom[i], LX + i * (bw + ts(8)), y, bw, ts(32), ids[i], tips[i]);
+  }
   y += ts(34);
   // 状态行独占一行（保存/部署消息较长，放按钮行右侧会被截断）
   mk(1, L"", 0, LX, y, ts(540), ts(20), IDC_STATUS);
@@ -1399,25 +1461,126 @@ static HWND mk_help(int x, int y, const wchar_t* tip) {
   return c;
 }
 
+// ── GDI+ 抗锯齿形状（2026-10-01 用户定案：圆徽标有锯齿 → 要光滑圆）──────
+// GDI 的 Ellipse/RoundRect 不做抗锯齿，18px 小圆的台阶肉眼可见；GDI+ 开 AntiAlias 即可。
+// 只把**形状**交给 GDI+，文字仍走 GDI DrawTextW（ClearType 比 GDI+ DrawString 清楚）——
+// 故 Graphics 对象放在独立作用域里，析构（Flush）之后再画字。
+// 圆形/圆角矩形都走 GraphicsPath：FillPath + DrawPath，边线 1px。
+static void gdip_round_path(Gdiplus::GraphicsPath* path, const RECT& r, int dia) {
+  const Gdiplus::REAL rad = (Gdiplus::REAL)dia / 2.0f;
+  const Gdiplus::REAL L = (Gdiplus::REAL)r.left + 0.5f, T = (Gdiplus::REAL)r.top + 0.5f;
+  const Gdiplus::REAL R = (Gdiplus::REAL)r.right - 0.5f, B = (Gdiplus::REAL)r.bottom - 0.5f;
+  const Gdiplus::REAL d = rad * 2.0f;
+  path->AddArc(L, T, d, d, 180.0f, 90.0f);
+  path->AddArc(R - d, T, d, d, 270.0f, 90.0f);
+  path->AddArc(R - d, B - d, d, d, 0.0f, 90.0f);
+  path->AddArc(L, B - d, d, d, 90.0f, 90.0f);
+  path->CloseFigure();
+}
+
 // WM_DRAWITEM（ODT_STATIC）：画浅蓝圆底 + 深蓝问号。
 // 窗口类背景是 COLOR_WINDOW（白），故先用白刷擦底再画圆。
+// 圆用 GDI+ 抗锯齿（GDI+ 起不来时退回 GDI Ellipse —— 有锯齿但功能不缺）。
 static void draw_help(const DRAWITEMSTRUCT* d) {
   RECT r = d->rcItem;
-  FillRect(d->hDC, &r, (HBRUSH)GetStockObject(WHITE_BRUSH));
-  HBRUSH fill = CreateSolidBrush(RGB(228, 235, 244));
-  HPEN edge = CreatePen(PS_SOLID, 1, RGB(150, 172, 200));
-  HGDIOBJ ob = SelectObject(d->hDC, fill);
-  HGDIOBJ op = SelectObject(d->hDC, edge);
-  Ellipse(d->hDC, r.left, r.top, r.right, r.bottom);
-  SelectObject(d->hDC, ob);
-  SelectObject(d->hDC, op);
-  DeleteObject(fill);
-  DeleteObject(edge);
+  FillRect(d->hDC, &r, GetSysColorBrush(COLOR_WINDOW));
+  bool drawn = false;
+  if (g_gdip) {
+    Gdiplus::Graphics g(d->hDC);
+    if (g.GetLastStatus() == Gdiplus::Ok) {
+      g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+      g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);   // 半像素对齐，圆更圆
+      Gdiplus::GraphicsPath path;
+      gdip_round_path(&path, r, r.bottom - r.top);          // dia = 整个高度 → 正圆
+      Gdiplus::SolidBrush fill(Gdiplus::Color(255, 228, 235, 244));
+      Gdiplus::Pen edge(Gdiplus::Color(255, 150, 172, 200), 1.0f);
+      g.FillPath(&fill, &path);
+      g.DrawPath(&edge, &path);
+      drawn = (g.GetLastStatus() == Gdiplus::Ok);
+    }
+  }
+  if (!drawn) {
+    HBRUSH fill = CreateSolidBrush(RGB(228, 235, 244));
+    HPEN edge = CreatePen(PS_SOLID, 1, RGB(150, 172, 200));
+    HGDIOBJ ob = SelectObject(d->hDC, fill);
+    HGDIOBJ op = SelectObject(d->hDC, edge);
+    Ellipse(d->hDC, r.left, r.top, r.right, r.bottom);
+    SelectObject(d->hDC, ob);
+    SelectObject(d->hDC, op);
+    DeleteObject(fill);
+    DeleteObject(edge);
+  }
   SetBkMode(d->hDC, TRANSPARENT);
   SetTextColor(d->hDC, RGB(45, 78, 120));
   HGDIOBJ of = SelectObject(d->hDC, g_font_help);
   DrawTextW(d->hDC, L"?", 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
   SelectObject(d->hDC, of);
+}
+
+// WM_DRAWITEM（ODT_BUTTON）：圆角实底色 + 居中文字（自绘按钮见 mk_button）。
+// 底/字/边三色按 主按钮×次要按钮 × 常态/悬停/按下/禁用 取；按下时文字下沉 1px。
+// 圆角四角用窗口底色擦一遍，否则残留上一帧的像素。
+static void draw_button(const DRAWITEMSTRUCT* d) {
+  RECT r = d->rcItem;
+  const bool primary = (d->CtlID == (UINT)IDC_SAVE);
+  const bool dis = (d->itemState & ODS_DISABLED) != 0;
+  const bool down = (d->itemState & ODS_SELECTED) != 0;
+  const bool hot = (g_hot_btn == d->hwndItem);
+  COLORREF bg, fg, eg;
+  if (dis) {
+    bg = RGB(238, 238, 238); fg = RGB(152, 152, 152); eg = RGB(205, 205, 205);
+  } else if (primary) {
+    bg = down ? kBtnAccentDown : (hot ? kBtnAccentHot : kBtnAccent);
+    fg = RGB(255, 255, 255);
+    eg = kBtnAccentEdge;
+  } else {
+    bg = down ? kBtnSoftDown : (hot ? kBtnSoftHot : kBtnSoft);
+    fg = kBtnSoftFg;
+    eg = kBtnSoftEdge;
+  }
+  FillRect(d->hDC, &r, GetSysColorBrush(COLOR_WINDOW));
+  // 圆角形状同样走 GDI+ 抗锯齿（GDI RoundRect 的四角有台阶）；文字随后用 GDI 画。
+  bool drawn = false;
+  if (g_gdip) {
+    Gdiplus::Graphics g(d->hDC);
+    if (g.GetLastStatus() == Gdiplus::Ok) {
+      g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+      g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+      Gdiplus::GraphicsPath path;
+      gdip_round_path(&path, r, ts(8) * 2);   // RoundRect 的 dia=ts(8) → 半径 ts(4)
+      Gdiplus::SolidBrush bgb(Gdiplus::Color(255, GetRValue(bg), GetGValue(bg), GetBValue(bg)));
+      Gdiplus::Pen pen(Gdiplus::Color(255, GetRValue(eg), GetGValue(eg), GetBValue(eg)), 1.0f);
+      g.FillPath(&bgb, &path);
+      g.DrawPath(&pen, &path);
+      drawn = (g.GetLastStatus() == Gdiplus::Ok);
+    }
+  }
+  if (!drawn) {
+    HBRUSH bgb = CreateSolidBrush(bg);
+    HPEN pen = CreatePen(PS_SOLID, 1, eg);
+    HGDIOBJ ob = SelectObject(d->hDC, bgb);
+    HGDIOBJ op = SelectObject(d->hDC, pen);
+    RoundRect(d->hDC, r.left, r.top, r.right, r.bottom, ts(8), ts(8));
+    SelectObject(d->hDC, ob);
+    SelectObject(d->hDC, op);
+    DeleteObject(bgb);
+    DeleteObject(pen);
+  }
+  wchar_t text[128] = L"";
+  GetWindowTextW(d->hwndItem, text, 128);
+  SetBkMode(d->hDC, TRANSPARENT);
+  SetTextColor(d->hDC, fg);
+  HGDIOBJ of = SelectObject(d->hDC, g_font);
+  RECT tr = r;
+  if (down) OffsetRect(&tr, 0, ts(1));
+  DrawTextW(d->hDC, text, -1, &tr,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+  SelectObject(d->hDC, of);
+  if (d->itemState & ODS_FOCUS) {
+    RECT fr = r;
+    InflateRect(&fr, -ts(4), -ts(4));
+    DrawFocusRect(d->hDC, &fr);
+  }
 }
 
 // ── 下载模型（2026-10-01 用户定案：功能两版统一，从安装器移到配置 GUI）──────
@@ -1613,17 +1776,6 @@ static void on_browse() {
   log_error(L"%s", msg);
 }
 
-static void on_open_dir() {
-  std::wstring dir = rime_user_dir();
-  if (dir.empty()) {
-    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"无法定位用户文件夹（APPDATA 缺失）");
-    log_error(L"打开用户文件夹：APPDATA 缺失");
-    return;
-  }
-  CreateDirectoryW(dir.c_str(), NULL);
-  ShellExecuteW(g_hwnd, L"open", dir.c_str(), NULL, NULL, SW_SHOWNORMAL);
-}
-
 // 实际消息处理（外面再套一层 WndProc 捕获异常 → 写错误日志）
 static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
@@ -1677,7 +1829,6 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       switch (LOWORD(wp)) {
         case IDC_BROWSE: on_browse(); return 0;
         case IDC_DOWNLOAD: on_download_model(); return 0;
-        case IDC_OPENDIR: on_open_dir(); return 0;
         case IDC_SCHEMAREM: on_schema_remove(); return 0;
         case IDC_SAVE: save_schema_params(); return 0;
         case IDC_CLOSE: DestroyWindow(h); return 0;
@@ -1692,8 +1843,27 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         draw_help(d);
         return TRUE;
       }
+      if (d && d->CtlType == ODT_BUTTON) {  // 全部按钮都是自绘（mk_button）
+        draw_button(d);
+        return TRUE;
+      }
       break;
     }
+    // 静态文本/复选框默认用 COLOR_BTNFACE（灰）擦自己的底，而窗口类是
+    // COLOR_WINDOW（白）→ 白底上一条条灰底（2026-10-01 用户报「label 背景
+    // 是灰的」）。统一返回窗口背景刷 + 透明文字底 → 标签与整体底色一致。
+    case WM_CTLCOLORSTATIC: {
+      HDC dc = (HDC)wp;
+      SetBkMode(dc, TRANSPARENT);
+      return (LRESULT)(HBRUSH)(COLOR_WINDOW + 1);
+    }
+    // 自绘按钮与 BS_DEFPUSHBUTTON 抢同一个样式位（BS_TYPEMASK 低 4 位）→ 缺省
+    // 按钮标记丢失，回车就没有落点。这里手动回答"IsDialogMessage 的默认按钮是
+    // 谁"，回车仍然 = 『保存并生效』（插件版对应 $form.AcceptButton）。
+    case DM_GETDEFID:
+      return MAKELRESULT(IDC_SAVE, DC_HASDEFID);
+    case DM_SETDEFID:
+      return 0;
     case WM_TIMER:
       if (wp == DL_TIMER_ID) { on_download_tick(); return 0; }
       break;
@@ -1726,6 +1896,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   // 主线程 STA：Vista+ 打开/保存对话框内部走 COM，缺初始化会静默失败
   CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+  // GDI+：圆徽标与按钮圆角的抗锯齿（失败则退回 GDI 画法，见 draw_help/draw_button）
+  Gdiplus::GdiplusStartupInput gdipInput;
+  GdiplusStartup(&g_gdip, &gdipInput, NULL);
   // 悬停提示（tooltips_class32）需要初始化 common controls
   INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_WIN95_CLASSES};
   InitCommonControlsEx(&icc);
@@ -1751,6 +1924,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
       DispatchMessageW(&m);
     }
   }
+  if (g_gdip) Gdiplus::GdiplusShutdown(g_gdip);
   CoUninitialize();
   return 0;
 }

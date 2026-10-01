@@ -50,8 +50,13 @@ public class W {
 
 function Get-Hwnd {
   for ($t = 0; $t -lt 10; $t++) {
-    $hw = (Get-Process WeaselLLMSetup -ErrorAction SilentlyContinue).MainWindowHandle
-    if ($hw) { return $hw }
+    # 同一时刻可能有多个 WeaselLLMSetup（上一次测试刚被强杀还没退干净 / 手工开着界面）——
+    # `.MainWindowHandle` 在多进程时会**返回数组**，传进 P/Invoke 直接报
+    # "cannot convert System.Object[] to System.IntPtr"（2026-10-01 实测踩到）。
+    # 取 StartTime 最新的那个，避免这条假失败。
+    $proc = Get-Process WeaselLLMSetup -ErrorAction SilentlyContinue |
+            Sort-Object StartTime -Descending | Select-Object -First 1
+    if ($proc -and $proc.MainWindowHandle) { return $proc.MainWindowHandle }
     Start-Sleep -Seconds 1
   }
   throw "window not found"
