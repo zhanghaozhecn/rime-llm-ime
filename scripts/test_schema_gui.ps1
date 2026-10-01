@@ -1,4 +1,4 @@
-# test_schema_gui.ps1 — WeaselLLMSetup 方案接入 GUI 自动化测试
+﻿# test_schema_gui.ps1 — WeaselLLMSetup 方案接入 GUI 自动化测试
 #
 # 隔离：测试期间 $env:APPDATA 重定向到沙箱目录（子进程 GUI 继承），
 # 方案与 llm_rerank 配置节读写全落沙箱——物理杜绝误伤活配置。
@@ -57,6 +57,26 @@ function Click-Remove($hw) {
   [W]::SendMessage([W]::GetDlgItem($hw, 1034), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
   Start-Sleep -Milliseconds 900
   return (Read-Stat $hw)
+}
+# 方案下拉列表项（跨进程：CB_GETCOUNT + CB_GETLBTEXT）
+function Get-ComboItems($hw) {
+  $out = @()
+  $n = [int][W]::SendMessage($hw, 0x0146, [IntPtr]::Zero, [IntPtr]::Zero)
+  for ($i = 0; $i -lt $n; $i++) {
+    $len = [int][W]::SendMessage($hw, 0x0149, [IntPtr]$i, [IntPtr]::Zero)
+    if ($len -le 0) { continue }
+    $sb = New-Object System.Text.StringBuilder ($len + 2)
+    [void][W]::SendMessageBuf($hw, 0x0148, [IntPtr]$i, $sb)
+    $out += $sb.ToString()
+  }
+  return $out
+}
+# 选最后一项（CB_SETCURSEL；原生 Win32 下拉框不响应直接投递的 VK_END）
+function Select-ComboLast($hw) {
+  $n = [int][W]::SendMessage($hw, 0x0146, [IntPtr]::Zero, [IntPtr]::Zero)   # CB_GETCOUNT
+  if ($n -le 0) { return }
+  [W]::SendMessage($hw, 0x014E, [IntPtr]($n - 1), [IntPtr]::Zero) | Out-Null  # CB_SETCURSEL
+  Start-Sleep -Milliseconds 400
 }
 function Show-File {
   Get-Content $test -Encoding UTF8 | ForEach-Object -Begin { $i = 1 } -Process { Write-Host ("    {0}: {1}" -f $i, $_); $i++ }
@@ -252,6 +272,56 @@ model_path: d:/gguf_models/legacy.gguf
   Assert "迁移的 code_pattern 单引号落盘" (($f | Where-Object { $_ -match "^  code_pattern: '\.\{3,4\}'$" }).Count -eq 1)
   Assert "迁移的 model_path 落盘（正斜杠）" (($f | Where-Object { $_ -match '^  model_path: d:/gguf_models/legacy\.gguf$' }).Count -eq 1)
   Assert "debug_fusion: true 落盘" (($f | Where-Object { $_ -match '^  debug_fusion: true$' }).Count -eq 1)
+
+  # phase9: 只在出错时写错误日志（GUI 程序目录 = bin\WeaselLLMSetup_error.log）
+  Write-Host "== phase9: 出错写错误日志（正常不写）=="
+  $logFile = Join-Path (Split-Path $exe -Parent) "WeaselLLMSetup_error.log"
+  if (Test-Path $logFile) { Remove-Item $logFile -Force }
+  [W]::SendMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # 正常保存
+  Start-Sleep -Milliseconds 700
+  Assert "正常保存不写错误日志" (-not (Test-Path $logFile))
+  Set-ItemProperty -Path $test -Name IsReadOnly -Value $true          # 方案只读 → 保存必失败
+  [W]::SendMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+  Start-Sleep -Milliseconds 700
+  Assert "状态行出现失败" ((Read-Ctl $hw 1103) -match '失败')
+  Assert "错误日志已生成" (Test-Path $logFile)
+  if (Test-Path $logFile) {
+    $lg = Get-Content $logFile -Raw -Encoding UTF8
+    Assert "日志含『写入方案失败』" ($lg -match '写入方案失败')
+    Write-Host ("  日志首行: " + ($lg -split "`r?`n")[0])
+  }
+  Set-ItemProperty -Path $test -Name IsReadOnly -Value $false
+
+  # phase10: 程序文件夹预装方案可选中 + 写入前自动复制到用户文件夹
+  Write-Host "== phase10: 程序文件夹预装方案可选中 + 接入自动复制到用户文件夹 =="
+  $items = Get-ComboItems $combo
+  Write-Host ("  方案下拉（{0} 项）: {1}" -f $items.Count, ($items -join ' | '))
+  $prog = @($items | Where-Object { $_ -like "*（程序）" })
+  Assert ("程序文件夹预装方案已列出（实测 $($prog.Count) 个）") ($prog.Count -ge 1)
+  $progName = @($prog | Select-Object -Last 1) -replace '（程序）$', ''
+  $root = (Get-ItemProperty 'HKLM:\SOFTWARE\Rime\Weasel' -Name WeaselRoot).WeaselRoot
+  $sharedFile = Join-Path (Join-Path $root 'data') $progName
+  $beforeHash = (Get-FileHash $sharedFile -Algorithm SHA256).Hash
+  Select-ComboLast $combo
+  [W]::SendMessage([W]::GetDlgItem($hw, 1032), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # 刷新 → 重读状态
+  Start-Sleep -Milliseconds 700
+  Assert ("已选中预装方案（实测 '$(Read-Ctl $hw 1031)'）") ((Read-Ctl $hw 1031) -like "*（程序）")
+  Assert "选中预装方案时状态提示会先复制" ((Read-Stat $hw) -match '预装方案')
+  # 注意：不能走 Click-Add（它内部会把选择重置到第 0 项）；这里直接点『接入 LLM』
+  [W]::SendMessage([W]::GetDlgItem($hw, 1033), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+  Start-Sleep -Milliseconds 1200
+  $st = Read-Stat $hw
+  Write-Host ("  status: " + $st)
+  $copied = Join-Path (Join-Path $sandbox "Rime") $progName
+  Assert "预装方案已复制到用户文件夹" (Test-Path $copied)
+  if (Test-Path $copied) {
+    $cf = Get-Content $copied -Encoding UTF8
+    Assert "复制件含 llm_filter 组件行" (($cf | Where-Object { $_ -match '^\s+- llm_filter\s*$' }).Count -eq 1)
+    Assert "复制件含 llm_rerank 节" (($cf | Where-Object { $_ -match '^llm_rerank:' }).Count -eq 1)
+    Assert "复制件 enabled: true" (($cf | Where-Object { $_ -match '^\s+enabled: true\s*$' }).Count -eq 1)
+    Remove-Item $copied -Force
+  }
+  Assert "程序文件夹原件未被改动" ((Get-FileHash $sharedFile -Algorithm SHA256).Hash -eq $beforeHash)
 }
 finally {
   Get-Process WeaselLLMSetup -ErrorAction SilentlyContinue | Stop-Process -Force

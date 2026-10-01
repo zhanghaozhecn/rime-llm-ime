@@ -306,6 +306,49 @@ static void set_status(HWND ctrl, const wchar_t* fmt, ...) {
   SetWindowTextW(ctrl, buf);
 }
 
+// ---- 错误日志（2026-09-30 用户定案：界面不留日志框，**只在出错时**写文件）----
+// 位置 = GUI 程序所在目录（安装目录）；该目录通常需要管理员权限，写不进时
+// 回退到用户文件夹 %APPDATA%\Rime。正常流程只更新状态行，不产生任何文件。
+static std::wstring error_log_path() {
+  static std::wstring cached;
+  if (!cached.empty()) return cached;
+  wchar_t exe[MAX_PATH] = L"";
+  GetModuleFileNameW(NULL, exe, MAX_PATH);
+  std::wstring dir = exe;
+  size_t p = dir.find_last_of(L'\\');
+  if (p != std::wstring::npos) dir = dir.substr(0, p);
+  std::wstring cand = dir + L"\\WeaselLLMSetup_error.log";
+  FILE* f = NULL;
+  _wfopen_s(&f, cand.c_str(), L"ab");   // 探测可写性（追加模式不留空文件）
+  if (f) {
+    fclose(f);
+    cached = cand;
+    return cached;
+  }
+  std::wstring userdir = rime_user_dir();
+  cached = userdir.empty() ? cand : (userdir + L"\\WeaselLLMSetup_error.log");
+  return cached;
+}
+
+static void log_error(const wchar_t* fmt, ...) {
+  wchar_t buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  _vsnwprintf_s(buf, _TRUNCATE, fmt, ap);
+  va_end(ap);
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  wchar_t head[128];
+  swprintf_s(head, L"===== %04d-%02d-%02d %02d:%02d:%02d =====", st.wYear,
+             st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+  std::string text = wide_to_utf8(std::wstring(head) + L"\n" + buf + L"\n");
+  FILE* f = NULL;
+  _wfopen_s(&f, error_log_path().c_str(), L"ab");
+  if (!f) return;
+  fwrite(text.data(), 1, text.size(), f);
+  fclose(f);
+}
+
 // ---- 模型路径下拉框：扫描常见位置的 .gguf（Rime 用户目录 = 默认下载
 // 落点；%USERPROFILE%\gguf_models = 插件版约定位置——从插件版迁移的
 // 用户模型已在盘上，下拉选一下即可，不必重新下载）----
@@ -499,6 +542,7 @@ static void trigger_redeploy() {
   if (!root[0] || GetFileAttributesW(deployer.c_str()) == INVALID_FILE_ATTRIBUTES) {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
                L"[提示] 未定位到 WeaselDeployer，请手动：托盘小狼毫 → 重新部署");
+    log_error(L"[部署] 未定位到 WeaselDeployer（WeaselRoot=%s）", root);
     return;
   }
   STARTUPINFOW si = {sizeof(si)};
@@ -507,41 +551,182 @@ static void trigger_redeploy() {
   wcscpy_s(cmd, deployer.c_str());
   if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
     CloseHandle(pi.hThread);
-    if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_TIMEOUT)
+    if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_TIMEOUT) {
       set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
                  L"重新部署仍在后台进行；若候选异常请托盘手动重新部署");
+      log_error(L"[部署] WeaselDeployer 15s 未退出（仍在后台）");
+    }
     CloseHandle(pi.hProcess);
   } else {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
                L"[提示] 自动重新部署失败，请手动：托盘小狼毫 → 重新部署");
+    log_error(L"[部署] CreateProcess 失败：%s", deployer.c_str());
   }
 }
+
+// ── 程序文件夹（预装数据）里的方案 ──────────────────────────────
+// Rime 的配置分两处：**用户文件夹** %APPDATA%\Rime（可写、优先）与**程序文件夹**
+// <小狼毫安装目录>\data（预装方案 luna_pinyin / cangjie5 / bopomofo …，随安装包更新）。
+// 两处的 *.schema.yaml 都要能选；但只有用户文件夹里的才算"用户的方案"：写程序
+// 文件夹既需管理员、又会被下次升级覆盖 → 对预装方案一律**先复制到用户文件夹再改**
+// （Rime 解析顺序本就是用户文件夹优先，这也是 Rime 官方的手改做法）。
+static std::wstring rime_shared_dir() {
+  static std::wstring cached;
+  static bool tried = false;
+  if (tried) return cached;
+  tried = true;
+  wchar_t root[MAX_PATH] = L"";
+  DWORD sz = sizeof(root);
+  if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Rime\\Weasel", L"WeaselRoot",
+                   RRF_RT_REG_SZ, NULL, root, &sz) != ERROR_SUCCESS || !root[0]) {
+    sz = sizeof(root);
+    RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Rime\\Weasel",
+                 L"WeaselRoot", RRF_RT_REG_SZ, NULL, root, &sz);
+  }
+  if (root[0]) {
+    std::wstring d = std::wstring(root) + L"\\data";
+    if (GetFileAttributesW(d.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      cached = d;
+      return cached;
+    }
+  }
+  // 回退：%ProgramFiles%\Rime\weasel-*\data（取字典序最大 = 最新版本）
+  wchar_t pf[MAX_PATH] = L"";
+  if (GetEnvironmentVariableW(L"ProgramFiles", pf, MAX_PATH)) {
+    std::wstring pat = std::wstring(pf) + L"\\Rime\\weasel-*";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+      do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+          std::wstring d = std::wstring(pf) + L"\\Rime\\" + fd.cFileName + L"\\data";
+          if (GetFileAttributesW(d.c_str()) != INVALID_FILE_ATTRIBUTES) cached = d;
+        }
+      } while (FindNextFileW(h, &fd));
+      FindClose(h);
+    }
+  }
+  return cached;
+}
+
+static const wchar_t* kSharedSuffix = L"（程序）";   // 预装方案在下拉里的后缀
+
+static const wchar_t* base_name(const std::wstring& path);   // 定义在后（先声明）
+
+// 方案下拉项 → 完整路径（与 combo 项一一对应）
+static std::vector<std::wstring> g_schema_paths;
+static std::vector<std::wstring> g_schema_names;
 
 static void scan_schemas() {
   HWND combo = GetDlgItem(g_hwnd, IDC_SCHEMA);
+  // 记住当前选中项（按文件名，忽略「（程序）」后缀）——刷新/接入后保持，不跳回第一项
+  std::wstring prev;
+  int prevSel = (int)SendMessageW(combo, CB_GETCURSEL, 0, 0);
+  if (prevSel >= 0 && prevSel < (int)g_schema_names.size()) prev = g_schema_names[prevSel];
   SendMessageW(combo, CB_RESETCONTENT, 0, 0);
-  std::wstring dir = rime_user_dir();
-  if (dir.empty()) return;
+  g_schema_paths.clear();
+  g_schema_names.clear();
+  std::wstring user = rime_user_dir();
+  if (user.empty()) return;
+  // ① 用户文件夹（无后缀）
   WIN32_FIND_DATAW fd;
-  HANDLE h = FindFirstFileW((dir + L"\\*.schema.yaml").c_str(), &fd);
-  if (h == INVALID_HANDLE_VALUE) return;
-  do {
-    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-    SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)fd.cFileName);
-  } while (FindNextFileW(h, &fd));
-  FindClose(h);
-  if (SendMessageW(combo, CB_GETCOUNT, 0, 0) > 0)
-    SendMessageW(combo, CB_SETCURSEL, 0, 0);
+  HANDLE h = FindFirstFileW((user + L"\\*.schema.yaml").c_str(), &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+      g_schema_names.push_back(fd.cFileName);
+      g_schema_paths.push_back(user + L"\\" + fd.cFileName);
+      SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)fd.cFileName);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  // ② 程序文件夹预装方案（带「（程序）」后缀；同名以用户文件夹为准，不重复列出）
+  std::wstring shared = rime_shared_dir();
+  if (!shared.empty()) {
+    h = FindFirstFileW((shared + L"\\*.schema.yaml").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+      do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        bool dup = false;
+        for (size_t i = 0; i < g_schema_names.size(); i++)
+          if (g_schema_names[i] == fd.cFileName) { dup = true; break; }
+        if (dup) continue;
+        g_schema_names.push_back(fd.cFileName);
+        g_schema_paths.push_back(shared + L"\\" + fd.cFileName);
+        SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)(std::wstring(fd.cFileName) + kSharedSuffix).c_str());
+      } while (FindNextFileW(h, &fd));
+      FindClose(h);
+    }
+  }
+  if (SendMessageW(combo, CB_GETCOUNT, 0, 0) > 0) {
+    int restore = 0;
+    if (!prev.empty()) {
+      for (size_t i = 0; i < g_schema_names.size(); i++)
+        if (g_schema_names[i] == prev) { restore = (int)i; break; }
+    }
+    SendMessageW(combo, CB_SETCURSEL, restore, 0);
+  }
+  // 下拉列表按最长项加宽（框内放不下没关系，列表可以更宽）——预装方案名 + 「（程序）」较长
+  HDC dc = GetDC(combo);
+  HGDIOBJ old = SelectObject(dc, g_font);
+  int wmax = 0;
+  int n = (int)SendMessageW(combo, CB_GETCOUNT, 0, 0);
+  for (int i = 0; i < n; i++) {
+    wchar_t item[260] = L"";
+    SendMessageW(combo, CB_GETLBTEXT, i, (LPARAM)item);
+    SIZE sz = {0};
+    if (GetTextExtentPoint32W(dc, item, (int)wcslen(item), &sz) && sz.cx > wmax) wmax = sz.cx;
+  }
+  SelectObject(dc, old);
+  ReleaseDC(combo, dc);
+  if (wmax > 0) SendMessageW(combo, CB_SETDROPPEDWIDTH, wmax + 24, 0);
+}
+
+// 下拉里按文件名（忽略后缀）重新选中——复制到用户文件夹后用
+static void select_schema_named(const std::wstring& name) {
+  for (size_t i = 0; i < g_schema_names.size(); i++) {
+    if (g_schema_names[i] == name) {
+      SendMessageW(GetDlgItem(g_hwnd, IDC_SCHEMA), CB_SETCURSEL, i, 0);
+      return;
+    }
+  }
+}
+
+// 写入前确保方案在用户文件夹：程序文件夹里的预装方案先复制过来（返回用户文件夹路径；
+// 第二个出参标记是否发生了复制，供状态行提示）
+static std::wstring ensure_user_schema(const std::wstring& path, bool* copied) {
+  if (copied) *copied = false;
+  std::wstring user = rime_user_dir();
+  if (user.empty()) return path;
+  if (_wcsnicmp(path.c_str(), (user + L"\\").c_str(), user.size() + 1) == 0) return path;
+  const wchar_t* leaf = base_name(path);
+  std::wstring dest = user + L"\\" + leaf;
+  CreateDirectoryW(user.c_str(), NULL);
+  if (!CopyFileW(path.c_str(), dest.c_str(), FALSE)) {
+    log_error(L"[复制] 预装方案复制到用户文件夹失败：%s → %s", path.c_str(), dest.c_str());
+    return path;   // 复制失败仍返回原路径（写盘会失败并报错，日志已留痕）
+  }
+  if (copied) *copied = true;
+  return dest;
 }
 
 static std::wstring selected_schema_path(bool* ok) {
-  wchar_t name[MAX_PATH];
-  if (GetDlgItemTextW(g_hwnd, IDC_SCHEMA, name, MAX_PATH) && name[0]) {
+  int sel = (int)SendMessageW(GetDlgItem(g_hwnd, IDC_SCHEMA), CB_GETCURSEL, 0, 0);
+  if (sel >= 0 && sel < (int)g_schema_paths.size()) {
     *ok = true;
-    return rime_user_dir() + L"\\" + name;
+    return g_schema_paths[sel];
   }
   *ok = false;
   return std::wstring();
+}
+
+// 选中的是不是程序文件夹里的预装方案（未被复制到用户文件夹）
+static bool selected_is_shared() {
+  int sel = (int)SendMessageW(GetDlgItem(g_hwnd, IDC_SCHEMA), CB_GETCURSEL, 0, 0);
+  if (sel < 0 || sel >= (int)g_schema_paths.size()) return false;
+  std::wstring user = rime_user_dir();
+  if (user.empty()) return false;
+  return _wcsnicmp(g_schema_paths[sel].c_str(), (user + L"\\").c_str(), user.size() + 1) != 0;
 }
 
 static const wchar_t* base_name(const std::wstring& path) {
@@ -575,6 +760,11 @@ static void load_schema_params() {
   if (has_section) {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"已加载 %s 的 llm_rerank 配置节",
                base_name(path));
+  } else if (selected_is_shared()) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
+               L"[未接入] %s 是程序文件夹里的预装方案——点『接入 LLM』或『保存并生效』"
+               L"会先复制到用户文件夹再写入",
+               base_name(path));
   } else if (migrated) {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
                L"[未接入] %s 没有 llm_rerank 节——已带出旧全局配置的值，"
@@ -596,20 +786,30 @@ static void save_schema_params() {
     set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"[失败] 请先选择方案文件");
     return;
   }
+  bool copied = false;
+  std::wstring name = base_name(path);
+  path = ensure_user_schema(path, &copied);   // 预装方案先落到用户文件夹
+  if (copied) {
+    scan_schemas();
+    select_schema_named(name);
+  }
   bool had_bom = false;
   std::vector<std::string> lines;
   if (!read_lines(path, &had_bom, &lines)) {
     set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"[失败] 读取方案失败：%s", path.c_str());
+    log_error(L"[保存] 读取方案失败：%s", path.c_str());
     return;
   }
   ui_to_params();
   if (!update_llm_section(&lines)) {
     set_status(GetDlgItem(g_hwnd, IDC_STATUS),
                L"[失败] 方案内没有 llm_rerank 配置节——请先点『接入 LLM』");
+    log_error(L"[保存] 方案内没有 llm_rerank 配置节：%s", path.c_str());
     return;
   }
   if (!write_lines(path, had_bom, lines)) {
     set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"[失败] 写入方案失败：%s", path.c_str());
+    log_error(L"[保存] 写入方案失败：%s", path.c_str());
     return;
   }
   set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已保存到 %s，正在重新部署…",
@@ -617,7 +817,9 @@ static void save_schema_params() {
   refresh_model_status();  // 模型路径可能刚改
   trigger_redeploy();
   set_status(GetDlgItem(g_hwnd, IDC_STATUS),
-             L"已保存到 %s 并触发重新部署——部署完成后参数生效", base_name(path));
+             copied ? L"已保存到 %s（原为程序文件夹预装方案，已复制到用户文件夹）并触发重新部署——部署完成后参数生效"
+                    : L"已保存到 %s 并触发重新部署——部署完成后参数生效",
+             base_name(path));
 }
 
 static void on_schema_add() {
@@ -628,10 +830,18 @@ static void on_schema_add() {
                L"请先在下拉框选择方案文件（%APPDATA%\\Rime\\*.schema.yaml）");
     return;
   }
+  bool copied = false;
+  std::wstring name = base_name(path);
+  path = ensure_user_schema(path, &copied);   // 预装方案先落到用户文件夹
+  if (copied) {
+    scan_schemas();
+    select_schema_named(name);
+  }
   bool had_bom;
   std::vector<std::string> lines;
   if (!read_lines(path, &had_bom, &lines)) {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"读取方案失败：%s", path.c_str());
+    log_error(L"[接入] 读取方案失败：%s", path.c_str());
     return;
   }
   int removed = strip_llm(&lines);  // 组件行 + 旧 llm_rerank 节一并剥净
@@ -639,6 +849,7 @@ static void on_schema_add() {
   if (!insert_llm_filter(&lines, &where)) {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
                L"[失败] 方案内未找到 engine/filters 块，无法插入组件");
+    log_error(L"[接入] 未找到 engine/filters 块：%s", path.c_str());
     return;
   }
   // 配置节内容取界面当前值（界面值 = 该方案原节或默认）；接入 = 重新启用意图
@@ -649,11 +860,13 @@ static void on_schema_add() {
   lines.insert(lines.end(), sec.begin(), sec.end());
   if (!write_lines(path, had_bom, lines)) {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"写入方案失败：%s", path.c_str());
+    log_error(L"[接入] 写入方案失败：%s", path.c_str());
     return;
   }
   wchar_t msg[512];
-  swprintf_s(msg, L"已接入 llm_filter（%s）+ llm_rerank 配置节%s", where.c_str(),
-             removed ? L"，旧 LLM 组件已剥离" : L"");
+  swprintf_s(msg, L"已接入 llm_filter（%s）+ llm_rerank 配置节%s%s", where.c_str(),
+             removed ? L"，旧 LLM 组件已剥离" : L"",
+             copied ? L"（原为程序文件夹预装方案，已复制到用户文件夹）" : L"");
   load_schema_params();  // 回读（节已是权威值）
   set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), msg);
   trigger_redeploy();
@@ -667,10 +880,18 @@ static void on_schema_remove() {
                L"请先在下拉框选择方案文件（%APPDATA%\\Rime\\*.schema.yaml）");
     return;
   }
+  if (selected_is_shared()) {
+    // 程序文件夹预装方案从未被改过 → 剥离无意义，也不该动它
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
+               L"[提示] 该方案是程序文件夹预装方案（未被修改过）——无可剥离；"
+               L"若要改它请先『接入 LLM』（会复制到用户文件夹）");
+    return;
+  }
   bool had_bom;
   std::vector<std::string> lines;
   if (!read_lines(path, &had_bom, &lines)) {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT), L"读取方案失败：%s", path.c_str());
+    log_error(L"[剥离] 读取方案失败：%s", path.c_str());
     return;
   }
   int removed = strip_llm(&lines);
@@ -679,7 +900,8 @@ static void on_schema_remove() {
                L"未发现 LLM 组件，方案未改动");
     return;
   }
-  write_lines(path, had_bom, lines);
+  if (!write_lines(path, had_bom, lines))
+    log_error(L"[剥离] 写入方案失败：%s", path.c_str());
   wchar_t msg[128];
   swprintf_s(msg, L"已移除 LLM 组件（含配置节）共 %d 行", removed);
   load_schema_params();  // 回默认值 + "未接入" 提示
@@ -783,10 +1005,11 @@ static const wchar_t* const TIP_MODEL =
     L"换模型保存后会自动卸载并重载。";
 static const wchar_t* const TIP_BROWSE = L"浏览…：选择 .gguf 模型文件。";
 static const wchar_t* const TIP_SCHEMA =
-    L"配置就写在选中的方案文件里（用户文件夹根目录的 *.schema.yaml）。\n"
-    L"先选方案、再改参数；右侧按钮负责接入 / 剥离 LLM 组件与配置节。";
+    L"配置就写在选中的方案文件里。下拉列出**用户文件夹** %APPDATA%\\Rime 与\n"
+    L"**程序文件夹** <小狼毫目录>\\data（预装方案，带「（程序）」后缀）两处的 *.schema.yaml。\n"
+    L"预装方案在写入前会自动复制到用户文件夹（Rime 解析顺序：用户文件夹优先）。";
 static const wchar_t* const TIP_SCHEMAREF =
-    L"重新扫描用户文件夹里的方案文件，并重新读入当前方案的参数。";
+    L"重新扫描两处方案文件（用户文件夹 + 程序文件夹），并重新读入当前方案的参数。";
 static const wchar_t* const TIP_SCHEMAADD =
     L"接入 LLM：把 llm_filter 组件行 + llm_rerank 配置节写进选中方案\n"
     L"（先剥旧版组件再插入，可跨版转换），并自动重新部署。";
@@ -976,9 +1199,10 @@ static void make_ui() {
   SYSTEM_INFO si;
   GetSystemInfo(&si);
   wchar_t note[200];
-  swprintf_s(note, L"参数写入选中方案；保存后自动重新部署生效　|　本机逻辑核 %lu",
+  swprintf_s(note,
+             L"保存后自动重新部署生效　|　本机逻辑核 %lu　|　出错日志：WeaselLLMSetup_error.log",
              si.dwNumberOfProcessors);
-  mk_hint(note, LX, y, ts(560));
+  mk_hint(note, LX, y, ts(596));
   y += ts(22);
   g_ui_height = y + ts(10);          // 内容总高（调用方据此定窗口高度）
 }
@@ -1114,19 +1338,22 @@ static void on_browse() {
   swprintf_s(msg, L"打开对话框失败（CommDlg 错误码 %lu）",
              CommDlgExtendedError());
   set_status(GetDlgItem(g_hwnd, IDC_STATUS), msg);
+  log_error(L"%s", msg);
 }
 
 static void on_open_dir() {
   std::wstring dir = rime_user_dir();
   if (dir.empty()) {
     set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"无法定位用户文件夹（APPDATA 缺失）");
+    log_error(L"打开用户文件夹：APPDATA 缺失");
     return;
   }
   CreateDirectoryW(dir.c_str(), NULL);
   ShellExecuteW(g_hwnd, L"open", dir.c_str(), NULL, NULL, SW_SHOWNORMAL);
 }
 
-static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+// 实际消息处理（外面再套一层 WndProc 捕获异常 → 写错误日志）
+static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
     case WM_CREATE:
       g_hwnd = h;
@@ -1181,6 +1408,20 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       PostQuitMessage(0);
       return 0;
   }
+  return DefWindowProcW(h, msg, wp, lp);
+}
+
+// 顶层异常兜底（2026-09-30：界面不留日志框，异常写 WeaselLLMSetup_error.log）
+static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+  try {
+    return WndProcInner(h, msg, wp, lp);
+  } catch (const std::exception& e) {
+    log_error(L"GUI 未捕获异常（msg=0x%04X）：%S", (unsigned)msg, e.what());
+  } catch (...) {
+    log_error(L"GUI 未捕获异常（msg=0x%04X）：未知类型", (unsigned)msg);
+  }
+  set_status(GetDlgItem(h, IDC_STATUS),
+             L"[失败] 界面异常，已写错误日志：WeaselLLMSetup_error.log");
   return DefWindowProcW(h, msg, wp, lp);
 }
 

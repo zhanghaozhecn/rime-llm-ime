@@ -1,4 +1,4 @@
-# tsf_switch.ps1 — 不重启切换 TSF 组件加载路径（测试用）
+﻿# tsf_switch.ps1 — 不重启切换 TSF 组件加载路径（测试用）
 # 原理：TSF 组件是每进程按需加载。把注册表 InprocServer32 临时指向
 # 新编译的 weaselx64.dll → 新启动的应用加载新 DLL，已运行进程不受影响。
 # 测试完 -Restore 恢复 System32 官方路径。无需重启系统。

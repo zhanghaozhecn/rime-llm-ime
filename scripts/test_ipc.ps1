@@ -1,4 +1,4 @@
-# test_ipc.ps1 — 自动化管道级测试: 直接向 WeaselServer 发送 IPC 消息
+﻿# test_ipc.ps1 — 自动化管道级测试: 直接向 WeaselServer 发送 IPC 消息
 # 用法:
 #   pwsh -File test_ipc.ps1                          # RESET_CONTEXT "focus:switch" x1
 #   pwsh -File test_ipc.ps1 -Msg 32785 -Body "你好"   # SET_CONTEXT_TEXT

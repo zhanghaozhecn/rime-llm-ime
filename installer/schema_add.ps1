@@ -1,4 +1,4 @@
-# schema_add.ps1 - 源码版（rime-llm-ime）方案接入助手
+﻿# schema_add.ps1 - 源码版（rime-llm-ime）方案接入助手
 #
 # 作用：向选中的 RIME 方案幂等插入 / 剥离 llm_filter 组件行 + llm_rerank 配置节。
 #   - 插入位置：filters 块内 uniquifier 之后（无 uniquifier 则 simplifier
