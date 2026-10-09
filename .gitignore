@@ -72,6 +72,11 @@ bin/test_rime.exe
 # 安装包产物（分发走 Release）
 installer/dist/
 
+# 线程数实测工具：规范源在插件版仓库（..\rime-llm-rerank\bin\bench_threads.exe），
+# 本仓库只在 make_installer.ps1 打包时现拷进 bin\ 与 installer\source\——不入库
+# （2026-09-30「子项目互不共享文件」去重铁律；bin\ 那份由 bin/*.exe 覆盖）
+installer/source/bench_threads.exe
+
 # 测试临时输出（test_rime 在 bin 产生的运行时文件）
 bin/rime_llm_filter_log.txt
 bin/user.yaml

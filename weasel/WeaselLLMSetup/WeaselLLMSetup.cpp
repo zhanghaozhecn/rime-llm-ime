@@ -48,6 +48,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_MAX_TOK      1014
 #define IDC_CORES        1015
 #define IDC_CODE_PAT     1016   // 编码匹配正则（2026-09-30 取代 min/max_code_len）
+#define IDC_BENCH        1017   // 实测线程数（2026-10-01 用户定案：与插件版同位置）
 #define IDC_ELW          1021
 #define IDC_FREQ_W       1022
 #define IDC_DEBUG        1023
@@ -1187,7 +1188,14 @@ static const wchar_t* const TIP_MAX_CAND =
     L"一般不用改——调大更准但更慢。";
 static const wchar_t* const TIP_CORES =
     L"推理用的 CPU 线程数（默认 4）。不要超过本机物理核；\n"
-    L"可用 ..\\rime-llm-rerank\\cpp\\build_bench_threads.bat 实测最优值。";
+    L"点右边的『实测线程数』可实测本机 4~8 线程的最优值。";
+// 线程数实测（2026-10-01 用户定案：起点 4 / 终点 8；不足 5 线程不实测）——
+// 文案与插件版 $tipBench **逐字一致**
+static const wchar_t* const TIP_BENCH =
+    L"线程数实测：加载本机模型实测 4~8 线程的推理延迟，给出推荐值\n"
+    L"（取最优 × 1.05 以内最快的线程数，且不超过物理核）。\n"
+    L"本机不足 5 线程时不做实测，直接取最大线程数。\n"
+    L"约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。";
 static const wchar_t* const TIP_BETA =
     L"用户词频权重 β（默认 1.5，0 = 关闭）。\n"
     L"融合分 = CE 分 + β·log(1+词频计数) + elw·词长加成\n"
@@ -1324,8 +1332,17 @@ static void make_ui() {
       if (w > lw) lw = w;
     }
     int gy = y; y += ts(26);
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < 3; ++i) {
+      int row_y = y;
       row_input(y, lw, rows[i].label, rows[i].id, 64, ES_NUMBER, rows[i].tip, HX);
+      // 线程数实测（2026-10-01 用户定案）：与插件版同位置——本行输入框右侧
+      // （『?』徽标列在 HX，按钮右边界远在其左，不会相交）
+      if (rows[i].id == IDC_CORES) {
+        int bx = ts(24) + lw + ts(10) + ts(64) + ts(8);
+        mk_button_tip(L"实测线程数", bx, row_y, tw(L"实测线程数", g_font) + ts(20),
+                      ts(22), IDC_BENCH, TIP_BENCH);
+      }
+    }
     mk_group(L"推理规模", PAD, gy, CW, y - gy + ts(8));
     y += ts(10);
 
@@ -1748,6 +1765,264 @@ static void on_download_tick() {
              file_size_ull(g_dl_tmp) >> 20, g_dl_target.c_str());
 }
 
+// ── 线程数实测（2026-10-01 用户定案：起点 4 / 终点 8）────────────────────
+// 与插件版逐字同源：起 bench_threads.exe（与本程序同目录）子进程，读它逐行
+// flush 的结果文件做进度，结束时弹框给表 + 推荐值，选"是"回填 CPU 线程数输入框
+// （不落盘——仍要点『保存并生效』）。推荐规则本体在 bench_threads.exe 的
+// `[RESULT]` 行内，两版 GUI 都只做「起进程 → 读结果 → 回填」，规则不会两处漂移。
+// 关窗时结束子进程；异常退出留下的进程由 pid 文件接管（同 curl 的 ④ 规则）。
+static const int kBenchMinCores = 5;   // 逻辑核 < 5 → 不实测，直接取最大线程数
+static const int kBenchTrials = 41;    // 每档计时次数（41 × 5 档 ≈ 30 秒）
+static HANDLE g_bench_proc = NULL;
+static std::wstring g_bench_out, g_bench_pid;
+#define BENCH_TIMER_ID 2
+
+// 逻辑核数。自动化测试钩子 RIME_LLM_FAKE_CORES：本机没法真的变成 4 核，
+// 「不足 5 线程不实测」这条分支只能靠它验证（bench_threads.exe 读同一个变量）
+static int logical_cores() {
+  wchar_t buf[16] = L"";
+  DWORD n = GetEnvironmentVariableW(L"RIME_LLM_FAKE_CORES", buf, 16);
+  if (n > 0 && n < 16) {
+    int v = _wtoi(buf);
+    if (v > 0) return v;
+  }
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  return (int)si.dwNumberOfProcessors;
+}
+
+static std::wstring bench_exe_path() {
+  wchar_t exe[MAX_PATH] = L"";
+  GetModuleFileNameW(NULL, exe, MAX_PATH);
+  std::wstring p = exe;
+  size_t slash = p.find_last_of(L"\\/");
+  if (slash == std::wstring::npos) return std::wstring();
+  return p.substr(0, slash + 1) + L"bench_threads.exe";
+}
+
+// 结果文件全读。**必须带 FILE_SHARE_READ|WRITE**：写入端是 bench_threads 用
+// _SH_DENYNO 打开的（普通 _wfopen 会拒绝读方 → 轮询必然 "被另一进程占用"）
+static std::string read_shared(const std::wstring& path) {
+  HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                         FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) return std::string();
+  std::string data;
+  LARGE_INTEGER sz;
+  if (GetFileSizeEx(h, &sz) && sz.QuadPart > 0 && sz.QuadPart < (1 << 20)) {
+    data.resize((size_t)sz.QuadPart);
+    DWORD got = 0;
+    if (ReadFile(h, &data[0], (DWORD)data.size(), &got, NULL)) data.resize(got);
+    else data.clear();
+  }
+  CloseHandle(h);
+  return data;
+}
+
+// 从 `[RESULT]` 行取键值（机器可读：rec= best= best_ms= phys_cores= reason=）
+static bool result_field(const std::string& text, const char* key, std::string* out) {
+  std::string k = std::string(key) + "=";
+  size_t p = text.rfind("[RESULT]");
+  if (p == std::string::npos) return false;
+  p = text.find(k, p);
+  if (p == std::string::npos) return false;
+  p += k.size();
+  size_t e = text.find_first_of(" \r\n", p);
+  *out = text.substr(p, e == std::string::npos ? std::string::npos : e - p);
+  return true;
+}
+
+// 表格行（进度与结果展示）：文件里所有 `thr=` 行（含 [超物理核] 后缀 → 按 UTF-8 转宽）
+static std::wstring bench_table(const std::string& text) {
+  std::string table;
+  size_t p = 0;
+  while (true) {
+    size_t ls = text.find("thr=", p);
+    if (ls == std::string::npos) break;
+    size_t le = text.find_first_of("\r\n", ls);
+    table += "  " + text.substr(ls, le == std::string::npos ? std::string::npos : le - ls) + "\r\n";
+    p = (le == std::string::npos) ? text.size() : le + 1;
+  }
+  return utf8_to_wide(table);
+}
+
+static bool terminate_pid_if_bench(DWORD pid) {
+  if (!pid) return false;
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, pid);
+  if (!h) return false;
+  wchar_t path[MAX_PATH] = L"";
+  DWORD n = MAX_PATH;
+  bool is_mine = QueryFullProcessImageNameW(h, 0, path, &n) &&
+                 wcsstr(path, L"bench_threads.exe");
+  DWORD code = 0;
+  bool alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+  bool killed = false;
+  if (is_mine && alive) killed = TerminateProcess(h, 1) != 0;
+  CloseHandle(h);
+  return killed;
+}
+
+static bool kill_stale_bench() {
+  if (g_bench_pid.empty()) return false;
+  FILE* f = NULL;
+  _wfopen_s(&f, g_bench_pid.c_str(), L"rb");
+  if (!f) return false;
+  char buf[64] = "";
+  size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  DeleteFileW(g_bench_pid.c_str());
+  if (!got) return false;
+  return terminate_pid_if_bench((DWORD)strtoul(buf, NULL, 10));
+}
+
+static void write_bench_pid(DWORD pid) {
+  if (g_bench_pid.empty()) return;
+  FILE* f = NULL;
+  _wfopen_s(&f, g_bench_pid.c_str(), L"wb");
+  if (!f) return;
+  fprintf(f, "%lu", (unsigned long)pid);
+  fclose(f);
+}
+
+static void bench_finish(DWORD code) {
+  if (g_bench_proc) { CloseHandle(g_bench_proc); g_bench_proc = NULL; }
+  KillTimer(g_hwnd, BENCH_TIMER_ID);
+  if (!g_bench_pid.empty()) DeleteFileW(g_bench_pid.c_str());
+  EnableWindow(GetDlgItem(g_hwnd, IDC_BENCH), TRUE);
+  std::string text = read_shared(g_bench_out);
+  std::string rec, reason;
+  if (code != 0 || !result_field(text, "rec", &rec) || !result_field(text, "reason", &reason)) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"[失败] 线程数实测失败（退出码 %lu）——换一个模型，或见 README 的线程数实测一节", code);
+    log_error(L"[实测] 失败：退出码 %lu；结果文件 %s", code, g_bench_out.c_str());
+    return;
+  }
+  int nrec = atoi(rec.c_str());
+  if (reason == "low_cores") {
+    SetDlgItemInt(g_hwnd, IDC_CORES, nrec, FALSE);
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"本机不足 %d 线程，已直接填入最大线程数 %d（点『保存并生效』应用）",
+               kBenchMinCores, nrec);
+    return;
+  }
+  std::string best, bestms, recms, phys;
+  result_field(text, "best", &best);
+  result_field(text, "best_ms", &bestms);
+  result_field(text, "rec_ms", &recms);
+  result_field(text, "phys_cores", &phys);
+  std::wstring msg = L"本机实测（ms/pass，越小越快）：\r\n\r\n" + bench_table(text) +
+      L"\r\n推荐 CPU 线程数 = " + utf8_to_wide(rec) + L"（" + utf8_to_wide(recms) +
+      L" ms；最优 " + utf8_to_wide(bestms) + L" ms @ " + utf8_to_wide(best) +
+      L" 线程，物理核 " + utf8_to_wide(phys) + L"）。\r\n\r\n" +
+      L"采用该值吗？（采用后点『保存并生效』应用）";
+  if (MessageBoxW(g_hwnd, msg.c_str(), L"线程数实测 — 推荐值",
+                  MB_YESNO | MB_ICONQUESTION) == IDYES) {
+    SetDlgItemInt(g_hwnd, IDC_CORES, nrec, FALSE);
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已填入 CPU 线程数 = %d（点『保存并生效』应用）", nrec);
+  } else {
+    wchar_t cur[32] = L"";
+    GetDlgItemTextW(g_hwnd, IDC_CORES, cur, 32);
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已取消（保留原值 %s）", cur);
+  }
+}
+
+static void on_bench_threads() {
+  if (g_bench_proc) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已有实测在进行中…");
+    return;
+  }
+  int cores = logical_cores();
+  if (cores < kBenchMinCores) {
+    // 不实测，直接取最大线程数（与插件版、bench_threads 内同规则；不需要模型）
+    SetDlgItemInt(g_hwnd, IDC_CORES, cores, FALSE);
+    wchar_t q[256];
+    swprintf_s(q, L"本机逻辑核 %d（不足 %d），不做实测。\n"
+                  L"已直接填入最大线程数 %d——点『保存并生效』应用。",
+               cores, kBenchMinCores, cores);
+    MessageBoxW(g_hwnd, q, L"线程数实测", MB_OK | MB_ICONINFORMATION);
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"本机仅 %d 线程，已直接填入最大线程数 %d（点『保存并生效』应用）", cores, cores);
+    return;
+  }
+  std::wstring exe = bench_exe_path();
+  if (exe.empty() || GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"[失败] 未找到 bench_threads.exe（应与本程序同目录）");
+    log_error(L"[实测] 缺少 bench_threads.exe：%s", exe.c_str());
+    return;
+  }
+  // 实测要加载模型：按『保存』同一口径先校验（绝对路径 / 存在 / 不像半截）
+  wchar_t box[512] = L"";
+  GetDlgItemTextW(g_hwnd, IDC_MODEL, box, 512);
+  std::wstring model = box[0] ? std::wstring(box) : default_model_path();
+  if (!is_abs_path(model)) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"[失败] 实测需要绝对路径的模型：%s", model.c_str());
+    return;
+  }
+  unsigned long long msz = 0;
+  if (!file_size(model, &msz)) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"[失败] 模型文件不存在（实测必须加载模型）：%s",
+               model.c_str());
+    return;
+  }
+  if (msz < kModelMinBytes) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"[失败] 模型文件可疑（仅 %llu MB）——先点“下载模型”或换一个", msz >> 20);
+    return;
+  }
+  wchar_t tmp[MAX_PATH] = L"";
+  DWORD tn = GetTempPathW(MAX_PATH, tmp);
+  std::wstring tmpdir = (tn > 0 && tn < MAX_PATH) ? std::wstring(tmp) : std::wstring(L".\\");
+  g_bench_out = tmpdir + L"rime_llm_bench_result.txt";
+  g_bench_pid = tmpdir + L"rime_llm_bench.pid";
+  if (kill_stale_bench())
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已结束上次遗留的实测进程，由本次接管…");
+  DeleteFileW(g_bench_out.c_str());
+  std::wstring cmd = L"\"" + exe + L"\" --out \"" + g_bench_out + L"\" --trials " +
+                     std::to_wstring(kBenchTrials) + L" --no-wait \"" + model + L"\"";
+  std::vector<wchar_t> cl(cmd.begin(), cmd.end());
+  cl.push_back(0);
+  STARTUPINFOW si = {sizeof(si)};
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_HIDE;
+  PROCESS_INFORMATION pi;
+  if (!CreateProcessW(NULL, cl.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL,
+                      &si, &pi)) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"[失败] 无法启动 bench_threads.exe（err=%lu）",
+               GetLastError());
+    log_error(L"[实测] CreateProcess 失败：%lu（%s）", GetLastError(), exe.c_str());
+    return;
+  }
+  CloseHandle(pi.hThread);
+  g_bench_proc = pi.hProcess;
+  write_bench_pid(pi.dwProcessId);
+  SetTimer(g_hwnd, BENCH_TIMER_ID, 700, NULL);
+  EnableWindow(GetDlgItem(g_hwnd, IDC_BENCH), FALSE);
+  set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+             L"实测中…（4~%d 线程 × %d 次，约 30 秒，期间请勿打字）",
+             cores < 8 ? cores : 8, kBenchTrials);
+}
+
+static void on_bench_tick() {
+  if (!g_bench_proc) { KillTimer(g_hwnd, BENCH_TIMER_ID); return; }
+  DWORD code = 0;
+  if (WaitForSingleObject(g_bench_proc, 0) == WAIT_OBJECT_0) {
+    GetExitCodeProcess(g_bench_proc, &code);
+    bench_finish(code);
+    return;
+  }
+  std::string text = read_shared(g_bench_out);
+  size_t p = text.rfind("thr=");
+  if (p != std::string::npos) {
+    size_t e = text.find_first_of("\r\n", p);
+    std::string line = text.substr(p, e == std::string::npos ? std::string::npos : e - p);
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"实测中… %s", utf8_to_wide(line).c_str());
+  } else {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"实测中…（4~8 线程 × %d 次，约 30 秒，期间请勿打字）", kBenchTrials);
+  }
+}
+
 static void on_browse() {
   wchar_t buf[512];
   GetDlgItemTextW(g_hwnd, IDC_MODEL, buf, 512);
@@ -1828,6 +2103,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       }
       switch (LOWORD(wp)) {
         case IDC_BROWSE: on_browse(); return 0;
+        case IDC_BENCH: on_bench_threads(); return 0;
         case IDC_DOWNLOAD: on_download_model(); return 0;
         case IDC_SCHEMAREM: on_schema_remove(); return 0;
         case IDC_SAVE: save_schema_params(); return 0;
@@ -1866,13 +2142,18 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     case WM_TIMER:
       if (wp == DL_TIMER_ID) { on_download_tick(); return 0; }
+      if (wp == BENCH_TIMER_ID) { on_bench_tick(); return 0; }
       break;
     case WM_DESTROY:
       KillTimer(h, DL_TIMER_ID);
+      KillTimer(h, BENCH_TIMER_ID);
       // ② 关窗连带结束 curl：它每次都是新进程，留着会和下次下载同时写同一个分片。
       //    分片本身保留 → 下次点『下载模型』照样断点续传。
       if (g_dl_proc) { TerminateProcess(g_dl_proc, 0); CloseHandle(g_dl_proc); g_dl_proc = NULL; }
       if (!g_dl_tmp.empty()) kill_stale_curl(g_dl_tmp);
+      // 线程数实测同理：子进程不带孙子进程，直接结束 + 删 pid（结果文件留着无妨）
+      if (g_bench_proc) { TerminateProcess(g_bench_proc, 0); CloseHandle(g_bench_proc); g_bench_proc = NULL; }
+      if (!g_bench_pid.empty()) DeleteFileW(g_bench_pid.c_str());
       PostQuitMessage(0);
       return 0;
   }

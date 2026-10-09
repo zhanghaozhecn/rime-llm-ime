@@ -51,10 +51,12 @@ Root: HKLM; Subkey: "Software\Rime\Weasel"; ValueType: string; ValueName: "Wease
 Root: HKLM; Subkey: "Software\WOW6432Node\Rime\Weasel"; ValueType: string; ValueName: "WeaselRoot"; ValueData: "{app}"; Flags: uninsdeletevalue
 
 [Files]
-; 应用目录：source\* = 10 个载荷（8 个 LLM 组件 + WinSparkle.dll 依赖 +
-; WeaselSetup.exe 注册工具——2026-08-27 起统一由 make_installer.ps1 同步入
-; source\，不再从 weasel\output 单独引用）+ 数据目录 + TSF 应急修复 +
-; 方案接入助手（schema_add.ps1，幂等插入/剥离 llm_filter，跨版自动转换）
+; 应用目录：source\* = 11 个载荷（8 个 LLM 组件 + WinSparkle.dll 依赖 +
+; WeaselSetup.exe 注册工具 + bench_threads.exe 线程数实测工具——2026-08-27 起
+; 统一由 make_installer.ps1 同步入 source\，不再从 weasel\output 单独引用）
+; + 数据目录 + TSF 应急修复 + 方案接入助手（schema_add.ps1，幂等插入/剥离
+; llm_filter，跨版自动转换）。bench_threads.exe 落在 {app} 下一层，
+; WeaselLLMSetup.exe 按**同目录**找它（GUI『实测线程数』按钮）。
 Source: "source\*"; DestDir: "{app}"; Flags: ignoreversion
 Source: "repair_tsf.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "schema_add.ps1"; DestDir: "{app}"; Flags: ignoreversion

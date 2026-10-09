@@ -28,6 +28,13 @@ public class W {
   [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, EnumProc cb, IntPtr l);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, ref int pid);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
+  // 控件几何（phase13 断言按钮位置用）
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L; public int T; public int R; public int B; }
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  public static int[] Rect(IntPtr h) {
+    RECT r; GetWindowRect(h, out r);
+    return new int[] { r.L, r.T, r.R - r.L, r.B - r.T };
+  }
   public static List<IntPtr> Children(IntPtr p) {
     var found = new List<IntPtr>();
     EnumChildWindows(p, delegate(IntPtr h, IntPtr l) { found.Add(h); return true; }, IntPtr.Zero);
@@ -181,6 +188,9 @@ New-Item -ItemType Directory -Path (Join-Path $sandbox "Rime") -Force | Out-Null
 $env:APPDATA = $sandbox                       # 子进程 GUI 继承 → 读写全落沙箱
 $env:WEASEL_LLM_SETUP_NO_REDEPLOY = "1"       # 静默跳过重新部署（测试开关）
 $env:RIME_LLM_USER_DIR = Join-Path $sandbox "Rime"   # 用户目录钉在沙箱（GUI 优先注册表 RimeUserDir）
+# 线程数实测：GUI 相位全程伪装成 3 逻辑核（<5 → 不实测、直接取最大线程数）。
+# 本机没法真的变成 3 核，这条分支只能靠该钩子验证（bench_threads.exe 读同一个变量）。
+$env:RIME_LLM_FAKE_CORES = "3"
 try {
   @'
 schema:
@@ -547,9 +557,40 @@ model_path: d:/gguf_models/legacy.gguf
     [void](Stop-Process -Id $procB.Id -Force)
     Remove-Item ($dlTarget + "*") -Force -ErrorAction SilentlyContinue
   }
+
+  # ══ phase13：线程数实测（2026-10-01 用户定案：起点 4 / 终点 8；不足 5 线程不实测）══
+  # GUI 全程伪装 3 逻辑核（见顶部 RIME_LLM_FAKE_CORES）→ 走"不实测、直接取最大"分支。
+  # 真机路径（≥5 核 + 真模型，约 30 秒）单列冒烟脚本手跑，不进本套件。
+  Write-Host "== phase13: 『实测线程数』按钮 + 不足 5 线程直接取最大 =="
+  $bBench = [W]::GetDlgItem($hw, 1017)
+  Assert "IDC_BENCH 按钮存在" ($bBench -ne [IntPtr]::Zero)
+  $rBench = [W]::Rect($bBench)
+  $rCores = [W]::Rect([W]::GetDlgItem($hw, 1015))
+  Assert ("按钮在 CPU 线程数框右侧（按钮 x=$($rBench[0]) > 框右 $($rCores[0] + $rCores[2])）") `
+    ($rBench[0] -gt ($rCores[0] + $rCores[2]))
+  Assert ("按钮与本行同排（Δy=$([Math]::Abs($rBench[1] - $rCores[1]))）") ([Math]::Abs($rBench[1] - $rCores[1]) -le 6)
+  # 「?」徽标列：找 y 最接近的那个徽标，按钮右边界必须留在它左侧（控件不得相交）
+  $badgeX = 0
+  $badgeNear = [int]::MaxValue
+  foreach ($h in [W]::Children($hw)) {
+    if ((Get-WText $h) -ne "?") { continue }
+    $rr = [W]::Rect($h)
+    if ($badgeX -eq 0 -or [Math]::Abs($rr[1] - $rBench[1]) -lt $badgeNear) {
+      $badgeX = $rr[0]; $badgeNear = [Math]::Abs($rr[1] - $rBench[1])
+    }
+  }
+  Assert ("按钮右边界不越过「?」徽标列（按钮 $($rBench[0] + $rBench[2]) < 徽标 $badgeX）") `
+    (($badgeX -gt 0) -and (($rBench[0] + $rBench[2]) -lt $badgeX))
+  # 不足 5 线程：点一下 → 弹提示（只有确定）→ CPU 线程数被直接填成 3
+  [void][W]::SendMessageStr([W]::GetDlgItem($hw, 1015), 0x000C, [IntPtr]::Zero, "6")
+  Click-Ctl $hw 1017 "确定"
+  Assert ("不足 5 线程：CPU 线程数被直接填成 3（实测 '$(Read-Ctl $hw 1015)'）") ((Read-Ctl $hw 1015) -eq "3")
+  Assert ("状态行说明『直接填入最大线程数』（实测 '" + (Read-Ctl $hw 1103) + "'）") ((Read-Ctl $hw 1103) -match '直接填入最大线程数')
 }
 finally {
   Get-Process WeaselLLMSetup -ErrorAction SilentlyContinue | Stop-Process -Force
+  Remove-Item Env:RIME_LLM_FAKE_CORES -ErrorAction SilentlyContinue
+  Remove-Item Env:RIME_LLM_USER_DIR -ErrorAction SilentlyContinue
   Remove-Item $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($script:fail -eq 0) { Write-Host "`nALL PASS" } else { Write-Host "`nFAILED: $($script:fail)"; exit 1 }
