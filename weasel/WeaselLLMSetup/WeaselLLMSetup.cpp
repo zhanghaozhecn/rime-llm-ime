@@ -424,15 +424,18 @@ static void refresh_model_status() {
       set_status(GetDlgItem(g_hwnd, IDC_MSTATUS), L"模型已就绪：%llu MB", sz >> 20);
       set_status(GetDlgItem(g_hwnd, IDC_MSTATUS_HINT), L"");
     } else {
-      set_status(GetDlgItem(g_hwnd, IDC_MSTATUS), L"模型文件可疑：仅 %llu MB", sz >> 20);
+      // 文案长度受 ts(140) 主状态 + ts(404) 提示的**可见宽度**约束（2026-10-09 实测：
+      // 长文案会被静态控件直接截断，末尾看不见）——改文案请先量宽：
+      // 「模型可疑：仅 99 MB」130px@14px ✓（可疑分支体积 <100MB，最多两位数）
+      set_status(GetDlgItem(g_hwnd, IDC_MSTATUS), L"模型可疑：仅 %llu MB", sz >> 20);
       set_status(GetDlgItem(g_hwnd, IDC_MSTATUS_HINT),
-                 L"疑似未下完或损坏（完整约 508MB）——点“下载模型”会删除后重下，或点“浏览…”换一个");
+                 L"疑似未下完或损坏——点“下载模型”重下，或点“浏览…”换一个");
     }
   } else {
     // 拆两行：主状态（正文）+ 后续操作（灰色小字）——一行放不下会被截断
     set_status(GetDlgItem(g_hwnd, IDC_MSTATUS), L"模型文件不存在");
     set_status(GetDlgItem(g_hwnd, IDC_MSTATUS_HINT),
-               L"点“下载模型”下载（ModelScope 断点续传），或点“浏览…”选已有的 .gguf");
+               L"点“下载模型”下载（可续传），或点“浏览…”选已有的 .gguf");
   }
 }
 
@@ -1236,11 +1239,16 @@ static HWND mk_button_tip(const wchar_t* text, int x, int y, int w, int h, int i
 }
 
 static void make_ui() {
-  g_font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+  // 字体高度**必须跟着 DPI 缩放**（2026-10-09 用户真机反馈修复）：清单已声明 system
+  // 感知，控件/间距/分组框全走 ts()，而字体原先是固定 14/12/13 px → 在 200% 屏上
+  // 框与间距放大 2×、文字仍是 14px，整屏"输入框很大、字很小"、标签与「?」都不成比例
+  // （3120×2080@200% 实测截图）。ts() 取系统 DPI，与 system 感知口径一致；
+  // 96 DPI 下 ts() 恒等 → 100% 机器观感与原先完全一致。
+  g_font = CreateFontW(-ts(14), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
                        CLEARTYPE_QUALITY, 0, L"Segoe UI");
-  g_font_hint = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+  g_font_hint = CreateFontW(-ts(12), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                             0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-  g_font_help = CreateFontW(-13, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+  g_font_help = CreateFontW(-ts(13), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
                             0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
   tip_init();
 
@@ -1394,13 +1402,22 @@ static void make_ui() {
 }
 
 // DPI 缩放：清单已声明 system 感知，此处把设计像素换算成设备像素
+// （字体高度也走本函数，见 make_ui —— 漏掉字体就会出现"框大字小"）
 static int ts(int v) {
-  static int dpi = 0;
-  if (!dpi) {
-    HDC dc = GetDC(NULL);
-    dpi = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
-    if (dc) ReleaseDC(NULL, dc);
-    if (dpi <= 0) dpi = 96;
+  static int dpi = -1;
+  if (dpi < 0) {
+    dpi = 0;
+    // 核对钩子（正常部署不设）：强制按指定 DPI 排版，100% 的本机也能复核 200% 布局
+    // （字体同样随之缩放，所以比例真实可查）。自动化/截图核对用，见 check_gui_layout.ps1
+    wchar_t env[16] = L"";
+    DWORD n = GetEnvironmentVariableW(L"WEASEL_LLM_SETUP_DPI", env, 16);
+    if (n > 0 && n < 16) dpi = _wtoi(env);
+    if (dpi <= 0) {
+      HDC dc = GetDC(NULL);
+      dpi = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
+      if (dc) ReleaseDC(NULL, dc);
+      if (dpi <= 0) dpi = 96;
+    }
   }
   return MulDiv(v, dpi, 96);
 }
