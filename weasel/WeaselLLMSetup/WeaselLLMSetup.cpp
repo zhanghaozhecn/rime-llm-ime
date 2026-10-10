@@ -1447,7 +1447,9 @@ static HWND mk_group(const wchar_t* title, int x, int y, int w, int h) {
 
 // 灰色小字（状态副行 / 底部动态注）
 static HWND mk_hint(const wchar_t* text, int x, int y, int w) {
-  HWND c = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, w, 18,
+  // 高度也要走 ts()：写死 18 时 200% 屏上字体 24px 塞进 18px 高的框，
+  // 整行文字**下半截被裁掉**（2026-10-09 用户真机反馈"最后一行显示不全"）
+  HWND c = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, w, ts(18),
                          g_hwnd, NULL, NULL, NULL);
   SendMessageW(c, WM_SETFONT, (WPARAM)g_font_hint, TRUE);
   return c;
