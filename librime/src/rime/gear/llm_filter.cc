@@ -74,7 +74,8 @@ static std::atomic<bool> g_loading{false};
 //   freq_beta: 用户词频对数融合 fused = score + β·log(1+eff)（score=原始
 //                 LLM 分 −CE；对数域加法=词频无上限可翻盘），eff=Rime
 //                 formula_d 时间衰减计数（tick 每词提交+1，与引擎调频同源；
-//                 user_freq.tsv 持久化）。β=1.5 标定自本机打字真实窗回放
+//                 user_freq.tsv 持久化）。β=8 连续文章语料重标定 (2026-11-02,
+//                 平台 8~30 取左段; 旧 1.5 出自独立窗口径)
 // 排序管线（顺序固定，与插件版一致）: CE 评分序 → 词频融合（融合应用于
 //   评分序之上）→ expected_length 加权 → 稳定排序（失败哨兵不参与
 //   min-max 与加成；非有限分整块跳过）。
@@ -116,10 +117,12 @@ static boost::regex g_code_re;          // 编译缓存（llm_apply_params 时�
 static bool g_code_re_ok = true;        // 模式非法 → false（回退默认成功后仍为 true）
 static int g_min_code_len = 4;          // 保留：仅日志/兼容，不再作为用户配置项
 static int g_max_code_len = 0;          // 保留：同上（0 = 无上限）
-static double g_expected_length_weight = 0.2;  // 预期词长加权 (冷启动标定 2026-09-03; 两版统一)
-// 用户词频对数融合 (2026-09-02): fused = score + β·log(1+eff), 默认 β=1.5
-// (本机打字真实窗回放标定: β∈[1,2] 平台, 大 β 为标签偏好假象; 见 Collect 段)
-static double g_freq_beta = 1.5;
+static double g_expected_length_weight = 0.0;  // 预期词长加权 (连续文章语料重标定
+// 2026-11-02: 全切片 argmax=0, 旧 0.2 出自独立句池口径已废; 定长方案冷启动可试 0.2)
+// 用户词频对数融合 (2026-09-02): fused = score + β·log(1+eff), 默认 β=8
+// (连续文章语料重标定 2026-11-02: 4000 篇 wiki/5.9 万窗/全程累计 eff 口径,
+//  增益平台 8~30 取左段; 旧 1.5 出自独立窗/单用户打字口径偏小近半增益)
+static double g_freq_beta = 8.0;
 // debug_fusion 诊断 (2026-09-03 插件版先行、本文件移植): true = 逐块记录
 // 评分→词频融合→词长加成全过程写 rime_llm_debug.txt (与插件版同名同格式;
 // 差异: commit 行无码字段 — OnCommit 只收到上屏文本; reset 行按代次触发,
@@ -152,8 +155,8 @@ struct LlmParamSet {
   bool has_min_code_len = false; int min_code_len = 4;   // 旧键：解析保留、不再生效
   bool has_max_code_len = false; int max_code_len = 0;   // 旧键：解析保留、不再生效
   bool has_code_pattern = false; std::string code_pattern;  // 2026-09-30 新键
-  bool has_elw = false;          double elw = 0.2;
-  bool has_freq_beta = false;    double freq_beta = 1.5;
+  bool has_elw = false;          double elw = 0.0;
+  bool has_freq_beta = false;    double freq_beta = 8.0;
   bool has_min_tokens = false;   int min_tokens = 1;
   bool has_max_tokens = false;   int max_tokens = 10;
   bool has_max_cand = false;     int max_cand = 5;
@@ -188,8 +191,8 @@ static void llm_apply_params() {
   // 仅保留数值以免日志/兼容字段为空。
   g_min_code_len = s.has_min_code_len ? s.min_code_len : 4;
   g_max_code_len = s.has_max_code_len ? s.max_code_len : 0;
-  g_expected_length_weight = s.has_elw ? s.elw : 0.2;
-  g_freq_beta = s.has_freq_beta ? s.freq_beta : 1.5;
+  g_expected_length_weight = s.has_elw ? s.elw : 0.0;
+  g_freq_beta = s.has_freq_beta ? s.freq_beta : 8.0;
   g_debug_fusion = s.has_debug_fusion ? s.debug_fusion : false;
   // g_com_ctx_enabled 不再读配置（2026-09-29 删 com_context 配置项）——
   // 保持定义处 true，排障改代码重编
@@ -829,8 +832,10 @@ static int                       s_cache_gen = -1; // 缓存建立时的 reset �
 // 衰减 = librime algo::formula_d (引擎调频同源):
 //   提交: dee = 1 + dee·exp((t_old - t_now)/τ)
 //   查询: eff = dee·exp((t_word - t_now)/τ)   未提交期间持续衰减
-//   τ=200 tick; tick 每词提交 +1 (同 userdb UpdateTickCount)。
-// 近期常打的词权重高, 久未使用的自动消退 (半衰期 ≈ 139 次提交)。
+//   τ=800 tick; tick 每词提交 +1 (同 userdb UpdateTickCount)。
+// 近期常打的词权重高, 久未使用的自动消退 (半衰期 ≈ 554 次提交)。
+// τ=800 (2026-11-02 连续文章语料重标定: τ×β 联合扫描内点最优, β=8 时较
+// 旧值 200 +0.25pp — 词频记忆跨数篇文章; 200 偏短)。
 // 格式: 首行 "#tick=N"; 数据行 "词\t累计\tdee\ttick"; 兼容旧版 "词\t次数"
 // (迁移: dee=次数, tick=当前 — 视为刚提交过)。
 // ============================================================
@@ -843,7 +848,7 @@ static std::map<std::string, UserFreqEntry> g_user_freq;
 static long long g_user_tick = 0;
 static bool g_user_freq_loaded = false;
 static int  g_user_freq_dirty = 0;
-static constexpr double kFreqTau = 200.0;  // rime formula_d 时间常数
+static constexpr double kFreqTau = 800.0;  // rime formula_d 时间常数 (2026-11-02 重标定)
 
 // Log file: RIME user data dir, single file rime_llm_filter_log.txt
 // (performance lines + per-inference event lines); falls back to %TEMP%.
@@ -1825,7 +1830,7 @@ void LlmRerankTranslation::Collect() {
 
     // 对数词频融合 (freq_beta, 2026-09-02; 词频 Rime 时间衰减 2026-08-21):
     // fused = score + β·log(1+eff)。score = 原始 LLM 分 (−CE, 对数概率域),
-    // eff = librime algo::formula_d 指数衰减计数 (τ=200 tick, tick=每词提交
+    // eff = librime algo::formula_d 指数衰减计数 (τ=800 tick, tick=每词提交
     // +1, 引擎调频同源) — 近期常打的词权重高, 久未使用的自动消退。
     // 对数域加法 = 词频无上限: 强个人高频词可翻盘 CE 分差 (工业输入法通行
     // 结构, 替代旧凸组合 (1-w)·minmax+w·eff/(eff+k) 的结构性封顶)。

@@ -311,8 +311,8 @@ engine:
   Assert "max_tokens: 10" (($y | Where-Object { $_ -match '^  max_tokens: 10$' }).Count -eq 1)
   Assert "max_candidates: 5" (($y | Where-Object { $_ -match '^  max_candidates: 5$' }).Count -eq 1)
   Assert "cpu_cores: 4" (($y | Where-Object { $_ -match '^  cpu_cores: 4$' }).Count -eq 1)
-  Assert "freq_beta: 1.50" (($y | Where-Object { $_ -match '^  freq_beta: 1\.50$' }).Count -eq 1)
-  Assert "expected_length_weight: 0.20" (($y | Where-Object { $_ -match '^  expected_length_weight: 0\.20$' }).Count -eq 1)
+  Assert "freq_beta: 8.00" (($y | Where-Object { $_ -match '^  freq_beta: 8\.00$' }).Count -eq 1)
+  Assert "expected_length_weight: 0.00" (($y | Where-Object { $_ -match '^  expected_length_weight: 0\.00$' }).Count -eq 1)
   Assert "debug_fusion: false" (($y | Where-Object { $_ -match '^  debug_fusion: false$' }).Count -eq 1)
   Assert "model_path 未配置 → 注释占位（与插件版同款）" (($y | Where-Object { $_ -match '^  # model_path:' }).Count -eq 1)
   Assert "旧键 min_code_len 不再产出" (($y | Where-Object { $_ -match 'min_code_len' }).Count -eq 0)
@@ -322,8 +322,8 @@ engine:
   Assert "llm_filter 组件仍恰 1 行" ((($y | Select-String 'llm_filter').Count) -eq 1)
   # 键序与插件版 Get-LlmCfgLines 逐字一致（两版配置节相同，仅组件行不同）
   $expect = @('  enabled: true', "  code_pattern: '[abcde]{4}'", '  max_tokens: 10',
-              '  max_candidates: 5', '  cpu_cores: 4', '  freq_beta: 1.50',
-              '  expected_length_weight: 0.20', '  debug_fusion: false')
+              '  max_candidates: 5', '  cpu_cores: 4', '  freq_beta: 8.00',
+              '  expected_length_weight: 0.00', '  debug_fusion: false')
   $i0 = 0; for ($i = 0; $i -lt $y.Count; $i++) { if ($y[$i] -match '^llm_rerank:') { $i0 = $i } }
   $got = @($y[($i0 + 1)..($i0 + 8)])
   Assert "节内键序与插件版一致" (($got -join '|') -eq ($expect -join '|'))

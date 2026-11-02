@@ -69,7 +69,7 @@ struct Params {
   // min_tokens 不再暴露给用户（2026-09-30 定案：最少上文 token 恒为 1，
   // 代码内默认值保留，yaml/schema 里的旧行读取时忽略、写入时不再产出）
   int max_tokens = 10, cpu_cores = 4;
-  double elw = 0.2, freq_beta = 1.5;
+  double elw = 0.0, freq_beta = 8.0;  // 连续文章语料重标定 2026-11-02（两版统一）
   int max_candidates = 5;
   bool debug_fusion = false;
   std::wstring model_path;  // 显示值（空 = 默认路径）
@@ -1200,14 +1200,14 @@ static const wchar_t* const TIP_BENCH =
     L"本机不足 5 线程时不做实测，直接取最大线程数。\n"
     L"约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。";
 static const wchar_t* const TIP_BETA =
-    L"用户词频权重 β（默认 1.5，0 = 关闭）。\n"
+    L"用户词频权重 β（默认 8，0 = 关闭）。\n"
     L"融合分 = CE 分 + β·log(1+词频计数) + elw·词长加成\n"
     L"越常上屏的词加分越多；加分在 log 域，可翻盘 LLM 的分差。";
 static const wchar_t* const TIP_ELW =
-    L"预期词长权重 elw（默认 0.2，0 = 关闭）。\n"
+    L"预期词长权重 elw（默认 0，0 = 关闭）。\n"
     L"融合分 = CE 分 + β·log(1+词频计数) + elw·词长加成\n"
-    L"按 词长 = 码长÷2 给候选加成，只对两码一字的方案有意义；\n"
-    L"成熟机器建议 0。";
+    L"按 词长 = 码长÷2 给候选加成，只对两码一字的定长方案（双拼/五笔/郑码）\n"
+    L"在冷启动阶段可能有用，可试 0.2；一般保持 0。";
 static const wchar_t* const TIP_DEBUG =
     L"诊断日志：开启后每次重排都往用户文件夹写 rime_llm_debug.txt\n"
     L"（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。";
