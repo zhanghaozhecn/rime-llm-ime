@@ -71,7 +71,9 @@ static std::atomic<bool> g_loading{false};
 //                 方案；等价换算 min=4,max=0 ⇒ code_pattern '.{4}'）
 //   expected_length_weight: >0 = bonus candidates whose word length equals
 //                 floor(code_len/2) (两码一字), weighted by current score span
-//   freq_beta: 用户词频对数融合 fused = score + β·log(1+eff)（score=原始
+//   freq_beta: **已删**（2026-11-05 标定产物退出用户配置面——用户没有标定能力；
+//                 β=8 为内置常数与 τ 同待遇，方案残留旧行读取端忽略、保存时剥除）。
+//                 用户词频对数融合 fused = score + β·log(1+eff)（score=原始
 //                 LLM 分 −CE；对数域加法=词频无上限可翻盘），eff=Rime
 //                 formula_d 时间衰减计数（tick 每词提交+1，与引擎调频同源；
 //                 user_freq.tsv 持久化）。β=8 连续文章语料重标定 (2026-11-02,
@@ -79,7 +81,7 @@ static std::atomic<bool> g_loading{false};
 // 排序管线（顺序固定，与插件版一致）: CE 评分序 → 词频融合（融合应用于
 //   评分序之上）→ expected_length 加权 → 稳定排序（失败哨兵不参与
 //   min-max 与加成；非有限分整块跳过）。
-// CE 位置权重 (2026-09-16, 与插件版同源, 首项归一规范形 (1,1.13,0.61)): ce2 判别
+// CE 位置权重 (2026-09-16, 与插件版同源, 首项归一规范形 (1,1.05,0.45) (v3 2026-11-06 六维联合标定)): ce2 判别
 //   力最强(上下文契合+词内连贯), ce3 深入词内部降权; 4+ token 词只算前三
 //   项——尾部外推证伪删除(λ 0→1 端到端命中率单调递减, λ=0 最优)。
 // 参数来源（2026-09-30 用户定案，两版统一）：**只读方案的 llm_rerank 配置节**
@@ -119,10 +121,12 @@ static int g_min_code_len = 4;          // 保留：仅日志/兼容，不再作
 static int g_max_code_len = 0;          // 保留：同上（0 = 无上限）
 static double g_expected_length_weight = 0.0;  // 预期词长加权 (连续文章语料重标定
 // 2026-11-02: 全切片 argmax=0, 旧 0.2 出自独立句池口径已废; 定长方案冷启动可试 0.2)
-// 用户词频对数融合 (2026-09-02): fused = score + β·log(1+eff), 默认 β=8
-// (连续文章语料重标定 2026-11-02: 4000 篇 wiki/5.9 万窗/全程累计 eff 口径,
-//  增益平台 8~30 取左段; 旧 1.5 出自独立窗/单用户打字口径偏小近半增益)
-static double g_freq_beta = 8.0;
+// 用户词频对数融合 (2026-09-02): fused = score + β·log(1+eff), β=12 **内置常数**
+// (2026-11-05 标定产物退出用户配置面——用户没有标定能力, 与 kFreqTau 同待遇;
+//  **2026-11-06 v3 六维联合标定** w2×w3×β×τ×γ×λ 68,640 点: 用户域标定 →
+//  wiki 平台内就近点 (1.05/0.45/β12/τ400/γ1/λ0.5), 见研究库 §三十三;
+//  旧 8 出自 2026-11-02 连续文章语料重标定)
+static double g_freq_beta = 12.0;
 // debug_fusion 诊断 (2026-09-03 插件版先行、本文件移植): true = 逐块记录
 // 评分→词频融合→词长加成全过程写 rime_llm_debug.txt (与插件版同名同格式;
 // 差异: commit 行无码字段 — OnCommit 只收到上屏文本; reset 行按代次触发,
@@ -138,7 +142,7 @@ static int g_n_threads = 4;        // default = GGML_DEFAULT_N_THREADS; override
 
 static void log_msg(const char *fmt, ...);  // defined below (fwd decl)
 static std::vector<llama_token> tokenize(const char *text);  // fwd decl
-static double cross_entropy(float *logits, int vs, int target_id);  // fwd decl
+static double cross_entropy(const float *logits, int vs, int target_id);  // fwd decl
 
 static int g_n_ctx = 128;          // KV: 11 seqs x (ctx 10 + cand 2) = 132, 64 overflows
 static int g_n_seq_max = 12;       // template seq 0 + up to 11 worker seqs
@@ -156,7 +160,7 @@ struct LlmParamSet {
   bool has_max_code_len = false; int max_code_len = 0;   // 旧键：解析保留、不再生效
   bool has_code_pattern = false; std::string code_pattern;  // 2026-09-30 新键
   bool has_elw = false;          double elw = 0.0;
-  bool has_freq_beta = false;    double freq_beta = 8.0;
+  // freq_beta 字段已删（2026-11-05 退出用户配置面）→ g_freq_beta=8.0 内置常数
   bool has_min_tokens = false;   int min_tokens = 1;
   bool has_max_tokens = false;   int max_tokens = 10;
   bool has_max_cand = false;     int max_cand = 5;
@@ -192,7 +196,8 @@ static void llm_apply_params() {
   g_min_code_len = s.has_min_code_len ? s.min_code_len : 4;
   g_max_code_len = s.has_max_code_len ? s.max_code_len : 0;
   g_expected_length_weight = s.has_elw ? s.elw : 0.0;
-  g_freq_beta = s.has_freq_beta ? s.freq_beta : 8.0;
+  // g_freq_beta 恒为内置常数 8.0（2026-11-05 退出用户配置面，不再从方案读取；
+  // 方案残留 freq_beta 旧行忽略，保存时由 GUI 剥除）
   g_debug_fusion = s.has_debug_fusion ? s.debug_fusion : false;
   // g_com_ctx_enabled 不再读配置（2026-09-29 删 com_context 配置项）——
   // 保持定义处 true，排障改代码重编
@@ -805,6 +810,8 @@ static std::string snapshot(unsigned max_age_ms) {
 // ============================================================
 static std::vector<llama_token> g_prep_ctx;     // pre-decoded ctx tokens
 static std::vector<float>       g_prep_logits;  // ctx_last logits
+static float                    g_prep_m = 0;   // ctx_last logits 的 softmax max（随 prep 缓存，命中路径免 O(vocab) 重扫）
+static double                   g_prep_lse = 0; // ctx_last logits 的 logsumexp（同上）
 static bool                     g_prep_ready = false;
 static std::atomic<int>         g_prep_seq{0};  // request seq, stale requests skip
 static long                     g_seq0_gen = 0; // seq0 KV generation: bumped by any decode covering seq0
@@ -848,7 +855,7 @@ static std::map<std::string, UserFreqEntry> g_user_freq;
 static long long g_user_tick = 0;
 static bool g_user_freq_loaded = false;
 static int  g_user_freq_dirty = 0;
-static constexpr double kFreqTau = 800.0;  // rime formula_d 时间常数 (2026-11-02 重标定)
+static constexpr double kFreqTau = 400.0;  // rime formula_d 时间常数 (v3 2026-11-06 六维联合标定; 旧 800 出自 2026-11-02)
 
 // Log file: RIME user data dir, single file rime_llm_filter_log.txt
 // (performance lines + per-inference event lines); falls back to %TEMP%.
@@ -964,6 +971,144 @@ static double user_freq_eff(const std::string &w) {
          exp((double)(it->second.tick - g_user_tick) / kFreqTau);
 }
 
+// ── 用户 bigram 计数 (v3 2026-11-06 六维联合标定: γ=1, λ=0.5) ──
+// 融合项 = log(0.5·p2+0.5·p1) [fired=bi[h2,x] 见过] / log(0.5·p1) [未 fired];
+// p1 = (uni[x]+1)/(n_seen+20000), p2 = bi[h2,x]/c1[h2]。与插件版
+// llm_processor.lua 同格式同文件 user_bigram.tsv (两版共用, user_freq.tsv 先例)。
+// 只计含中文字符的词 (字节级 CJK 判定, 比插件 utf8 精确判定略宽, 可忽略);
+// h2 = 上一个中文提交词; **原始计数不衰减** (标定语义), 冷启动自然回退。
+// 存储: 首行 "#n=N", 行 "u	词	次数" / "b	前词	词	次数"; c1 载入合计。
+static std::map<std::string, long long> g_user_uni;
+static std::map<std::string, long long> g_user_bi;   // key = "前词	词"
+static std::map<std::string, long long> g_user_c1;
+static long long g_user_nseen = 0;
+static std::string g_last_cjk;
+static bool g_user_bi_loaded = false;
+static int  g_user_bi_dirty = 0;
+static constexpr int kBigramVcap = 20000;
+
+static bool user_bi_file(char *path, size_t n) {
+  const RimeApi *api = rime_get_api();
+  if (api && api->get_user_data_dir) {
+    const char *ud = api->get_user_data_dir();
+    if (ud && *ud) {
+      snprintf(path, n, "%s\user_bigram.tsv", ud);
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool text_has_cjk_utf8(const std::string &w) {
+  size_t i = 0;
+  while (i < w.size()) {
+    unsigned char c = (unsigned char)w[i];
+    int len = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2
+            : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 1;
+    if (len == 3 && c >= 0xE4 && c <= 0xE9 && i + 2 < w.size() &&
+        (unsigned char)w[i + 1] >= 0x80 && (unsigned char)w[i + 2] >= 0x80)
+      return true;
+    i += len;
+  }
+  return false;
+}
+
+static void user_bi_ensure_loaded() {
+  if (g_user_bi_loaded)
+    return;
+  g_user_bi_loaded = true;
+  char path[MAX_PATH];
+  if (!user_bi_file(path, sizeof(path)))
+    return;
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return;
+  char line[1024];
+  while (fgets(line, sizeof(line), f)) {
+    size_t len = strlen(line);
+    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len] = 0;
+    if (strncmp(line, "#n=", 3) == 0) {
+      g_user_nseen = atoll(line + 3);
+      continue;
+    }
+    char *t1 = strchr(line, '\t');
+    if (!t1)
+      continue;
+    *t1 = 0;
+    char *t2 = strchr(t1 + 1, '\t');
+    if (!t2)
+      continue;
+    *t2 = 0;
+    char *t3 = strchr(t2 + 1, '\t');
+    long long cnt = atoll(t3 ? t3 + 1 : t2 + 1);
+    if (line[0] == 'u') {
+      g_user_uni[std::string(t1 + 1)] = cnt;
+    } else if (line[0] == 'b' && t3) {
+      *t3 = 0;
+      std::string key = std::string(t1 + 1) + "\t" + std::string(t2 + 1);
+      g_user_bi[key] = cnt;
+      g_user_c1[std::string(t1 + 1)] += cnt;
+    }
+  }
+  fclose(f);
+}
+
+static void user_bi_save() {
+  char path[MAX_PATH];
+  if (!user_bi_file(path, sizeof(path)))
+    return;
+  FILE *f = fopen(path, "w");
+  if (!f)
+    return;
+  fprintf(f, "#n=%lld\n", g_user_nseen);
+  for (auto &kv : g_user_uni)
+    fprintf(f, "u\t%s\t%lld\n", kv.first.c_str(), kv.second);
+  for (auto &kv : g_user_bi) {
+    std::string key = kv.first;
+    size_t tab = key.find('\t');
+    if (tab == std::string::npos)
+      continue;
+    fprintf(f, "b\t%s\t%s\t%lld\n", key.substr(0, tab).c_str(),
+            key.substr(tab + 1).c_str(), kv.second);
+  }
+  fclose(f);
+}
+
+static void user_bi_bump(const std::string &w) {
+  user_bi_ensure_loaded();
+  if (!text_has_cjk_utf8(w))
+    return;
+  ++g_user_nseen;
+  ++g_user_uni[w];
+  if (!g_last_cjk.empty()) {
+    std::string key = g_last_cjk + "\t" + w;
+    ++g_user_bi[key];
+    ++g_user_c1[g_last_cjk];
+  }
+  g_last_cjk = w;
+  if (++g_user_bi_dirty >= 20) {
+    user_bi_save();
+    g_user_bi_dirty = 0;
+  }
+}
+
+// 融合项查询: fired = bi[h2,x]>0 且 c1[h2]>0
+static double user_bigram_term(const std::string &x) {
+  user_bi_ensure_loaded();
+  double p1 = (double)((g_user_uni.count(x) ? g_user_uni[x] : 0) + 1)
+              / (double)(g_user_nseen + kBigramVcap);
+  if (!g_last_cjk.empty()) {
+    auto cc = g_user_c1.find(g_last_cjk);
+    if (cc != g_user_c1.end() && cc->second > 0) {
+      auto b = g_user_bi.find(g_last_cjk + "\t" + x);
+      if (b != g_user_bi.end() && b->second > 0)
+        return log(0.5 * (double)b->second / (double)cc->second + 0.5 * p1);
+    }
+  }
+  return log(0.5 * p1);
+}
+
 static void user_freq_save() {
   char path[MAX_PATH];
   if (!user_freq_file(path, sizeof(path)))
@@ -1007,6 +1152,7 @@ static void user_freq_bump(const std::string &w) {
     user_freq_save();
     g_user_freq_dirty = 0;
   }
+  user_bi_bump(w);
 }
 
 static void log_msg(const char *fmt, ...) {
@@ -1345,15 +1491,27 @@ static std::vector<llama_token> tokenize(const char *text) {
 
 // ============================================================
 // CE helper: -log(softmax(x)[target])
+// 通用优化（2026-11-06，两版同步；不依赖特定指令集、不改评分语义）：
+// ① 尾部跳过：与 max 相差 > kLseSkipNat 的项不做 exp——单项贡献
+//    < e^-20 ≈ 2.1e-9，全词表（26 万封顶）总贡献 < 5.5e-4，即 lse 偏差
+//    < 0.0006 nats，比候选间典型 CE 差（≥0.01）小一个数量级以上；
+//    真实分布高度集中，跳过量通常 >90%（近乎均匀的病态分布退化为原速）。
+// ② exp 用 float 版 expf（标量运算，无 SIMD 依赖），求和仍 double 累加。
+// 实测（13900H 锁频）：单次全词表归一化 ~2ms → ~0.1ms；prep 命中路径
+// 配合归一化量缓存（见 score_batch）CE1 段 ~0ms。
 // ============================================================
-static double cross_entropy(float *logits, int vs, int target_id) {
+static const float kLseSkipNat = 20.0f;  // 尾部跳过阈值（nats，误差界见上）
+
+static double cross_entropy(const float *logits, int vs, int target_id) {
   float m = -1e30f;
   for (int k = 0; k < vs; k++)
     if (logits[k] > m)
       m = logits[k];
+  const float cut = m - kLseSkipNat;
   double se = 0;
   for (int k = 0; k < vs; k++)
-    se += exp((double)(logits[k] - m));
+    if (logits[k] >= cut)
+      se += expf(logits[k] - m);
   return -((double)(logits[target_id] - m) - log(se));
 }
 
@@ -1361,18 +1519,22 @@ static double cross_entropy(float *logits, int vs, int target_id) {
 // across multiple CE targets. Step 1 scores all candidates against the same
 // ctx logits, so the O(vocab) scan was repeated per candidate (5x waste,
 // ~5ms of the CE1 stage); with a shared normalizer it becomes O(vocab) once
-// + O(1) per target.
-static void logits_normalizer(float *logits, int vs, float &m, double &lse) {
+// + O(1) per target. 2026-11-06: tail skip + expf on top, and the normalizer
+// result is cached with the prep state — the prep-hit path skips the scan
+// entirely (CE1 stage ~0ms).
+static void logits_normalizer(const float *logits, int vs, float &m, double &lse) {
   m = -1e30f;
   for (int k = 0; k < vs; k++)
     if (logits[k] > m)
       m = logits[k];
+  const float cut = m - kLseSkipNat;
   double se = 0;
   for (int k = 0; k < vs; k++)
-    se += exp((double)(logits[k] - m));
+    if (logits[k] >= cut)
+      se += expf(logits[k] - m);
   lse = log(se);
 }
-static double ce_target(float *logits, int target_id, float m, double lse) {
+static double ce_target(const float *logits, int target_id, float m, double lse) {
   return -((double)(logits[target_id] - m) - lse);
 }
 
@@ -1418,7 +1580,9 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
   // ctx keeps hitting until seq0 is covered by another decode.
   bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx &&
                   g_seq0_gen == g_prep_gen;
-  std::vector<float> ctx_logits;
+  const float *ctx_logits = nullptr;  // 直接指向 prep 存储，免全量 vector 拷贝
+  float m0 = 0;
+  double lse0 = 0;
   double ms1 = 0;
 
   if (!use_prep) {
@@ -1433,41 +1597,49 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
     }
     ctx_batch.logits[ctx_len - 1] = 1;
     ctx_batch.n_tokens = ctx_len;
+    bool decoded_ok = false;
     if (llama_decode(g_ctx, ctx_batch) == 0) {
       g_seq0_gen++;  // seq0 KV updated
       float *cl = llama_get_logits_ith(g_ctx, ctx_len - 1);
-      if (cl)
-        ctx_logits.assign(cl, cl + vs);
+      if (cl) {
+        g_prep_logits.assign(cl, cl + vs);  // 直接落 prep 存储（原多一次全量拷贝）
+        decoded_ok = true;
+      }
     }
     llama_batch_free(ctx_batch);
-    if (ctx_logits.empty()) {
+    if (!decoded_ok) {
       log_msg("ERROR: ctx decode failed");
-      return;
+      return;  // prep 存储只在成功时覆写
     }
     // self-refresh prep: seq0 just decoded (generation bumped), KV and
     // logits are consistent, so later scores for the same ctx (page turn,
     // candidate window rebuild) all hit instead of cascading misses
     g_prep_gen = g_seq0_gen;
     g_prep_ctx = ctx_ids;
-    g_prep_logits = ctx_logits;
+    logits_normalizer(g_prep_logits.data(), vs, g_prep_m, g_prep_lse);  // 归一化量随 prep 缓存
     g_prep_ready = true;
+    ctx_logits = g_prep_logits.data();
+    m0 = g_prep_m;
+    lse0 = g_prep_lse;
     auto ts1_1 = std::chrono::high_resolution_clock::now();
     ms1 = std::chrono::duration<double, std::milli>(ts1_1 - ts1_0).count();
   } else {
-    ctx_logits = g_prep_logits;  // pre-decode hit: Step 1 skipped
+    // pre-decode hit: Step 1 skipped, reuse cached normalizer too
+    // (saves the O(vocab) rescan, 实测 CE1 段 2ms → ~0ms)
+    ctx_logits = g_prep_logits.data();
+    m0 = g_prep_m;
+    lse0 = g_prep_lse;
   }
 
   // Step 1 CE: P(cand[0] | ctx) for all candidates
   // all candidates share the same ctx logits -> one normalizer scan
+  // (2026-11-06: normalizer cached with prep state, hit path skips the scan)
   auto ts_ce1_0 = std::chrono::high_resolution_clock::now();
   std::vector<double> ce_sum(n_cands, 0.0);
-  float m0;
-  double lse0;
-  logits_normalizer(ctx_logits.data(), vs, m0, lse0);
-  // CE 位置权重 (kCeW1/2/3): 见文件头注释; 4+ token 只算前三项, 无外推
-  static constexpr double kCeW[3] = {1.0, 1.13, 0.61};
+  // CE 位置权重 (kCeW[0/1/2]): 见文件头注释; 4+ token 只算前三项, 无外推
+  static constexpr double kCeW[3] = {1.0, 1.05, 0.45};  // v3 2026-11-06 六维联合标定 (旧 1.13/0.61 出自 2026-09-16 前缀标定)
   for (int i = 0; i < n_cands; i++) {
-    ce_sum[i] = kCeW[0] * ce_target(ctx_logits.data(), cands[i][0], m0, lse0);
+    ce_sum[i] = kCeW[0] * ce_target(ctx_logits, cands[i][0], m0, lse0);
   }
   auto ts_ce1_1 = std::chrono::high_resolution_clock::now();
   double ms_ce1 =
@@ -1650,6 +1822,9 @@ static void prepare(const std::vector<llama_token> &ctx_ids, int seq) {
   g_seq0_gen++;  // seq0 KV updated (this pass)
   g_prep_gen = g_seq0_gen;
   g_prep_ctx = ctx_ids;
+  // 归一化量随 prep 一并算好（2026-11-06）：score 的 prep 命中路径直接取用，
+  // 省一次 O(vocab) 扫描。放在 g_prep_ready 置位前、锁内完成，无 torn state。
+  logits_normalizer(g_prep_logits.data(), vs, g_prep_m, g_prep_lse);
   g_prep_ready = true;
   auto t1 = std::chrono::high_resolution_clock::now();
   double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1848,8 +2023,9 @@ void LlmRerankTranslation::Collect() {
         double t = has_score[i]
                        ? score_of[i] +
                              g_freq_beta * std::log(1.0 + user_freq_eff(
-                                                 candidates_[i]->text()))
-                       : -1e308;  // 失败哨兵/缺分 → 排尾
+                                                 candidates_[i]->text())) +
+                             user_bigram_term(candidates_[i]->text())
+                       : -1e308;  // 失败哨兵/缺分 → 排尾 (v3: + 用户 bigram 项)
         fused_of[i] = t;
         fused.emplace_back(t, i);
       }
@@ -1919,13 +2095,14 @@ void LlmRerankTranslation::Collect() {
         int i = order[k];
         double eff = has_score[i] ? user_freq_eff(candidates_[i]->text()) : 0;
         double fb = has_score[i] ? g_freq_beta * std::log1p(eff) : 0;
-        char line[256];
+        double bi = has_score[i] ? user_bigram_term(candidates_[i]->text()) : 0;
+        char line[320];
         snprintf(line, sizeof(line),
-                 "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f 长+%5.2f key=%s"
+                 "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f bi+%6.3f 长+%5.2f key=%s"
                  "  原次序%d→%d",
                  (int)k + 1, candidates_[i]->text().c_str(),
                  dbg_num8(has_score[i] ? score_of[i] : -1e308).c_str(), eff,
-                 fb, dbg_eb[i], dbg_num(fused_of[i] + dbg_eb[i]).c_str(),
+                 fb, bi, dbg_eb[i], dbg_num(fused_of[i] + dbg_eb[i]).c_str(),
                  ce_rank[i], final_rank[i]);
         dbg.push_back(line);
       }
@@ -2040,14 +2217,15 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     if (config->GetInt("llm_rerank/max_code_len", &v)) { p.has_max_code_len = true; p.max_code_len = v; }
     double dw = 0.0;
     if (config->GetDouble("llm_rerank/expected_length_weight", &dw) && dw >= 0) { p.has_elw = true; p.elw = dw; }
-    if (config->GetDouble("llm_rerank/freq_beta", &dw) && dw >= 0) { p.has_freq_beta = true; p.freq_beta = dw; }
+    // freq_beta 不再读取（2026-11-05 退出用户配置面 → g_freq_beta=8.0 内置常数；
+    // 方案残留旧行忽略，保存时由 GUI 剥除）
     if (config->GetInt("llm_rerank/min_tokens", &v)) { p.has_min_tokens = true; p.min_tokens = v; }
     if (config->GetInt("llm_rerank/max_tokens", &v)) { p.has_max_tokens = true; p.max_tokens = v; }
     if (config->GetInt("llm_rerank/max_candidates", &v)) { p.has_max_cand = true; p.max_cand = v; }
     if (config->GetInt("llm_rerank/cpu_cores", &v)) { p.has_cpu_cores = true; p.cpu_cores = v; }
     llm_apply_params();
     log_msg("config: enabled=%d code_pattern='%s' (min_code_len=%d max_code_len=%d 旧键不生效) "
-            "expected_length_weight=%.2f freq_beta=%.2f debug_fusion=%d "
+            "expected_length_weight=%.2f freq_beta=%.2f(内置) debug_fusion=%d "
             "min_tokens=%d "
             "max_tokens=%d max_candidates=%d cpu_cores=%d "
             "model=%s",
