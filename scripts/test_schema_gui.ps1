@@ -312,7 +312,8 @@ engine:
   Assert "max_candidates: 5" (($y | Where-Object { $_ -match '^  max_candidates: 5$' }).Count -eq 1)
   Assert "cpu_cores: 4" (($y | Where-Object { $_ -match '^  cpu_cores: 4$' }).Count -eq 1)
   Assert "无 freq_beta（标定产物退出配置面 2026-11-05）" (($y | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
-  Assert "expected_length_weight: 0.00" (($y | Where-Object { $_ -match '^  expected_length_weight: 0\.00$' }).Count -eq 1)
+  Assert "two_code_sentence: false（默认关闭）" (($y | Where-Object { $_ -match '^  two_code_sentence: false$' }).Count -eq 1)
+  Assert "无 expected_length_weight（elw 退役 2026-11-07）" (($y | Where-Object { $_ -match 'expected_length_weight' }).Count -eq 0)
   Assert "debug_fusion: false" (($y | Where-Object { $_ -match '^  debug_fusion: false$' }).Count -eq 1)
   Assert "model_path 未配置 → 注释占位（与插件版同款）" (($y | Where-Object { $_ -match '^  # model_path:' }).Count -eq 1)
   Assert "旧键 min_code_len 不再产出" (($y | Where-Object { $_ -match 'min_code_len' }).Count -eq 0)
@@ -323,7 +324,7 @@ engine:
   # 键序与插件版 Get-LlmCfgLines 逐字一致（两版配置节相同，仅组件行不同）
   $expect = @('  enabled: true', "  code_pattern: '[abcde]{4}'", '  max_tokens: 10',
               '  max_candidates: 5', '  cpu_cores: 4',
-              '  expected_length_weight: 0.00', '  debug_fusion: false')
+              '  two_code_sentence: false', '  debug_fusion: false')
   $i0 = 0; for ($i = 0; $i -lt $y.Count; $i++) { if ($y[$i] -match '^llm_rerank:') { $i0 = $i } }
   $got = @($y[($i0 + 1)..($i0 + 7)])
   Assert "节内键序与插件版一致" (($got -join '|') -eq ($expect -join '|'))
@@ -359,17 +360,18 @@ model_path: d:/gguf_models/legacy.gguf
   Write-Host ("  status: " + $st)
   Assert "状态提示已带出旧全局配置" ($st -match '旧全局配置')
   $vCores = Read-Ctl $hw 1015; $vTok = Read-Ctl $hw 1014
-  $vPat = Read-Ctl $hw 1016; $vModel = Read-Ctl $hw 1002; $vElw = Read-Ctl $hw 1021
-  Write-Host ("  界面实测: cores='{0}' max_tokens='{1}' elw='{2}' code_pattern='{3}' model='{4}'" -f $vCores, $vTok, $vElw, $vPat, $vModel)
+  $vPat = Read-Ctl $hw 1016; $vModel = Read-Ctl $hw 1002
+  Write-Host ("  界面实测: cores='{0}' max_tokens='{1}' code_pattern='{2}' model='{3}'" -f $vCores, $vTok, $vPat, $vModel)
   Assert ("界面 cpu_cores = 7（迁移，实测 '$vCores'）") ($vCores -eq "7")
   Assert ("界面 max_tokens = 12（迁移，实测 '$vTok'）") ($vTok -eq "12")
-  Assert ("界面 elw = 0.35（迁移，实测 '$vElw'）") ($vElw -eq "0.35")
   Assert ("界面 code_pattern = .{3,4}（迁移，实测 '$vPat'）") ($vPat -eq ".{3,4}")
   Assert ("界面 model_path 尾部 legacy.gguf（迁移，实测 '$vModel'）") ($vModel -match 'legacy\.gguf$')
   $st = Click-Add $hw
   $f = Get-Content $test -Encoding UTF8
   Assert "迁移值写进方案节 cpu_cores: 7" (($f | Where-Object { $_ -match '^  cpu_cores: 7$' }).Count -eq 1)
   Assert "迁移方案节无 freq_beta（旧键收敛）" (($f | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
+  Assert "迁移方案节无 expected_length_weight（elw 退役不迁移）" (($f | Where-Object { $_ -match 'expected_length_weight' }).Count -eq 0)
+  Assert "迁移方案节 two_code_sentence: false（默认）" (($f | Where-Object { $_ -match '^  two_code_sentence: false$' }).Count -eq 1)
   Assert "迁移值写进方案节 max_tokens: 12" (($f | Where-Object { $_ -match '^  max_tokens: 12$' }).Count -eq 1)
   Assert "迁移的 code_pattern 单引号落盘" (($f | Where-Object { $_ -match "^  code_pattern: '\.\{3,4\}'$" }).Count -eq 1)
   Assert "迁移的 model_path 落盘（正斜杠）" (($f | Where-Object { $_ -match '^  model_path: d:/gguf_models/legacy\.gguf$' }).Count -eq 1)

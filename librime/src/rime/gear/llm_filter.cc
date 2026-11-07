@@ -69,8 +69,8 @@ static std::atomic<bool> g_loading{false};
 //                 空串 = 不限制；非法模式回退默认 '.{4}' 并写日志。
 //   min_code_len / max_code_len: **旧键，已不生效**（解析保留仅为兼容历史
 //                 方案；等价换算 min=4,max=0 ⇒ code_pattern '.{4}'）
-//   expected_length_weight: >0 = bonus candidates whose word length equals
-//                 floor(code_len/2) (两码一字), weighted by current score span
+//   two_code_sentence: true = 满长组优先（词长==⌊码长/2⌋ 的候选一组直接优先,
+//                 组内融合分降序、同分稳定; 2026-11-07 取代 expected_length_weight）
 //   freq_beta: **已删**（2026-11-05 标定产物退出用户配置面——用户没有标定能力；
 //                 β=8 为内置常数与 τ 同待遇，方案残留旧行读取端忽略、保存时剥除）。
 //                 用户词频对数融合 fused = score + β·log(1+eff)（score=原始
@@ -79,8 +79,8 @@ static std::atomic<bool> g_loading{false};
 //                 user_freq.tsv 持久化）。β=8 连续文章语料重标定 (2026-11-02,
 //                 平台 8~30 取左段; 旧 1.5 出自独立窗口径)
 // 排序管线（顺序固定，与插件版一致）: CE 评分序 → 词频融合（融合应用于
-//   评分序之上）→ expected_length 加权 → 稳定排序（失败哨兵不参与
-//   min-max 与加成；非有限分整块跳过）。
+//   评分序之上）→ 两码整句满长组优先（开关开启时）→ 稳定排序（失败哨兵
+//   分排尾部）。
 // CE 位置权重 (2026-09-16, 与插件版同源, 首项归一规范形 (1,1.05,0.45) (v3 2026-11-06 六维联合标定)): ce2 判别
 //   力最强(上下文契合+词内连贯), ce3 深入词内部降权; 4+ token 词只算前三
 //   项——尾部外推证伪删除(λ 0→1 端到端命中率单调递减, λ=0 最优)。
@@ -119,8 +119,8 @@ static boost::regex g_code_re;          // 编译缓存（llm_apply_params 时�
 static bool g_code_re_ok = true;        // 模式非法 → false（回退默认成功后仍为 true）
 static int g_min_code_len = 4;          // 保留：仅日志/兼容，不再作为用户配置项
 static int g_max_code_len = 0;          // 保留：同上（0 = 无上限）
-static double g_expected_length_weight = 0.0;  // 预期词长加权 (连续文章语料重标定
-// 2026-11-02: 全切片 argmax=0, 旧 0.2 出自独立句池口径已废; 定长方案冷启动可试 0.2)
+static bool g_two_code_sentence = false;  // 两码整句：满长组优先 (2026-11-07
+// 用户定案取代 expected_length_weight——elw·span 间接量退役)
 // 用户词频对数融合 (2026-09-02): fused = score + β·log(1+eff), β=12 **内置常数**
 // (2026-11-05 标定产物退出用户配置面——用户没有标定能力, 与 kFreqTau 同待遇;
 //  **2026-11-06 v3 六维联合标定** w2×w3×β×τ×γ×λ 68,640 点: 用户域标定 →
@@ -159,7 +159,7 @@ struct LlmParamSet {
   bool has_min_code_len = false; int min_code_len = 4;   // 旧键：解析保留、不再生效
   bool has_max_code_len = false; int max_code_len = 0;   // 旧键：解析保留、不再生效
   bool has_code_pattern = false; std::string code_pattern;  // 2026-09-30 新键
-  bool has_elw = false;          double elw = 0.0;
+  bool has_tcs = false;          bool two_code_sentence = false;
   // freq_beta 字段已删（2026-11-05 退出用户配置面）→ g_freq_beta=8.0 内置常数
   bool has_min_tokens = false;   int min_tokens = 1;
   bool has_max_tokens = false;   int max_tokens = 10;
@@ -195,7 +195,7 @@ static void llm_apply_params() {
   // 仅保留数值以免日志/兼容字段为空。
   g_min_code_len = s.has_min_code_len ? s.min_code_len : 4;
   g_max_code_len = s.has_max_code_len ? s.max_code_len : 0;
-  g_expected_length_weight = s.has_elw ? s.elw : 0.0;
+  g_two_code_sentence = s.has_tcs ? s.two_code_sentence : false;
   // g_freq_beta 恒为内置常数 8.0（2026-11-05 退出用户配置面，不再从方案读取；
   // 方案残留 freq_beta 旧行忽略，保存时由 GUI 剥除）
   g_debug_fusion = s.has_debug_fusion ? s.debug_fusion : false;
@@ -820,7 +820,7 @@ static long                     g_prep_gen = 0; // generation at which prep was 
 // ============================================================
 // score result cache: same (ctx, input) reuses the previous rerank
 // (翻页/候选窗重建不重复推理 — 对齐插件版 _G.llm_filter_cache)。
-// 只存评分顺序（候选文本），词频融合/expected_length 排序与 AI 徽章每次
+// 只存评分顺序（候选文本），词频融合/两码整句排序与 AI 徽章每次
 // 按当前配置重放，改参数后重新部署缓存仍正确。reset 代次变
 // （编辑键/窗口切换）→ 失效；ctx/input 变 → key 不匹配自然失效。
 // engine 线程专用（Apply/Collect 均在引擎线程），无锁。
@@ -1921,24 +1921,49 @@ an<Candidate> LlmRerankTranslation::Peek() {
 }
 
 void LlmRerankTranslation::Collect() {
-  // collect up to max_candidates for scoring, keep the rest in original order
+  // v3 两层重排 (2026-11-07 用户定案): 层1 = 全体候选 eff+bigram 打分稳定
+  // 降序（同分保引擎序）→ 前 max_candidates 进 LLM 评分（层2 三项融合重排,
+  // 在下方融合块）, 其余按层1 序透传。目标在层1 前 k 外 → 必然不在首位
+  // （评测 sweep_2layer 同语义, 全窗参评）。文件序无关性: 引擎调频与否仅
+  // 影响冷词同分打破（目标卷入 ≤0.05pp 窗, 研究库 §三十三·附 6）。
   const size_t kMaxRerank = (size_t)(g_max_candidates > 0 ? g_max_candidates : 5);
   std::vector<an<Candidate>> tail;
+  std::vector<double> s1_head;   // 层1 分（对齐 candidates_; 无 CE 分回退用）
 
-  size_t n = 0;
-  while (!translation_->exhausted() && n < kMaxRerank) {
-    auto cand = translation_->Peek();
-    if (cand) {
-      candidates_.push_back(cand);
-      n++;
-    }
-    translation_->Next();
-  }
+  std::vector<an<Candidate>> allc;
   while (!translation_->exhausted()) {
     auto cand = translation_->Peek();
     if (cand)
-      tail.push_back(cand);
+      allc.push_back(cand);
     translation_->Next();
+  }
+  if (allc.size() >= 2 && g_loaded.load()) {
+    user_freq_ensure_loaded();
+    user_bi_ensure_loaded();
+    std::vector<size_t> idx(allc.size());
+    std::vector<double> s1(allc.size());
+    for (size_t i = 0; i < allc.size(); i++) {
+      idx[i] = i;
+      s1[i] = g_freq_beta * std::log(1.0 + user_freq_eff(allc[i]->text())) +
+              user_bigram_term(allc[i]->text());
+    }
+    std::stable_sort(idx.begin(), idx.end(),
+                     [&s1](size_t a, size_t b) { return s1[a] > s1[b]; });
+    size_t nk = (std::min)(kMaxRerank, allc.size());
+    for (size_t i = 0; i < nk; i++) {
+      candidates_.push_back(allc[idx[i]]);
+      s1_head.push_back(s1[idx[i]]);
+    }
+    for (size_t i = nk; i < allc.size(); i++)
+      tail.push_back(allc[idx[i]]);
+  } else {
+    // 未加载/单候选: 引擎原序（行为与两层之前一致）
+    for (size_t i = 0; i < allc.size(); i++) {
+      if (i < kMaxRerank)
+        candidates_.push_back(allc[i]);
+      else
+        tail.push_back(allc[i]);
+    }
   }
 
   if (candidates_.size() >= 2 && g_loaded.load()) {
@@ -1972,9 +1997,7 @@ void LlmRerankTranslation::Collect() {
 
     // debug_fusion 块缓冲: 头行先写, 明细在各段补, 末尾统一落盘
     std::vector<std::string> dbg;
-    double dbg_span = 0;
-    bool dbg_span_on = false;
-    std::vector<double> dbg_eb(candidates_.size(), 0.0);
+    std::vector<char> dbg_full(candidates_.size(), 0);
     const bool cache_hit = s_cache_valid && ctx == s_cache_ctx &&
                            input_ == s_cache_input && !s_cache_ranked.empty();
     if (g_debug_fusion) {
@@ -2076,7 +2099,7 @@ void LlmRerankTranslation::Collect() {
     // β=1.5 标定 (本机打字真实候选窗回放, 事前 eff 口径): 真实窗子集
     // β∈[1,2] 平台 +0.38pp, 大 β 为标签偏好假象; 改错数随 β 单调下降
     // (高频首选获自保护)。失败哨兵/缺分不参与融合, 保序排尾。
-    // 应用于评分/缓存顺序之上、expected_length 之前 (与插件版一致);
+    // 应用于评分/缓存顺序之上、两码整句段之前 (与插件版一致);
     // 缓存只存分数序, 融合每次按当前衰减重放。稳定排序保同分原序 (CE 序)。
     std::vector<double> fused_of(candidates_.size(), -1e308);
     if (order.size() > 1) {
@@ -2089,7 +2112,9 @@ void LlmRerankTranslation::Collect() {
                              g_freq_beta * std::log(1.0 + user_freq_eff(
                                                  candidates_[i]->text())) +
                              user_bigram_term(candidates_[i]->text())
-                       : -1e308;  // 失败哨兵/缺分 → 排尾 (v3: + 用户 bigram 项)
+                       : (i < s1_head.size() ? s1_head[i]
+                                             : -1e308);  // 无 CE 分 → 后两项和
+                                                         // （层1 分, 两层语义）
         fused_of[i] = t;
         fused.emplace_back(t, i);
       }
@@ -2103,53 +2128,34 @@ void LlmRerankTranslation::Collect() {
         order.push_back(x.second);
     }
 
-    // expected-length weighting: 加成作用于融合分 (2026-09-03 统一结合公式,
-    // 冷启动标定 elw=0.2): 两码一字方案 L 码对应 floor(L/2) 字 — 词长等于
-    // 期望词长的候选在融合分上加 weight·span (span = 原始有效分跨度);
-    // 修复旧实现按原始分重排导致 ELW 架空词频融合的组成缺陷。失败哨兵/
-    // 缺分候选不得奖励; 任一候选无有效融合分则整体跳过 (与插件版一致)。
-    // 稳定排序: 加权分降序 → 匹配词长优先, 全同分保持原序 (融合序)。
-    if (g_expected_length_weight > 0 && order.size() > 1) {
+    // 两码整句 (two_code_sentence, 2026-11-07 用户定案取代 elw): 词长==
+    // ⌊码长/2⌋ 的候选一组直接优先 (组内融合分降序, 同分稳定保融合序),
+    // 其余按融合分降序——即原 elw 的极限行为 (elw·span 加成→∞),
+    // 不再需要 span 间接量。失败哨兵分排尾部 (与插件版一致)。
+    if (g_two_code_sentence && order.size() > 1) {
       int expected_len = (int)(input_.length() / 2);
-      double lo = 1e300, hi = -1e300;
-      bool all_valid = true;
-      for (int i : order) {
-        if (!has_score[i] || fused_of[i] <= -1e307) {
-          all_valid = false;
-          break;
-        }
-        if (score_of[i] < lo) lo = score_of[i];
-        if (score_of[i] > hi) hi = score_of[i];
-      }
-      double span = hi - lo;
-      if (all_valid && expected_len >= 1 && span > 1e-9) {
-        struct ELItem { double score; bool match; int idx; };
-        std::vector<ELItem> items;
+      if (expected_len >= 1) {
+        struct TCSItem { double score; bool match; int idx; };
+        std::vector<TCSItem> items;
         items.reserve(order.size());
         for (int i : order) {
           bool match = utf8_len(candidates_[i]->text()) == expected_len;
-          double bonus = match ? g_expected_length_weight * span : 0.0;
           if (g_debug_fusion && match)
-            dbg_eb[i] = bonus;
-          items.push_back({fused_of[i] + bonus, match, i});
+            dbg_full[i] = true;
+          items.push_back({fused_of[i], match, i});
         }
         std::stable_sort(items.begin(), items.end(),
-                         [](const ELItem &a, const ELItem &b) {
+                         [](const TCSItem &a, const TCSItem &b) {
+                           if (a.match != b.match) return (int)a.match > (int)b.match;
                            if (a.score != b.score) return a.score > b.score;
-                           return (int)a.match > (int)b.match;
+                           return false;  // stable 保融合序
                          });
         order.clear();
         for (auto &it : items) order.push_back(it.idx);
-        if (g_debug_fusion) {
-          dbg_span = span;
-          dbg_span_on = true;
-        }
-      } else if (g_debug_fusion && !all_valid) {
-        dbg.push_back("  词长段跳过: 存在无效融合分候选");
       }
     }
 
-    // 诊断明细: 逐候选 CE/eff/频+/长+/key 与名次变化 (最终序前 8 个)
+    // 诊断明细: 逐候选 CE/eff/频+/bi+/满长标记/key 与名次变化 (最终序前 8 个)
     if (g_debug_fusion && !order.empty()) {
       std::vector<int> final_rank(candidates_.size(), 0);
       for (size_t k = 0; k < order.size(); k++)
@@ -2162,11 +2168,11 @@ void LlmRerankTranslation::Collect() {
         double bi = has_score[i] ? user_bigram_term(candidates_[i]->text()) : 0;
         char line[320];
         snprintf(line, sizeof(line),
-                 "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f bi+%6.3f 长+%5.2f key=%s"
+                 "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f bi+%6.3f 满=%d key=%s"
                  "  原次序%d→%d",
                  (int)k + 1, candidates_[i]->text().c_str(),
                  dbg_num8(has_score[i] ? score_of[i] : -1e308).c_str(), eff,
-                 fb, bi, dbg_eb[i], dbg_num(fused_of[i] + dbg_eb[i]).c_str(),
+                 fb, bi, (int)dbg_full[i], dbg_num(fused_of[i]).c_str(),
                  ce_rank[i], final_rank[i]);
         dbg.push_back(line);
       }
@@ -2183,8 +2189,6 @@ void LlmRerankTranslation::Collect() {
       }
       dbg.push_back(moved.empty() ? "  名次变化: 无 (CE 序即融合序)"
                                   : "  名次变化: " + moved);
-      if (dbg_span_on)
-        dbg.push_back("  词长span=" + dbg_num(dbg_span));
     }
     if (g_debug_fusion)
       debug_fusion_write(dbg);
@@ -2279,22 +2283,22 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     }
     if (config->GetInt("llm_rerank/min_code_len", &v)) { p.has_min_code_len = true; p.min_code_len = v; }
     if (config->GetInt("llm_rerank/max_code_len", &v)) { p.has_max_code_len = true; p.max_code_len = v; }
-    double dw = 0.0;
-    if (config->GetDouble("llm_rerank/expected_length_weight", &dw) && dw >= 0) { p.has_elw = true; p.elw = dw; }
-    // freq_beta 不再读取（2026-11-05 退出用户配置面 → g_freq_beta=8.0 内置常数；
-    // 方案残留旧行忽略，保存时由 GUI 剥除）
+    // expected_length_weight 不再读取（2026-11-07 由 two_code_sentence 取代；
+    // 方案残留旧行忽略，保存时由 GUI 剥除）。freq_beta 同（2026-11-05）。
     if (config->GetInt("llm_rerank/min_tokens", &v)) { p.has_min_tokens = true; p.min_tokens = v; }
     if (config->GetInt("llm_rerank/max_tokens", &v)) { p.has_max_tokens = true; p.max_tokens = v; }
     if (config->GetInt("llm_rerank/max_candidates", &v)) { p.has_max_cand = true; p.max_cand = v; }
     if (config->GetInt("llm_rerank/cpu_cores", &v)) { p.has_cpu_cores = true; p.cpu_cores = v; }
+    // bool b 复用上方 enabled/debug_fusion 的声明（同作用域）
+    if (config->GetBool("llm_rerank/two_code_sentence", &b)) { p.has_tcs = true; p.two_code_sentence = b; }
     llm_apply_params();
     log_msg("config: enabled=%d code_pattern='%s' (min_code_len=%d max_code_len=%d 旧键不生效) "
-            "expected_length_weight=%.2f freq_beta=%.2f(内置) debug_fusion=%d "
+            "two_code_sentence=%d freq_beta=%.2f(内置) debug_fusion=%d "
             "min_tokens=%d "
             "max_tokens=%d max_candidates=%d cpu_cores=%d "
             "model=%s",
             g_enabled ? 1 : 0, g_code_pattern.c_str(), g_min_code_len, g_max_code_len,
-            g_expected_length_weight, g_freq_beta, g_debug_fusion ? 1 : 0,
+            g_two_code_sentence ? 1 : 0, g_freq_beta, g_debug_fusion ? 1 : 0,
             g_min_tokens,
             g_max_ctx_tokens, g_max_candidates, g_n_threads,
             g_model_path.c_str());

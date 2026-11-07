@@ -49,7 +49,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_CORES        1015
 #define IDC_CODE_PAT     1016   // 编码匹配正则（2026-09-30 取代 min/max_code_len）
 #define IDC_BENCH        1017   // 实测线程数（2026-10-01 用户定案：与插件版同位置）
-#define IDC_ELW          1021
+#define IDC_TCS          1021   // 两码整句（2026-11-07 取代 IDC_ELW 预期词长权重）
 #define IDC_DEBUG        1023
 #define IDC_MAX_CAND     1024
 // 方案接入（2026-09-29 GUI 化，语义同 installer\schema_add.ps1）
@@ -68,7 +68,7 @@ struct Params {
   // min_tokens 不再暴露给用户（2026-09-30 定案：最少上文 token 恒为 1，
   // 代码内默认值保留，yaml/schema 里的旧行读取时忽略、写入时不再产出）
   int max_tokens = 10, cpu_cores = 4;
-  double elw = 0.0;  // 预期词长权重（保留配置项：整句方案长度匹配效应）
+  bool two_code_sentence = false;  // 两码整句：满长组优先（2026-11-07 取代 elw）
   // freq_beta 已删（2026-11-05 标定产物退出用户配置面 → β=12 内置常数，两版统一；
 // v3 2026-11-06 六维联合标定：β12/τ400/γ1/λ0.5 + 用户 bigram 项上线）
   int max_candidates = 5;
@@ -209,7 +209,7 @@ static bool load_legacy_params(Params* p) {
     if (val.empty()) continue;
     if (key == "enabled") p->enabled = (val == "true");
     else if (key == "code_pattern") p->code_pattern = val;
-    else if (key == "expected_length_weight") p->elw = atof(val.c_str());
+    // expected_length_weight 已退役（2026-11-07 → two_code_sentence），不迁移
     else if (key == "max_tokens") p->max_tokens = atoi(val.c_str());
     else if (key == "max_candidates") p->max_candidates = atoi(val.c_str());
     else if (key == "cpu_cores") p->cpu_cores = atoi(val.c_str());
@@ -229,7 +229,7 @@ static bool load_legacy_params(Params* p) {
 // %APPDATA%\Rime\llm_rerank.yaml）----
 // 节内键序与插件版 installer\install_plugin.ps1 的 Get-LlmCfgLines /
 // Update-LlmSection **逐字一致**：enabled / code_pattern / max_tokens /
-// max_candidates / cpu_cores / expected_length_weight /
+// max_candidates / cpu_cores / two_code_sentence /
 // debug_fusion / model_path —— 两版方案配置节相同，仅组件行不同。
 // （freq_beta 已删 2026-11-05：标定产物退出配置面；旧方案残留行读取时忽略）
 static const char* kCfgSection = "llm_rerank:";
@@ -269,8 +269,10 @@ static bool parse_llm_section(const std::vector<std::string>& lines) {
     else if (key == "code_pattern") g_p.code_pattern = val;
     else if (key == "min_code_len" || key == "max_code_len" ||
              key == "min_tokens" || key == "com_context" ||
-             key == "freq_beta") { /* 旧键忽略（freq_beta 2026-11-05 退出配置面） */ }
-    else if (key == "expected_length_weight") g_p.elw = atof(val.c_str());
+             key == "freq_beta" ||
+             key == "expected_length_weight") { /* 旧键忽略（freq_beta 2026-11-05、
+                                                  elw 2026-11-07 退出配置面） */ }
+    else if (key == "two_code_sentence") g_p.two_code_sentence = (val == "true");
     else if (key == "max_tokens") g_p.max_tokens = atoi(val.c_str());
     else if (key == "max_candidates") g_p.max_candidates = atoi(val.c_str());
     else if (key == "cpu_cores") g_p.cpu_cores = atoi(val.c_str());
@@ -290,7 +292,7 @@ static std::vector<std::string> build_llm_section() {
   sprintf_s(buf, "  max_tokens: %d", g_p.max_tokens); sec.push_back(buf);
   sprintf_s(buf, "  max_candidates: %d", g_p.max_candidates); sec.push_back(buf);
   sprintf_s(buf, "  cpu_cores: %d", g_p.cpu_cores); sec.push_back(buf);
-  sprintf_s(buf, "  expected_length_weight: %.2f", g_p.elw); sec.push_back(buf);
+  sec.push_back(g_p.two_code_sentence ? "  two_code_sentence: true" : "  two_code_sentence: false");
   sec.push_back(g_p.debug_fusion ? "  debug_fusion: true" : "  debug_fusion: false");
   if (!g_p.model_path.empty()) {
     std::string p = wide_to_utf8(g_p.model_path);
@@ -1022,11 +1024,8 @@ static void ui_to_params() {
       if (*p < 128) pat += (char)*p;
     g_p.code_pattern = trim(pat);
   }
-  struct { int id; double* v; } dbls[] = {{IDC_ELW, &g_p.elw}};
-  for (auto& r : dbls) {
-    GetDlgItemTextW(g_hwnd, r.id, buf, 64);
-    *r.v = wcstod(buf, NULL);
-  }
+  g_p.two_code_sentence =
+      SendMessageW(GetDlgItem(g_hwnd, IDC_TCS), BM_GETCHECK, 0, 0) == BST_CHECKED;
   GetDlgItemTextW(g_hwnd, IDC_MODEL, buf, 512);
   std::wstring def = default_model_path();
   g_p.model_path = (wcscmp(buf, def.c_str()) == 0) ? std::wstring() : buf;
@@ -1039,9 +1038,10 @@ static std::wstring g_ui_sig;
 static std::wstring ui_signature() {
   std::wstring s;
   s += SendMessageW(GetDlgItem(g_hwnd, IDC_ENABLED), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
+  s += SendMessageW(GetDlgItem(g_hwnd, IDC_TCS), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
   s += SendMessageW(GetDlgItem(g_hwnd, IDC_DEBUG), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
   const int ids[] = {IDC_MODEL,   IDC_CODE_PAT, IDC_MAX_TOK, IDC_MAX_CAND,
-                     IDC_CORES,   IDC_ELW};
+                     IDC_CORES};
   wchar_t buf[512];
   for (int id : ids) {
     buf[0] = 0;
@@ -1068,8 +1068,8 @@ static void params_to_ui() {
     swprintf_s(buf, L"%d", r.v);
     SetDlgItemTextW(g_hwnd, r.id, buf);
   }
-  swprintf_s(buf, L"%.2f", g_p.elw);
-  SetDlgItemTextW(g_hwnd, IDC_ELW, buf);
+  SendMessageW(GetDlgItem(g_hwnd, IDC_TCS), BM_SETCHECK,
+               g_p.two_code_sentence ? BST_CHECKED : BST_UNCHECKED, 0);
   scan_models(GetDlgItem(g_hwnd, IDC_MODEL));
   refresh_model_status();
   g_ui_sig = ui_signature();   // 脏标记基准（打开下拉是否重读当前文件）
@@ -1198,13 +1198,13 @@ static const wchar_t* const TIP_BENCH =
     L"约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。";
 // TIP_BETA 已删（2026-11-05：用户词频权重 β 退出用户配置面 → FREQ_BETA=12 内置
 // 常数，与 τ 同待遇——用户没有标定能力；方案残留旧行保存时剥除）
-static const wchar_t* const TIP_ELW =
-    L"预期词长权重 elw（默认 0，0 = 关闭）。\n"
-    L"融合分 = CE 分 + β·log(1+词频计数) + log(0.5·p2+0.5·p1) + elw·词长加成\n"
-    L"两码一字整句方案：长编码切词拼接的候选里使 floor(码长/2) 字的长词优先，\n"
-    L"又不直接优先最长词（1~2 码简码存在，不应压到字前面）。\n"
-    L"定长方案（双拼/五笔/郑码）冷启动可试 0.2；一般保持 0。\n"
-    L"注：词频权重 β 与 bigram 项 γ/λ 均为内置常数 12/1/0.5（v3 六维联合标定 2026-11-06 起不提供配置）。";
+// TIP_ELW 已删（2026-11-07：预期词长权重 elw 退役 → two_code_sentence 开关）
+static const wchar_t* const TIP_TCS =
+    L"两码整句 two_code_sentence（默认关闭）。\n"
+    L"开启后（双拼/五笔/郑码等两码一字整句方案）：词长恰为\n"
+    L"floor(码长/2) 字的候选作为一组直接优先（组内按融合分），\n"
+    L"其余候选按融合分排后——整句方案的满句长候选优先。\n"
+    L"一般字词方案保持关闭。取代原预期词长权重 elw（2026-11-07）。";
 static const wchar_t* const TIP_DEBUG =
     L"诊断日志：开启后每次重排都往用户文件夹写 rime_llm_debug.txt\n"
     L"（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。";
@@ -1321,18 +1321,18 @@ static void make_ui() {
   }
   y += ts(10);
 
-  // ═══ 推理规模 + 候选排序融合：四个参数各一行，标签列用同一个实测宽度
-  // （2026-09-30 第二次定案：融合分不再平铺公式——两个权重按普通配置项列出，
-  //  公式移进「?」悬停说明；2026-11-05 用户定案：删「用户词频权重」行——
-  //  freq_beta 为标定产物退出配置面 → FREQ_BETA=8 内置常数）═══
+  // ═══ 推理规模：三个参数各一行，标签列用同一个实测宽度
+  // （2026-09-30 第二次定案：融合分不再平铺公式——公式移进「?」悬停说明；
+  //  2026-11-05 用户定案：删「用户词频权重」行——freq_beta 为标定产物退出
+  //  配置面 → FREQ_BETA=12 内置常数；2026-11-07 用户定案：「预期词长权重」
+  //  行退役 → 「候选排序融合」组只剩「两码整句」复选框）═══
   {
     struct { const wchar_t* label; int id; const wchar_t* tip; } rows[] = {
         {L"上文 token 上限:", IDC_MAX_TOK, TIP_MAX_TOK},
         {L"参与打分的候选数:", IDC_MAX_CAND, TIP_MAX_CAND},
-        {L"CPU 线程数:", IDC_CORES, TIP_CORES},
-        {L"预期词长权重:", IDC_ELW, TIP_ELW}};
+        {L"CPU 线程数:", IDC_CORES, TIP_CORES}};
     int lw = 0;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 3; ++i) {
       int w = tw(rows[i].label, g_font);
       if (w > lw) lw = w;
     }
@@ -1352,8 +1352,13 @@ static void make_ui() {
     y += ts(10);
 
     gy = y; y += ts(26);
-    for (int i = 3; i < 4; ++i)
-      row_input(y, lw, rows[i].label, rows[i].id, 64, 0, rows[i].tip, HX);
+    HWND cb = mk(0, L"两码整句 two_code_sentence",
+                 BS_AUTOCHECKBOX | WS_TABSTOP, PAD + ts(12), y + ts(2),
+                 tw(L"两码整句 two_code_sentence", g_font) + ts(26), ts(22),
+                 IDC_TCS);
+    tip_add(cb, TIP_TCS);
+    mk_help(HX, y + ts(4), TIP_TCS);
+    y += ts(30);
     mk_group(L"候选排序融合", PAD, gy, CW, y - gy + ts(8));
   }
   y += ts(12);
