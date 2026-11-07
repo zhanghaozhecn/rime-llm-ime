@@ -992,7 +992,7 @@ static bool user_bi_file(char *path, size_t n) {
   if (api && api->get_user_data_dir) {
     const char *ud = api->get_user_data_dir();
     if (ud && *ud) {
-      snprintf(path, n, "%s\user_bigram.tsv", ud);
+      snprintf(path, n, "%s\\user_bigram.tsv", ud);
       return true;
     }
   }
