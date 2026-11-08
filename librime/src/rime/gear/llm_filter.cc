@@ -971,18 +971,18 @@ static double user_freq_eff(const std::string &w) {
          exp((double)(it->second.tick - g_user_tick) / kFreqTau);
 }
 
-// ── 用户 bigram 计数 (v3 2026-11-06 六维联合标定: γ=1, λ=0.5) ──
-// 融合项 = log(0.5·p2+0.5·p1) [fired=bi[h2,x] 见过] / log(0.5·p1) [未 fired];
-// p1 = (uni[x]+1)/(n_seen+20000), p2 = bi[h2,x]/c1[h2]。与插件版
-// llm_processor.lua 同格式同文件 user_bigram.tsv (两版共用, user_freq.tsv 先例)。
+// ── 用户累计 Unigram 计数 (v3 2026-11-06; 累计 Bigram 退役 2026-11-08) ──
+// 融合项 = log(0.5·p1);  p1 = (uni[x]+1)/(n_seen+20000)。
+// （曾配套累计 Bigram 项 log(0.5·p2+0.5·p1)——cohort 生产量级评测实证其在
+//   真实用户龄仅 fired ~2%、剔除零损失（研究库 §三十七），2026-11-08 退役：
+//   停记 b 行、查询只剩 p1；旧 user_bigram.tsv 里的 b 行读取时忽略。）
+// 与插件版 llm_processor.lua 同格式同文件 user_bigram.tsv (两版共用,
+// user_freq.tsv 先例; 文件名历史沿用)。
 // 只计含中文字符的词 (字节级 CJK 判定, 比插件 utf8 精确判定略宽, 可忽略);
-// h2 = 上一个中文提交词; **原始计数不衰减** (标定语义), 冷启动自然回退。
-// 存储: 首行 "#n=N", 行 "u	词	次数" / "b	前词	词	次数"; c1 载入合计。
+// **原始计数不衰减** (标定语义), 冷启动自然回退。
+// 存储: 首行 "#n=N", 行 "u	词	次数"。
 static std::map<std::string, long long> g_user_uni;
-static std::map<std::string, long long> g_user_bi;   // key = "前词	词"
-static std::map<std::string, long long> g_user_c1;
 static long long g_user_nseen = 0;
-static std::string g_last_cjk;
 static bool g_user_bi_loaded = false;
 static int  g_user_bi_dirty = 0;
 static constexpr int kBigramVcap = 20000;
@@ -1044,12 +1044,8 @@ static void user_bi_ensure_loaded() {
     long long cnt = atoll(t3 ? t3 + 1 : t2 + 1);
     if (line[0] == 'u') {
       g_user_uni[std::string(t1 + 1)] = cnt;
-    } else if (line[0] == 'b' && t3) {
-      *t3 = 0;
-      std::string key = std::string(t1 + 1) + "\t" + std::string(t2 + 1);
-      g_user_bi[key] = cnt;
-      g_user_c1[std::string(t1 + 1)] += cnt;
     }
+    // 旧版 b 行: 累计 Bigram 已退役, 忽略
   }
   fclose(f);
 }
@@ -1064,14 +1060,6 @@ static void user_bi_save() {
   fprintf(f, "#n=%lld\n", g_user_nseen);
   for (auto &kv : g_user_uni)
     fprintf(f, "u\t%s\t%lld\n", kv.first.c_str(), kv.second);
-  for (auto &kv : g_user_bi) {
-    std::string key = kv.first;
-    size_t tab = key.find('\t');
-    if (tab == std::string::npos)
-      continue;
-    fprintf(f, "b\t%s\t%s\t%lld\n", key.substr(0, tab).c_str(),
-            key.substr(tab + 1).c_str(), kv.second);
-  }
   fclose(f);
 }
 
@@ -1081,32 +1069,21 @@ static void user_bi_bump(const std::string &w) {
     return;
   ++g_user_nseen;
   ++g_user_uni[w];
-  if (!g_last_cjk.empty()) {
-    std::string key = g_last_cjk + "\t" + w;
-    ++g_user_bi[key];
-    ++g_user_c1[g_last_cjk];
-  }
-  g_last_cjk = w;
   if (++g_user_bi_dirty >= 20) {
     user_bi_save();
     g_user_bi_dirty = 0;
   }
 }
 
-// 融合项查询: fired = bi[h2,x]>0 且 c1[h2]>0
-static double user_bigram_term(const std::string &x) {
+// 融合项查询: 用户累计 Unigram 项
+// δ=1（log p1）：cohort 终审 2026-11-08（大词典链 12 万窗 GPU 宇宙）——
+// (β=12, δ=1) 全 6 龄距档内 argmax ≤0.06pp、5/6 龄优于旧尺度 δ=0.5；
+// 用户域（llm_training 真实词流）独立互证方向（旧 log(0.5·p1) 是 δ=0.5）
+static double user_unigram_term(const std::string &x) {
   user_bi_ensure_loaded();
   double p1 = (double)((g_user_uni.count(x) ? g_user_uni[x] : 0) + 1)
               / (double)(g_user_nseen + kBigramVcap);
-  if (!g_last_cjk.empty()) {
-    auto cc = g_user_c1.find(g_last_cjk);
-    if (cc != g_user_c1.end() && cc->second > 0) {
-      auto b = g_user_bi.find(g_last_cjk + "\t" + x);
-      if (b != g_user_bi.end() && b->second > 0)
-        return log(0.5 * (double)b->second / (double)cc->second + 0.5 * p1);
-    }
-  }
-  return log(0.5 * p1);
+  return log(p1);
 }
 
 static void user_freq_save() {
@@ -1921,7 +1898,7 @@ an<Candidate> LlmRerankTranslation::Peek() {
 }
 
 void LlmRerankTranslation::Collect() {
-  // v3 两层重排 (2026-11-07 用户定案): 层1 = 全体候选 eff+bigram 打分稳定
+  // v3 两层重排 (2026-11-07 用户定案): 层1 = 全体候选 eff+累计Unigram 打分稳定
   // 降序（同分保引擎序）→ 前 max_candidates 进 LLM 评分（层2 三项融合重排,
   // 在下方融合块）, 其余按层1 序透传。目标在层1 前 k 外 → 必然不在首位
   // （评测 sweep_2layer 同语义, 全窗参评）。文件序无关性: 引擎调频与否仅
@@ -1945,7 +1922,7 @@ void LlmRerankTranslation::Collect() {
     for (size_t i = 0; i < allc.size(); i++) {
       idx[i] = i;
       s1[i] = g_freq_beta * std::log(1.0 + user_freq_eff(allc[i]->text())) +
-              user_bigram_term(allc[i]->text());
+              user_unigram_term(allc[i]->text());
     }
     std::stable_sort(idx.begin(), idx.end(),
                      [&s1](size_t a, size_t b) { return s1[a] > s1[b]; });
@@ -2111,7 +2088,7 @@ void LlmRerankTranslation::Collect() {
                        ? score_of[i] +
                              g_freq_beta * std::log(1.0 + user_freq_eff(
                                                  candidates_[i]->text())) +
-                             user_bigram_term(candidates_[i]->text())
+                             user_unigram_term(candidates_[i]->text())
                        : (i < s1_head.size() ? s1_head[i]
                                              : -1e308);  // 无 CE 分 → 后两项和
                                                          // （层1 分, 两层语义）
@@ -2155,7 +2132,7 @@ void LlmRerankTranslation::Collect() {
       }
     }
 
-    // 诊断明细: 逐候选 CE/eff/频+/bi+/满长标记/key 与名次变化 (最终序前 8 个)
+    // 诊断明细: 逐候选 CE/eff/频+/u1+/满长标记/key 与名次变化 (最终序前 8 个)
     if (g_debug_fusion && !order.empty()) {
       std::vector<int> final_rank(candidates_.size(), 0);
       for (size_t k = 0; k < order.size(); k++)
@@ -2165,14 +2142,14 @@ void LlmRerankTranslation::Collect() {
         int i = order[k];
         double eff = has_score[i] ? user_freq_eff(candidates_[i]->text()) : 0;
         double fb = has_score[i] ? g_freq_beta * std::log1p(eff) : 0;
-        double bi = has_score[i] ? user_bigram_term(candidates_[i]->text()) : 0;
+        double u1 = has_score[i] ? user_unigram_term(candidates_[i]->text()) : 0;
         char line[320];
         snprintf(line, sizeof(line),
-                 "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f bi+%6.3f 满=%d key=%s"
+                 "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f u1+%6.3f 满=%d key=%s"
                  "  原次序%d→%d",
                  (int)k + 1, candidates_[i]->text().c_str(),
                  dbg_num8(has_score[i] ? score_of[i] : -1e308).c_str(), eff,
-                 fb, bi, (int)dbg_full[i], dbg_num(fused_of[i]).c_str(),
+                 fb, u1, (int)dbg_full[i], dbg_num(fused_of[i]).c_str(),
                  ce_rank[i], final_rank[i]);
         dbg.push_back(line);
       }

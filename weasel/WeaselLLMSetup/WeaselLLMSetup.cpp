@@ -70,7 +70,8 @@ struct Params {
   int max_tokens = 10, cpu_cores = 4;
   bool two_code_sentence = false;  // 两码整句：满长组优先（2026-11-07 取代 elw）
   // freq_beta 已删（2026-11-05 标定产物退出用户配置面 → β=12 内置常数，两版统一；
-// v3 2026-11-06 六维联合标定：β12/τ400/γ1/λ0.5 + 用户 bigram 项上线）
+// v3 2026-11-06 六维联合标定：β12/τ400；用户 bigram 项 2026-11-08 退役，
+// 融合项只剩累计 Unigram log(0.5·p1)）
   int max_candidates = 5;
   bool debug_fusion = false;
   std::wstring model_path;  // 显示值（空 = 默认路径）
