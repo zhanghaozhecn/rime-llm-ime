@@ -69,6 +69,12 @@ void WeaselServerApp::SetupMenuHandlers() {
   m_server.AddMenuHandler(
       ID_WEASELTRAY_LLM_SETUP,
       std::bind(execute, dir / L"WeaselLLMSetup.exe", std::wstring()));
+  // LLM 实时调试窗口（2026-11-10）：连接 \\.\pipe\rime_llm_live 显示上文
+  // 来源/内容与逐候选分数（数据流由方案 debug_fusion 开关驱动）。
+  // TSF 语言栏的同名菜单项经 default TrayCommand IPC 转发到这里（同一处理）
+  m_server.AddMenuHandler(
+      ID_WEASELTRAY_LLM_DEBUG,
+      std::bind(execute, dir / L"WeaselLLMDebug.exe", std::wstring()));
   m_server.AddMenuHandler(ID_WEASELTRAY_WIKI,
                           std::bind(open, L"https://rime.im/docs/"));
   m_server.AddMenuHandler(ID_WEASELTRAY_HOMEPAGE,

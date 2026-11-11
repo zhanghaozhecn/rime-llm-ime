@@ -34,7 +34,7 @@ Write-Host "+ bench_threads.exe ← 插件版 bin\（规范源）"
 foreach ($f in @("rime.dll", "WeaselServer.exe", "WeaselDeployer.exe",
                  "weaselx64.dll", "weasel32.dll", "opencc.dll", "vcomp140.dll",
                  "WeaselLLMSetup.exe", "WeaselSetup.exe", "WinSparkle.dll",
-                 "bench_threads.exe")) {
+                 "bench_threads.exe", "WeaselLLMDebug.exe")) {
   $s = Join-Path $SourceBin $f
   if (Test-Path $s) { Copy-Item $s $dst -Force; Write-Host "+ $f" }
   else { Write-Host "MISS $f" -ForegroundColor Yellow }

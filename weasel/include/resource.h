@@ -28,6 +28,7 @@
 #define ID_WEASELTRAY_RERUN_SERVICE     40015
 #define ID_WEASELTRAY_LOGDIR            40016
 #define ID_WEASELTRAY_LLM_SETUP         40017
+#define ID_WEASELTRAY_LLM_DEBUG         40018
 
 // Next default values for new objects
 //

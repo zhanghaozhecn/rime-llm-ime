@@ -1245,6 +1245,140 @@ static std::string dbg_num8(double v) {
 }
 
 // ============================================================
+// 实时调试管道 rime_llm_live（2026-11-10，与插件版 rime_llm.cpp 同协议）：
+// debug_fusion 开时把 V/L/C/S/E/R 行协议广播给外部查看器
+// （WeaselLLMDebug.exe）。行语义见查看器源头部注释。设计约束：
+//   - 懒启动：首次 live_send 才起接纳线程（debug_fusion 关 = 零开销）
+//   - 广播带 50ms 超时（overlapped WriteFile）——查看器卡死/断开即踢，
+//     绝不阻塞打字路径；无连接 = 一次 mutex + 空列表遍历
+//   - rime.dll 随 WeaselServer 进程生命周期加载，接纳线程不设停机
+// 仅 Windows（其余平台 live_send 为空实现）。
+// ============================================================
+#ifdef _WIN32
+static const char *kLivePipeName = "\\\\.\\pipe\\rime_llm_live";
+static const char *kLiveProtoDate = "2026-11-10";
+
+static std::mutex g_live_mu;
+static std::vector<HANDLE> g_live_clients;
+static std::atomic<bool> g_live_started{false};
+
+// 单句柄单次写：overlapped + 50ms 超时（超时/失败由调用方踢客户端）
+static bool live_write_raw(HANDLE h, const std::string &s) {
+  OVERLAPPED ov = {};
+  ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+  if (!ov.hEvent)
+    return false;
+  bool ok = false;
+  BOOL pending = WriteFile(h, s.data(), (DWORD)s.size(), NULL, &ov);
+  if (pending || GetLastError() == ERROR_IO_PENDING) {
+    DWORD written = 0;
+    if (GetOverlappedResultEx(h, &ov, &written, 50, FALSE))
+      ok = true;
+    else
+      CancelIo(h);
+  }
+  CloseHandle(ov.hEvent);
+  return ok;
+}
+
+static void live_drop_client(HANDLE h) {
+  DisconnectNamedPipe(h);
+  CloseHandle(h);
+}
+
+// 接纳线程：每次建一个管道实例阻塞等连接，连上即推 V 行并加入客户端
+// 列表，随后建下一实例。上限 8 个并发查看器。
+static void live_thread_proc() {
+  for (;;) {
+    HANDLE h = CreateNamedPipeA(kLivePipeName,
+                                PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
+                                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                                8, 64 * 1024, 64 * 1024, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+      Sleep(2000);
+      continue;
+    }
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!ov.hEvent) {
+      CloseHandle(h);
+      Sleep(2000);
+      continue;
+    }
+    BOOL conn = ConnectNamedPipe(h, &ov);
+    if (!conn && GetLastError() == ERROR_IO_PENDING)
+      conn = WaitForSingleObject(ov.hEvent, INFINITE) == WAIT_OBJECT_0;
+    BOOL connected = conn || GetLastError() == ERROR_PIPE_CONNECTED;
+    CloseHandle(ov.hEvent);
+    if (!connected) {
+      CloseHandle(h);
+      Sleep(500);
+      continue;
+    }
+    std::string hello =
+        std::string("V|rime-llm-live|1|source|") + kLiveProtoDate + "\n";
+    if (live_write_raw(h, hello)) {
+      std::lock_guard<std::mutex> lk(g_live_mu);
+      g_live_clients.push_back(h);
+    } else {
+      live_drop_client(h);
+    }
+  }
+}
+
+static void live_broadcast(const std::string &line) {
+  bool f = false;
+  if (g_live_started.compare_exchange_strong(f, true))
+    std::thread(live_thread_proc).detach();
+  std::string s = line + "\n";
+  std::lock_guard<std::mutex> lk(g_live_mu);
+  for (auto it = g_live_clients.begin(); it != g_live_clients.end();) {
+    if (live_write_raw(*it, s))
+      ++it;
+    else {
+      live_drop_client(*it);
+      it = g_live_clients.erase(it);
+    }
+  }
+}
+
+// 行发送入口：debug_fusion 门控（与 rime_llm_debug.txt 同开关）
+static void live_send(const std::string &line) {
+  if (!g_debug_fusion || line.empty())
+    return;
+  live_broadcast(line);
+}
+#else
+static void live_send(const std::string &) {}  // non-Windows: no-op
+#endif  // _WIN32
+
+// 自由文本字段转义：| → 全角｜、换行 → 空格（行协议字段分隔符保护，
+// 与插件版 lua live_esc 一致）
+static std::string live_esc(const std::string &s) {
+  std::string r;
+  r.reserve(s.size());
+  for (char c : s) {
+    if (c == '|') {
+      r += "\xEF\xBD\x9C";  // ｜ (U+FF5C)
+    } else if (c == '\n' || c == '\r') {
+      r += ' ';
+    } else {
+      r += c;
+    }
+  }
+  return r;
+}
+
+// 数值字段：有限 → %.3f；否则空串（"无分"标记，与协议约定一致）
+static std::string live_num(double v) {
+  if (!(v == v) || v <= -1e307)
+    return "";
+  char b[32];
+  snprintf(b, sizeof(b), "%.3f", v);
+  return b;
+}
+
+// ============================================================
 // async model loading (non-blocking for the IME)
 // ============================================================
 static void load_model_async() {
@@ -1935,6 +2069,9 @@ void LlmRerankTranslation::Collect() {
       tail.push_back(allc[idx[i]]);
   } else {
     // 未加载/单候选: 引擎原序（行为与两层之前一致）
+    live_send(now_hms() + std::string("|S|") +
+              (allc.size() < 2 ? "few_candidates" : "model_loading") + "|" +
+              live_esc(input_) + "|" + src_);
     for (size_t i = 0; i < allc.size(); i++) {
       if (i < kMaxRerank)
         candidates_.push_back(allc[i]);
@@ -1957,11 +2094,14 @@ void LlmRerankTranslation::Collect() {
     if (gen != s_cache_gen) {
       // 插件版在 processor 编辑键回调记 reset 行; 源码版无 lua 层, 在下次
       // Collect 见到代次变化时补记 (首块 s_cache_gen=-1 不记, 免启动噪音)
-      if (g_debug_fusion && s_cache_gen != -1)
+      if (g_debug_fusion && s_cache_gen != -1) {
         debug_fusion_write({now_hms() + "|reset|代次 " +
                             std::to_string(s_cache_gen) + "→" +
                             std::to_string(gen) +
                             " → 上文重置+缓存清空 (编辑键/切窗)"});
+        live_send(now_hms() + "|R|代次 " + std::to_string(s_cache_gen) + "→" +
+                  std::to_string(gen) + " (编辑键/切窗)");
+      }
       s_cache_valid = false;
       s_cache_gen = gen;
     }
@@ -2053,12 +2193,15 @@ void LlmRerankTranslation::Collect() {
           did_score = true;
         } else if (g_debug_fusion) {
           dbg.push_back("  评分异常: scores 数组长度不符 (推理失败)");
+          live_send(now_hms() + "|S|score_failed|" + live_esc(input_) + "|" +
+                    src_);
         }
       } else if (g_debug_fusion) {
         dbg.push_back("  score=nil (ctx tokens " +
                       std::to_string((int)ctx_ids.size()) +
                       " < min_tokens " + std::to_string(g_min_tokens) +
                       " — 上文空/过短跳过)");
+        live_send(now_hms() + "|S|ctx_short|" + live_esc(input_) + "|" + src_);
       }
     }
 
@@ -2167,6 +2310,61 @@ void LlmRerankTranslation::Collect() {
       dbg.push_back(moved.empty() ? "  名次变化: 无 (CE 序即融合序)"
                                   : "  名次变化: " + moved);
     }
+    // 实时调试 C 行（2026-11-10）：窗口候选按最终序（ce/fused/cerank 取自
+    // 重排状态）+ 层1 尾窗透传（win=0，无 CE 分），上限 20 行。
+    // order 空时（评分整体失败）窗口按引擎序全 win=1 无分。
+    // L 头行也在此发（评分/融合后 ev_ms 才是终值；HIT 时为 0）。
+    if (g_debug_fusion) {
+      char msb[16];
+      snprintf(msb, sizeof(msb), "%.0f", ev_ms);
+      live_send(std::string("L|") + now_hms() + "|" + live_esc(input_) + "|" +
+                (cache_hit ? "HIT" : "MISS") + "|" + src_ + "|" +
+                live_esc(ctx) + "|" + std::to_string((long long)g_user_tick) +
+                "|" + msb + "|1|" +
+                std::to_string((int)candidates_.size()));
+      user_freq_ensure_loaded();
+      std::map<std::string, int> eng_rank;  // 引擎原序（首现位置）
+      for (size_t i = 0; i < allc.size(); i++)
+        if (!eng_rank.count(allc[i]->text()))
+          eng_rank[allc[i]->text()] = (int)i + 1;
+      int emitted = 0;
+      auto live_c = [&](const an<Candidate> &c, const std::string &ce,
+                        const std::string &fused, int cerank, int fin,
+                        int full, int win) {
+        if (emitted >= 20)
+          return;
+        emitted++;
+        double eff = user_freq_eff(c->text());
+        double fb = g_freq_beta * std::log1p(eff);
+        double u1 = user_unigram_term(c->text());
+        auto er = eng_rank.find(c->text());
+        live_send("C|" +
+                  std::to_string(er != eng_rank.end() ? er->second : 0) +
+                  "|" + live_esc(c->text()) + "|" + live_num(fb + u1) + "|" +
+                  ce + "|" + live_num(fb) + "|" + live_num(u1) + "|" + fused +
+                  "|" + std::to_string(full) + "|" + std::to_string(cerank) +
+                  "|" + std::to_string(fin) + "|" + std::to_string(win));
+      };
+      if (!order.empty()) {
+        std::vector<int> fin_rank(candidates_.size(), 0);
+        for (size_t k = 0; k < order.size(); k++)
+          fin_rank[(size_t)order[k]] = (int)k + 1;
+        for (int i : order)
+          live_c(candidates_[(size_t)i],
+                 has_score[(size_t)i] ? live_num(score_of[(size_t)i]) : "",
+                 live_num(fused_of[(size_t)i]), ce_rank[(size_t)i],
+                 fin_rank[(size_t)i], dbg_full[(size_t)i] ? 1 : 0, 1);
+        int base = (int)candidates_.size();
+        for (size_t j = 0; j < tail.size(); j++)
+          live_c(tail[j], "", "", 0, base + (int)j + 1, 0, 0);
+      } else {
+        for (size_t i = 0; i < candidates_.size(); i++)
+          live_c(candidates_[i], "", "", 0, (int)i + 1, 0, 1);
+        int base = (int)candidates_.size();
+        for (size_t j = 0; j < tail.size(); j++)
+          live_c(tail[j], "", "", 0, base + (int)j + 1, 0, 0);
+      }
+    }
     if (g_debug_fusion)
       debug_fusion_write(dbg);
 
@@ -2190,21 +2388,9 @@ void LlmRerankTranslation::Collect() {
         if (!used[i])
           reranked.push_back(candidates_[i]);
       candidates_ = std::move(reranked);
-      // AI 首选徽章: 重排后首候选 comment 追加来源标记 (与已有 comment 合并,
-      // ShadowCandidate 包装避免污染原候选; weasel 端识别 "AI·" 用强调色渲染)
-      if (!candidates_.empty()) {
-        // 来源标记: tsf = TSF 光标前文; com = COM 文档模型旁路 (WPS 类受限
-        // 应用, 2026-09-10); 其余 = 历史上屏记录。weasel 端按 "AI·" 前缀
-        // 统一强调渲染, 徽章文案区分来源。
-        std::string tag = (src_ == "tsf")   ? "AI·TSF"
-                          : (src_ == "com") ? "AI·COM"
-                                            : "AI·历史";
-        auto &c0 = candidates_[0];
-        std::string merged =
-            c0->comment().empty() ? tag : c0->comment() + " " + tag;
-        candidates_[0] =
-            New<ShadowCandidate>(c0, c0->type(), string(), merged, false);
-      }
+      // AI 首选徽章已删（2026-11-10 用户定案：实时调试窗口上线——上文来源/
+      // 内容与逐候选分数都在调试窗口看，候选窗保持干净、不再动 comment；
+      // weasel 端 "AI·" 强调渲染保留为无害死代码）
       // 事件日志仅在真实推理时写 (缓存命中不重复推理, 也省日志 IO)
       if (did_score) {
         std::string after;
@@ -2390,6 +2576,12 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
                user_freq_eff(commit_text), tick_before, (long long)g_user_tick,
                dirty_before);
       debug_fusion_write({line});
+      // 实时调试 E 行（2026-11-10）：commit 落账（eff/tick 前后值）
+      live_send(now_hms() + "|E|" + live_esc(commit_text) + "|" +
+                live_num(eff_before) + "|" +
+                live_num(user_freq_eff(commit_text)) + "|" +
+                std::to_string(tick_before) + "|" +
+                std::to_string((long long)g_user_tick));
     }
   } else {
     user_freq_bump(commit_text);
@@ -2666,8 +2858,13 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
     if (!g_code_pattern.empty()) {
       matched = g_code_re_ok && boost::regex_match(code, g_code_re);
     }
-    if (!matched)
+    if (!matched) {
+      // 实时调试（2026-11-10）：跳过原因 S 行——"为什么没触发"是调试窗口
+      // 的主要用途之一（pattern / ctx_empty / model_loading / few_candidates）
+      live_send(now_hms() + "|S|pattern|" +
+                live_esc(engine_->context()->input()) + "|-");
       return translation;  // code outside code_pattern
+    }
   }
 
   // context source: TSF caret text, or commit history fallback
@@ -2677,11 +2874,16 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
     log_msg("Apply: ctx empty (src=%s input=[%s] len=%d) -> no rerank",
             src.c_str(), engine_->context()->input().c_str(),
             (int)engine_->context()->input().size());
+    live_send(now_hms() + "|S|ctx_empty|" +
+              live_esc(engine_->context()->input()) + "|" + src);
     return translation;  // no context, keep original order
   }
 
-  if (!g_loaded.load())
+  if (!g_loaded.load()) {
+    live_send(now_hms() + "|S|model_loading|" +
+              live_esc(engine_->context()->input()) + "|" + src);
     return translation;  // model still loading, keep original order
+  }
 
   return New<LlmRerankTranslation>(translation, engine_->context()->input(),
                                    ctx, src);
