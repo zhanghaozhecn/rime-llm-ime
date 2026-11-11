@@ -297,16 +297,16 @@ static std::wstring ce_proc(const Row &r, int wl, int wc) {
   return t + L")";
 }
 
-// 衰减词频分格：β·log(1+eff)，β=12 内置常数
+// 衰减词频分格：β·ln(1+eff)，β=12 内置常数（log/ln = 自然对数）
 static std::wstring fb_proc(const Row &r, int wl, int we) {
   double fb, eff;
   if (!num_of(r.fb, fb)) return L"—";
   std::wstring lead = padl(f3(fb), wl);
   if (!num_of(r.eff, eff)) return lead;
-  return lead + L"=12·log(1+" + padl(f2(eff), we) + L")";
+  return lead + L"=12·ln(1+" + padl(f2(eff), we) + L")";
 }
 
-// 累计词频格：log(uni+1)（2026-11-11 公式简化，分母为窗内常数已去除）
+// 累计词频格：ln(uni+1)（2026-11-11 公式简化，分母为窗内常数已去除）
 static std::wstring u1_proc(const Row &r, int wl, int wu) {
   double u1, uni;
   if (!num_of(r.u1, u1)) return L"—";
@@ -314,7 +314,7 @@ static std::wstring u1_proc(const Row &r, int wl, int wu) {
   if (!num_of(r.uni, uni)) return lead;
   wchar_t ub[16], b[48];
   swprintf(ub, 16, L"%d", (int)uni);
-  swprintf(b, 48, L"=log(%s+1)", padl(ub, wu).c_str());
+  swprintf(b, 48, L"=ln(%s+1)", padl(ub, wu).c_str());
   return lead + b;
 }
 
