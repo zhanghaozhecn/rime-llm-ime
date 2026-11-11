@@ -268,9 +268,9 @@ static void update_current() {
   const Inv &inv = g_invs[g_view];
   wchar_t line[512];
   swprintf(line, 512,
-           L"%s  输入 %s   评缓 %s   预解 %s   %sms   tick %s   就绪 %s"
+           L"%s  输入 %s   预解 %s   %sms   tick %s   就绪 %s"
            L"   n=%s   来源 %s",
-           inv.t.c_str(), inv.input.c_str(), inv.cache.c_str(),
+           inv.t.c_str(), inv.input.c_str(),
            inv.prep.empty() ? L"-" : inv.prep.c_str(), inv.ms.c_str(),
            inv.tick.c_str(), inv.ready.c_str(), inv.n.c_str(),
            inv.src.c_str());
@@ -452,7 +452,7 @@ static void make_ui() {
   // 列（2026-11-11 协议 v2）：频两项 = 原始值（衰减频=eff 衰减计数、
   // 累计频=累计 unigram 原始计数）；CE 列加宽到 118 容纳展开的 c1/c2/c3
   struct { const wchar_t *t; int w; } cols[] = {
-      {L"#", 24}, {L"词", 58}, {L"CE", 126}, {L"层1", 56}, {L"衰减频", 56},
+      {L"#", 24}, {L"词", 58}, {L"CE", 126}, {L"用户频", 56}, {L"衰减频", 56},
       {L"累计频", 54}, {L"融合", 64}, {L"满", 28}, {L"序变", 48},
       {L"窗内", 46}};
   LVCOLUMNW col = {};
@@ -476,18 +476,18 @@ static void make_ui() {
   // 层1/满/展开说明；点 CE 格展开 CE1/2/3）
   mk_ctl(L"STATIC",
          L"融合分 = CE + β·log(1+衰减频) + log(p1)，β=12；"
-         L"p1=(累计频+1)/(全词数+2万)；层1 = β·log(1+衰减频)+log(p1)",
+         L"p1=(累计频+1)/(全词数+2万)；用户频 = β·log(1+衰减频)+log(p1)",
          SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 512, 764, 16, IDC_FOOT,
          g_font_hint);
   mk_ctl(L"STATIC",
-         L"层1 = 词频预排分（全体候选按层1降序取前5进 LLM 评分）；满 = 两码"
-         L"整句满长组；窗内=0 = 层1尾窗未进 LLM（灰字）；点 CE 格展开 CE1/2/3",
+         L"用户频 = 词频预排分（全体候选按它降序取前5进 LLM 评分）；满 = 两码"
+         L"整句满长组；窗内=0 = 尾窗未进 LLM（灰字）；点 CE 格展开 CE1/2/3",
          SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 530, 764, 16, IDC_FOOT,
          g_font_hint);
   h_foot = mk_ctl(L"STATIC",
                   L"数据源 \\\\.\\pipe\\rime_llm_live · 开关 = 方案 "
-                  L"llm_rerank/debug_fusion（改后重新部署）· 评缓=评分缓存，"
-                  L"预解=上文 KV 预解码",
+                  L"llm_rerank/debug_fusion（改后重新部署）· 预解 = 上文 KV 预解码"
+                  L"命中",
                   SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 548, 764, 16, IDC_FOOT,
                   g_font_hint);
 }

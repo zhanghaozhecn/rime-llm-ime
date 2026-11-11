@@ -826,13 +826,11 @@ static long                     g_prep_gen = 0; // generation at which prep was 
 // （编辑键/窗口切换）→ 失效；ctx/input 变 → key 不匹配自然失效。
 // engine 线程专用（Apply/Collect 均在引擎线程），无锁。
 // ============================================================
-static bool                      s_cache_valid = false;
-static std::string               s_cache_ctx;
-static std::string               s_cache_input;
-static std::vector<std::string>  s_cache_ranked;  // 评分后的候选文本顺序
-static std::vector<double>       s_cache_scores;  // 与 ranked 对齐的原始分 (词频融合重放用)
-static std::vector<std::array<double, 3>> s_cache_ce3;  // 与 ranked 对齐的 CE 三分量（未乘权重；调试窗口展开用）
-static int                       s_cache_gen = -1; // 缓存建立时的 reset 代次
+// 评分结果缓存已删除（2026-11-11 用户定案）：同 (上文+编码) 的复用在生产里
+// 命中率极低（每个新词的上文都变），却要维护一整套失效逻辑（编辑键/切窗代次/
+// 候选集变化重放），删掉以简化。仍保留 reset 代次，仅用于调试窗口的"上文重置"
+// 事件（编辑键/切窗信号本身对排障有用）。
+static int                       s_seen_gen = -1;  // 上次见到的 reset 代次
 
 // ============================================================
 // 用户词频 (freq_beta 对数融合, 2026-09-02; 衰减 2026-08-21 起 Rime 时间衰减):
@@ -1493,7 +1491,6 @@ static void unload_model() {
     g_prep_ready = false;
     g_prep_ctx.clear();
     g_prep_logits.clear();
-    s_cache_valid = false;  // 模型已卸载, 评分结果缓存一并作废
     log_msg("model unloaded");
   }
 }
@@ -2122,25 +2119,23 @@ void LlmRerankTranslation::Collect() {
     // text, or commit history fallback when TSF is unavailable)
     std::string ctx = normalize_ctx(ctx_);
 
-    // reset generation: edit keys / window switch invalidate cached results
-    // (插件版由 processor 在编辑键时清缓存; 源码版无 lua 层, 用 reset 代次)
+    // reset 代次（编辑键/切窗）：只用于调试事件（插件版由 processor 在编辑键
+    // 回调记 reset 行；源码版无 lua 层，在下次 Collect 见到代次变化时补记，
+    // 首见不记免启动噪音）。评分缓存已删，此处不再失效任何状态。
     int gen = 0;
     if (const RimeApi *api = rime_get_api())
       if (api->context_reset_generation)
         gen = api->context_reset_generation();
-    if (gen != s_cache_gen) {
-      // 插件版在 processor 编辑键回调记 reset 行; 源码版无 lua 层, 在下次
-      // Collect 见到代次变化时补记 (首块 s_cache_gen=-1 不记, 免启动噪音)
-      if (g_debug_fusion && s_cache_gen != -1) {
+    if (gen != s_seen_gen) {
+      if (g_debug_fusion && s_seen_gen != -1) {
         debug_fusion_write({now_hms() + "|reset|代次 " +
-                            std::to_string(s_cache_gen) + "→" +
+                            std::to_string(s_seen_gen) + "→" +
                             std::to_string(gen) +
-                            " → 上文重置+缓存清空 (编辑键/切窗)"});
-        live_send(now_hms() + "|R|代次 " + std::to_string(s_cache_gen) + "→" +
+                            " → 上文重置 (编辑键/切窗)"});
+        live_send(now_hms() + "|R|代次 " + std::to_string(s_seen_gen) + "→" +
                   std::to_string(gen) + " (编辑键/切窗)");
       }
-      s_cache_valid = false;
-      s_cache_gen = gen;
+      s_seen_gen = gen;
     }
 
     bool did_score = false;
@@ -2155,40 +2150,21 @@ void LlmRerankTranslation::Collect() {
     // debug_fusion 块缓冲: 头行先写, 明细在各段补, 末尾统一落盘
     std::vector<std::string> dbg;
     std::vector<char> dbg_full(candidates_.size(), 0);
-    const bool cache_hit = s_cache_valid && ctx == s_cache_ctx &&
-                           input_ == s_cache_input && !s_cache_ranked.empty();
     if (g_debug_fusion) {
       user_freq_ensure_loaded();  // tick 读数须在懒加载后 (插件版同修)
       std::string tail =
           ctx.size() > 16 ? "…" + ctx.substr(ctx.size() - 15) : ctx;
       char head[512];
       snprintf(head, sizeof(head),
-               "%s|score|input=%s|cache=%s|ctx=[%s]|src=%s|tick=%lld|ready=1"
+               "%s|score|input=%s|ctx=[%s]|src=%s|tick=%lld|ready=1"
                "|n=%d",
-               now_hms().c_str(), input_.c_str(), cache_hit ? "HIT" : "MISS",
+               now_hms().c_str(), input_.c_str(),
                tail.c_str(), src_.c_str(), (long long)g_user_tick,
                (int)candidates_.size());
       dbg.push_back(head);
     }
 
-    if (cache_hit) {
-      // cache hit: 同一 (ctx, input) 的评分结果复用 — 翻页/候选窗重建
-      // 不再跑 S2/S3 (~36ms/次)。缓存存评分顺序+原始分, 词频融合与徽章按
-      // 当前配置重放; 候选集变化时新候选未命中 → 落到尾部 (与插件版一致)。
-      prep_hit = true;  // 评分缓存命中 = 整段推理热路径（预解必在）
-      for (size_t k = 0; k < s_cache_ranked.size(); k++)
-        for (size_t i = 0; i < candidates_.size(); i++)
-          if (candidates_[i]->text() == s_cache_ranked[k]) {
-            order.push_back((int)i);
-            if (k < s_cache_scores.size()) {
-              score_of[i] = s_cache_scores[k];
-              has_score[i] = s_cache_scores[k] > -1e9;
-            }
-            if (k < s_cache_ce3.size())
-              ce3_of[i] = s_cache_ce3[k];
-            break;
-          }
-    } else {
+    {
       if (ctx != ctx_)  // newline/whitespace differences worth showing
         log_msg("ctx raw: [%s]", escape_ctx(ctx_).c_str());
       log_msg("ctx: [%s]", escape_ctx(ctx).c_str());
@@ -2225,18 +2201,6 @@ void LlmRerankTranslation::Collect() {
           std::sort(ord.begin(), ord.end(),
                     [&](int a, int b) { return scores[a] > scores[b]; });
           order = std::move(ord);
-          // store cache: 评分顺序+原始分 (候选文本), 命中时按文本重放
-          s_cache_valid = true;
-          s_cache_ctx = ctx;
-          s_cache_input = input_;
-          s_cache_ranked.clear();
-          s_cache_scores.clear();
-          s_cache_ce3.clear();
-          for (int i : order) {
-            s_cache_ranked.push_back(candidates_[i]->text());
-            s_cache_scores.push_back(scores[i]);
-            s_cache_ce3.push_back(ce3[i]);
-          }
           did_score = true;
         } else if (g_debug_fusion) {
           dbg.push_back("  评分异常: scores 数组长度不符 (推理失败)");
@@ -2362,13 +2326,15 @@ void LlmRerankTranslation::Collect() {
     // （未乘 kCeW 权重，查看器点击 CE 单元格展开））：窗口候选按最终序
     // （ce/fused/cerank 取自重排状态）+ 层1 尾窗透传（win=0，无 CE 分），
     // 上限 20 行。order 空时（评分整体失败）窗口按引擎序全 win=1 无分。
-    // L 头行也在此发（评分/融合后 ev_ms 才是终值；HIT 时为 0；尾字段
-    // prep = 上文 KV 预解码命中）。
+    // L 头行也在此发（评分/融合后 ev_ms 才是终值；尾字段 prep = 上文 KV
+    // 预解码命中）。第 3 字段原为评分缓存 HIT/MISS——缓存已删（2026-11-11），
+    // 保留字段位置发 "-"：旧查看器显示"评缓 -"，新查看器不显示该列，
+    // 行字段数不变（免新旧版混用时错位）。
     if (g_debug_fusion) {
       char msb[16];
       snprintf(msb, sizeof(msb), "%.0f", ev_ms);
-      live_send(std::string("L|") + now_hms() + "|" + live_esc(input_) + "|" +
-                (cache_hit ? "HIT" : "MISS") + "|" + src_ + "|" +
+      live_send(std::string("L|") + now_hms() + "|" + live_esc(input_) + "|-|" +
+                src_ + "|" +
                 live_esc(ctx) + "|" + std::to_string((long long)g_user_tick) +
                 "|" + msb + "|1|" +
                 std::to_string((int)candidates_.size()) + "|" +
