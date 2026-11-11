@@ -2103,7 +2103,7 @@ void LlmRerankTranslation::Collect() {
       tail.push_back(allc[idx[i]]);
   } else {
     // 未加载/单候选: 引擎原序（行为与两层之前一致）
-    live_send(now_hms() + std::string("|S|") +
+    live_send(std::string("S|") + now_hms() + "|" +
               (allc.size() < 2 ? "few_candidates" : "model_loading") + "|" +
               live_esc(input_) + "|" + src_);
     for (size_t i = 0; i < allc.size(); i++) {
@@ -2132,8 +2132,9 @@ void LlmRerankTranslation::Collect() {
                             std::to_string(s_seen_gen) + "→" +
                             std::to_string(gen) +
                             " → 上文重置 (编辑键/切窗)"});
-        live_send(now_hms() + "|R|代次 " + std::to_string(s_seen_gen) + "→" +
-                  std::to_string(gen) + " (编辑键/切窗)");
+        live_send(std::string("R|") + now_hms() + "|代次 " +
+                  std::to_string(s_seen_gen) + "→" + std::to_string(gen) +
+                  " (编辑键/切窗)");
       }
       s_seen_gen = gen;
     }
@@ -2204,15 +2205,16 @@ void LlmRerankTranslation::Collect() {
           did_score = true;
         } else if (g_debug_fusion) {
           dbg.push_back("  评分异常: scores 数组长度不符 (推理失败)");
-          live_send(now_hms() + "|S|score_failed|" + live_esc(input_) + "|" +
-                    src_);
+          live_send(std::string("S|") + now_hms() + "|score_failed|" +
+                    live_esc(input_) + "|" + src_);
         }
       } else if (g_debug_fusion) {
         dbg.push_back("  score=nil (ctx tokens " +
                       std::to_string((int)ctx_ids.size()) +
                       " < min_tokens " + std::to_string(g_min_tokens) +
                       " — 上文空/过短跳过)");
-        live_send(now_hms() + "|S|ctx_short|" + live_esc(input_) + "|" + src_);
+        live_send(std::string("S|") + now_hms() + "|ctx_short|" +
+                  live_esc(input_) + "|" + src_);
       }
     }
 
@@ -2608,8 +2610,8 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
                dirty_before);
       debug_fusion_write({line});
       // 实时调试 E 行（2026-11-10）：commit 落账（eff/tick 前后值）
-      live_send(now_hms() + "|E|" + live_esc(commit_text) + "|" +
-                live_num(eff_before) + "|" +
+      live_send(std::string("E|") + now_hms() + "|" + live_esc(commit_text) +
+                "|" + live_num(eff_before) + "|" +
                 live_num(user_freq_eff(commit_text)) + "|" +
                 std::to_string(tick_before) + "|" +
                 std::to_string((long long)g_user_tick));
@@ -2892,7 +2894,7 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
     if (!matched) {
       // 实时调试（2026-11-10）：跳过原因 S 行——"为什么没触发"是调试窗口
       // 的主要用途之一（pattern / ctx_empty / model_loading / few_candidates）
-      live_send(now_hms() + "|S|pattern|" +
+      live_send(std::string("S|") + now_hms() + "|pattern|" +
                 live_esc(engine_->context()->input()) + "|-");
       return translation;  // code outside code_pattern
     }
@@ -2905,13 +2907,13 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
     log_msg("Apply: ctx empty (src=%s input=[%s] len=%d) -> no rerank",
             src.c_str(), engine_->context()->input().c_str(),
             (int)engine_->context()->input().size());
-    live_send(now_hms() + "|S|ctx_empty|" +
+    live_send(std::string("S|") + now_hms() + "|ctx_empty|" +
               live_esc(engine_->context()->input()) + "|" + src);
     return translation;  // no context, keep original order
   }
 
   if (!g_loaded.load()) {
-    live_send(now_hms() + "|S|model_loading|" +
+    live_send(std::string("S|") + now_hms() + "|model_loading|" +
               live_esc(engine_->context()->input()) + "|" + src);
     return translation;  // model still loading, keep original order
   }
