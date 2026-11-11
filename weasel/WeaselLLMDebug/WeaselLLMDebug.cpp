@@ -235,13 +235,57 @@ static std::wstring f3(double v) {
   swprintf(b, 32, L"%.3f", v);
   return b;
 }
+// 左补空格到指定宽（右对齐）：各数值小数位数一致时小数点即逐位对齐
+static std::wstring padl(const std::wstring &s, int w) {
+  if ((int)s.size() >= w) return s;
+  return std::wstring((size_t)(w - (int)s.size()), L' ') + s;
+}
+
+// 动态对齐（2026-11-11 用户定案）：本次调用内每个数值组向最宽者看齐。
+// 每列分两组——分数（等号左）与计算过程里的量，分别量宽。
+struct ColW {
+  int ce_l, ce_c;    // CE 列：分数 / 三分量
+  int fb_l, fb_e;    // 衰减词频分列：分数 / eff（2 位小数）
+  int u1_l, uni;     // 累计词频列：分数 / 累计次数（整数）
+  int fu_l, fu_t;    // 总分列：分数 / 连加项（带符号）
+};
+static void measure_widths(const Inv &inv, ColW &w) {
+  w = {0, 0, 0, 0, 0, 0, 0, 0};
+  auto mx = [](int a, int b) { return a > b ? a : b; };
+  double v;
+  for (auto &r : inv.rows) {
+    if (num_of(r.ce, v)) {
+      w.ce_l = mx(w.ce_l, (int)f3(v).size());
+      w.fu_t = mx(w.fu_t, 1 + (int)f3(v).size());  // 连加项按带符号量宽
+    }
+    if (num_of(r.ce1, v)) w.ce_c = mx(w.ce_c, (int)f3(v).size());
+    if (num_of(r.ce2, v)) w.ce_c = mx(w.ce_c, (int)f3(v).size());
+    if (num_of(r.ce3, v)) w.ce_c = mx(w.ce_c, (int)f3(v).size());
+    if (num_of(r.fb, v)) {
+      w.fb_l = mx(w.fb_l, (int)f3(v).size());
+      w.fu_t = mx(w.fu_t, 1 + (int)f3(v).size());
+    }
+    if (num_of(r.eff, v)) w.fb_e = mx(w.fb_e, (int)f2(v).size());
+    if (num_of(r.u1, v)) {
+      w.u1_l = mx(w.u1_l, (int)f3(v).size());
+      w.fu_t = mx(w.fu_t, 1 + (int)f3(v).size());
+    }
+    if (num_of(r.uni, v)) {
+      wchar_t b[16];
+      swprintf(b, 16, L"%d", (int)v);
+      w.uni = mx(w.uni, (int)wcslen(b));
+    }
+    if (num_of(r.fused, v)) w.fu_l = mx(w.fu_l, (int)f3(v).size());
+  }
+}
 
 // CE 格：加权 CE 与三分量的连加过程。1.00/1.05/0.45 = kCeW 位置权重
 //（librime v3 标定内置常数）；分量缺（无分/未参与）的项整项省略。
-static std::wstring ce_proc(const Row &r) {
+static std::wstring ce_proc(const Row &r, int wl, int wc) {
   double ce;
   if (!num_of(r.ce, ce)) return L"—";
-  std::wstring t = f3(ce) + L"=";
+  std::wstring lead = padl(f3(ce), wl);
+  std::wstring t = lead + L"=";
   bool any = false;
   const struct {
     const wchar_t *w;
@@ -251,39 +295,43 @@ static std::wstring ce_proc(const Row &r) {
     double v;
     if (!num_of(*x.raw, v)) continue;
     wchar_t b[48];
-    swprintf(b, 48, L"%s·%.3f", x.w, v);
+    swprintf(b, 48, L"%s·", x.w);
     if (any) t += L"+";
-    t += b;
+    t += b + padl(f3(v), wc);
     any = true;
   }
-  if (!any) return f3(ce);  // 旧协议无分量 → 只显分数
+  if (!any) return lead;  // 旧协议无分量 → 只显分数
   return t;
 }
 
 // 衰减词频分格：β·log(1+eff)，β=12 内置常数
-static std::wstring fb_proc(const Row &r) {
+static std::wstring fb_proc(const Row &r, int wl, int we) {
   double fb, eff;
   if (!num_of(r.fb, fb)) return L"—";
-  if (!num_of(r.eff, eff)) return f3(fb);
-  return f3(fb) + L"=12·log(1+" + f2(eff) + L")";
+  std::wstring lead = padl(f3(fb), wl);
+  if (!num_of(r.eff, eff)) return lead;
+  return lead + L"=12·log(1+" + padl(f2(eff), we) + L")";
 }
 
 // 累计词频格：log((uni+1)/(n_seen+20000))——平滑常数 +1/+2万 在格里可见
-static std::wstring u1_proc(const Row &r, const Inv &inv) {
+static std::wstring u1_proc(const Row &r, const Inv &inv, int wl, int wu) {
   double u1, uni, nseen;
   if (!num_of(r.u1, u1)) return L"—";
-  if (!num_of(r.uni, uni) || !num_of(inv.nseen, nseen)) return f3(u1);
-  wchar_t b[96];
-  swprintf(b, 96, L"%.3f=log((%d+1)/(%d+20000))", u1, (int)uni, (int)nseen);
-  return b;
+  std::wstring lead = padl(f3(u1), wl);
+  if (!num_of(r.uni, uni) || !num_of(inv.nseen, nseen)) return lead;
+  wchar_t ub[16], b[96];
+  swprintf(ub, 16, L"%d", (int)uni);
+  swprintf(b, 96, L"=log((%s+1)/(%d+20000))", padl(ub, wu).c_str(),
+           (int)nseen);
+  return lead + b;
 }
 
 // 总分格：融合分 = 各现成分的带符号连加（无 CE 的回退行自然只剩两项；
 // 尾窗透传行无融合分 → —）
-static std::wstring fused_proc(const Row &r) {
+static std::wstring fused_proc(const Row &r, int wl, int wt) {
   double fu;
   if (!num_of(r.fused, fu)) return L"—";
-  std::wstring t = f3(fu) + L"=";
+  std::wstring t = padl(f3(fu), wl) + L"=";
   bool any = false;
   const std::wstring *src[3] = {&r.ce, &r.fb, &r.u1};
   for (auto *p : src) {
@@ -291,15 +339,17 @@ static std::wstring fused_proc(const Row &r) {
     if (!num_of(*p, v)) continue;
     wchar_t b[32];
     swprintf(b, 32, any ? L"%+.3f" : L"%.3f", v);
-    t += b;
+    t += padl(b, wt);
     any = true;
   }
-  if (!any) return f3(fu);
+  if (!any) return padl(f3(fu), wl);
   return t;
 }
 
 static void fill_grid(const Inv &inv) {
   ListView_DeleteAllItems(h_grid);
+  ColW w;
+  measure_widths(inv, w);
   int i = 0;
   for (auto &r : inv.rows) {
     LVITEMW it = {};
@@ -311,8 +361,10 @@ static void fill_grid(const Inv &inv) {
     it.pszText = nb;
     it.lParam = (LPARAM)(r.win0 ? 1 : 0);
     int at = ListView_InsertItem(h_grid, &it);
-    std::wstring ce_txt = ce_proc(r), fb_txt = fb_proc(r);
-    std::wstring u1_txt = u1_proc(r, inv), fu_txt = fused_proc(r);
+    std::wstring ce_txt = ce_proc(r, w.ce_l, w.ce_c);
+    std::wstring fb_txt = fb_proc(r, w.fb_l, w.fb_e);
+    std::wstring u1_txt = u1_proc(r, inv, w.u1_l, w.uni);
+    std::wstring fu_txt = fused_proc(r, w.fu_l, w.fu_t);
     struct { int col; const wchar_t *t; } cells[] = {
         {1, r.word.c_str()},
         {2, ce_txt.c_str()},
@@ -518,16 +570,16 @@ static void make_ui() {
                     SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 8, 700, 22,
                     IDC_STATUS, g_font);
   h_info = mk_ctl(L"STATIC", L"—", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 34,
-                  1370, 20, IDC_INFO, g_font_bold);
+                  1392, 20, IDC_INFO, g_font_bold);
   h_ctx = mk_ctl(L"STATIC", L"上文：—", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8,
-                 58, 1370, 42, IDC_CTX, g_font);
+                 58, 1392, 42, IDC_CTX, g_font);
   mk_ctl(L"BUTTON", L"暂停", BS_PUSHBUTTON, 720, 6, 64, 24, IDC_PAUSE, g_font);
   mk_ctl(L"BUTTON", L"置顶", BS_AUTOCHECKBOX, 792, 8, 52, 22, IDC_TOP, g_font);
   mk_ctl(L"BUTTON", L"清空", BS_PUSHBUTTON, 852, 6, 52, 24, IDC_CLEAR, g_font);
 
   h_grid = mk_ctl(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT |
                                       LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
-                  8, 104, 1158, 314, IDC_GRID, g_font_mono);
+                  8, 104, 1180, 314, IDC_GRID, g_font_mono);
   ListView_SetExtendedListViewStyle(
       h_grid, LVS_EX_FULLROWSELECT | LVS_EX_LABELTIP | LVS_EX_DOUBLEBUFFER);
   // 分数部分四列（2026-11-11 用户定案"分数=计算过程"）：CE / 衰减词频分 /
@@ -538,8 +590,8 @@ static void make_ui() {
   // 插入循环上界按数组长度推导——曾把循环写死 i<10 而 11 列，第 11 列
   // 从未创建（表现为"最后一列消失"，2026-11-11 踩过）
   struct { const wchar_t *t; int w; } cols[] = {
-      {L"#", 26}, {L"词", 64}, {L"CE", 330}, {L"衰减词频分", 172},
-      {L"累计词频", 260}, {L"总分", 232}, {L"满", 26}, {L"窗", 30}};
+      {L"#", 26}, {L"词", 64}, {L"CE", 344}, {L"衰减词频分", 172},
+      {L"累计词频", 260}, {L"总分", 240}, {L"满", 26}, {L"窗", 30}};
   LVCOLUMNW col = {};
   col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
   for (int i = 0; i < (int)(sizeof(cols) / sizeof(cols[0])); i++) {
@@ -552,18 +604,18 @@ static void make_ui() {
   h_hist = mk_ctl(L"LISTBOX", L"",
                   WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL |
                       LBS_NOINTEGRALHEIGHT,
-                  1174, 104, 204, 314, IDC_HIST, g_font);
+                  1196, 104, 204, 314, IDC_HIST, g_font);
   h_evt = mk_ctl(L"LISTBOX", L"",
                  WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL |
                      LBS_NOINTEGRALHEIGHT,
-                 8, 426, 1370, 96, IDC_EVT, g_font);
+                 8, 426, 1392, 96, IDC_EVT, g_font);
   // 公式行/列义行已删（2026-11-11 用户定案：计算过程直接写在分数格里，
   // 无需再对照底部公式）；只剩数据源一行灰注
   h_foot = mk_ctl(L"STATIC",
                   L"数据源 \\\\.\\pipe\\rime_llm_live · 开关 = 方案 "
                   L"llm_rerank/debug_fusion（改后重新部署）· 预解 = 上文 KV 预解码"
                   L"命中",
-                  SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 528, 1370, 16, IDC_FOOT,
+                  SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 528, 1392, 16, IDC_FOOT,
                   g_font_hint);
 }
 
@@ -585,7 +637,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
       g_hwnd = h;
       make_ui();
-      RECT cr = {0, 0, ts(1390), ts(548)};
+      RECT cr = {0, 0, ts(1412), ts(548)};
       AdjustWindowRect(&cr, (DWORD)GetWindowLongPtrW(h, GWL_STYLE), FALSE);
       SetWindowPos(h, NULL, 0, 0, cr.right - cr.left, cr.bottom - cr.top,
                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -701,7 +753,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
                            L"LLM 实时调试 — rime-llm-ime（源码版）",
                            WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX &
                                ~WS_THICKFRAME,
-                           CW_USEDEFAULT, CW_USEDEFAULT, ts(1390), ts(548),
+                           CW_USEDEFAULT, CW_USEDEFAULT, ts(1412), ts(548),
                            NULL, NULL, inst, NULL);
   ShowWindow(h, show);
   UpdateWindow(h);
