@@ -55,8 +55,10 @@ scripts/*
 !scripts/build_probe_uia_ctx.bat
 !scripts/run_test_rime.bat
 !scripts/build_llm_setup.bat
+!scripts/build_llm_debug.bat
 !scripts/build_setup.bat
 !scripts/build_pkg.bat
+!scripts/test_debug_viewer_pipe.ps1
 !scripts/enum_wps.py
 !scripts/probe_tab_active.ps1
 !scripts/probe_tab_active2.ps1
