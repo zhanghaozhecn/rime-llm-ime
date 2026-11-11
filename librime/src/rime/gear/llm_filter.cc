@@ -2321,16 +2321,18 @@ void LlmRerankTranslation::Collect() {
       dbg.push_back(moved.empty() ? "  名次变化: 无 (CE 序即融合序)"
                                   : "  名次变化: " + moved);
     }
-    // 实时调试 C 行（2026-11-10；2026-11-11 协议 v2：频两项改发原始值
-    // eff/uni——"显示未乘系数的数字"，尾接 CE 三分量原始值 ce1/ce2/ce3
-    // （未乘 kCeW 权重，查看器点击 CE 单元格展开））：窗口候选按最终序
-    // （ce/fused/cerank 取自重排状态）+ 层1 尾窗透传（win=0，无 CE 分），
-    // 上限 20 行。order 空时（评分整体失败）窗口按引擎序全 win=1 无分。
-    // L 头行也在此发（评分/融合后 ev_ms 才是终值；尾字段 prep = 上文 KV
-    // 预解码命中）。第 3 字段原为评分缓存 HIT/MISS——缓存已删（2026-11-11），
-    // 保留字段位置发 "-"：旧查看器显示"评缓 -"，新查看器不显示该列，
-    // 行字段数不变（免新旧版混用时错位）。
+    // 实时调试 C 行（2026-11-10；2026-11-11 协议 v3：同时发"原始计数"与
+    // "得分项"两套——衰减计数(eff)/累计次数(uni) 是证据，词频得分(β·log1p(eff))
+    // /累计得分(log p1) 是真正进融合的项；尾接 CE 三分量 ce1/ce2/ce3（未乘
+    // kCeW 权重，查看器常显）：窗口候选按最终序（ce/fused/cerank 取自重排
+    // 状态）+ 层1 尾窗透传（win=0，无 CE 分），上限 20 行。order 空时（评分
+    // 整体失败）窗口按引擎序全 win=1 无分。
+    // L 头行也在此发（评分/融合后 ev_ms 才是终值；尾两字段 prep = 上文 KV
+    // 预解码命中、nseen = 累计 unigram 全词数（累计得分的分母，n_seen）。
+    // 第 3 字段原为评分缓存 HIT/MISS——缓存已删（2026-11-11），保留字段位置
+    // 发 "-"：旧查看器显示"评缓 -"，新查看器不显示该列，字段数只增不改位。
     if (g_debug_fusion) {
+      user_bi_ensure_loaded();  // n_seen 读数须在懒加载后
       char msb[16];
       snprintf(msb, sizeof(msb), "%.0f", ev_ms);
       live_send(std::string("L|") + now_hms() + "|" + live_esc(input_) + "|-|" +
@@ -2338,7 +2340,8 @@ void LlmRerankTranslation::Collect() {
                 live_esc(ctx) + "|" + std::to_string((long long)g_user_tick) +
                 "|" + msb + "|1|" +
                 std::to_string((int)candidates_.size()) + "|" +
-                (prep_hit ? "1" : "0"));
+                (prep_hit ? "1" : "0") + "|" +
+                std::to_string((long long)g_user_nseen));
       user_freq_ensure_loaded();
       std::map<std::string, int> eng_rank;  // 引擎原序（首现位置）
       for (size_t i = 0; i < allc.size(); i++)
@@ -2370,7 +2373,8 @@ void LlmRerankTranslation::Collect() {
                   std::to_string(user_uni_count(c->text())) + "|" + fused +
                   "|" + std::to_string(full) + "|" + std::to_string(cerank) +
                   "|" + std::to_string(fin) + "|" + std::to_string(win) +
-                  "|" + ce1 + "|" + ce2 + "|" + ce3s);
+                  "|" + ce1 + "|" + ce2 + "|" + ce3s + "|" +
+                  live_num(fb) + "|" + live_num(u1));  // v3: 词频得分/累计得分
       };
       if (!order.empty()) {
         std::vector<int> fin_rank(candidates_.size(), 0);

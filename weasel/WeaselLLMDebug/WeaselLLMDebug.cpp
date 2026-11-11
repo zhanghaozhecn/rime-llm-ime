@@ -101,12 +101,12 @@ static void split8(const std::string &s, std::vector<std::string> &out) {
 // ---- 数据模型 ----
 struct Row {
   std::wstring eng, word, s1, ce, eff, uni, fused, full, cerank, fin, win;
-  std::wstring ce1, ce2, ce3;  // CE 三分量原始值（点击 CE 格展开；空=无分量）
+  std::wstring ce1, ce2, ce3;  // CE 三分量（未乘权重；常显）
+  std::wstring fb, u1;         // 词频得分 β·log1p(衰减计数) / 累计得分 log p1
   bool win0 = false;  // 尾窗透传（灰字）
-  bool ce_expanded = false;
 };
 struct Inv {
-  std::wstring t, input, cache, src, ctx, tick, ms, ready, n, prep;
+  std::wstring t, input, cache, src, ctx, tick, ms, ready, n, prep, nseen;
   std::vector<Row> rows;
 };
 static std::deque<Inv> g_invs;          // 最近 50 次调用（新的在尾）
@@ -220,9 +220,9 @@ static std::wstring ce_short(const std::wstring &v) {
   return v.substr(0, dot + 3);  // 整数部分 + '.' + 2 位
 }
 
+// CE 列：常显三子项 C1/C2/C3（未乘权重，2 位小数）；无分量时显示 ·
 static std::wstring ce_cell_text(const Row &r) {
-  bool has = !(r.ce1.empty() && r.ce2.empty() && r.ce3.empty());
-  if (!r.ce_expanded || !has) return r.ce.empty() ? L"·" : r.ce;
+  if (r.ce1.empty() && r.ce2.empty() && r.ce3.empty()) return L"·";
   return ce_short(r.ce1) + L"/" + ce_short(r.ce2) + L"/" + ce_short(r.ce3);
 }
 
@@ -241,16 +241,29 @@ static void fill_grid(const Inv &inv) {
     wchar_t cerank_fin[48];
     swprintf(cerank_fin, 48, L"%s→%s", r.cerank.c_str(), r.fin.c_str());
     std::wstring ce_txt = ce_cell_text(r);
+    // 词频得分 1.886 (0.75)：得分 + 括号原始衰减计数
+    std::wstring fb_txt = r.fb;
+    if (!r.fb.empty() && !r.eff.empty())
+      fb_txt += L"(" + ce_short(r.eff) + L")";
+    else if (r.fb.empty() && !r.eff.empty())
+      fb_txt = ce_short(r.eff);
+    // 累计得分 -8.32 (9)：得分 + 括号原始累计次数
+    std::wstring u1_txt = r.u1;
+    if (!r.u1.empty() && !r.uni.empty())
+      u1_txt += L"(" + r.uni + L")";
+    else if (r.u1.empty() && !r.uni.empty())
+      u1_txt = r.uni;
     struct { int col; const wchar_t *t; } cells[] = {
         {1, r.word.c_str()},
         {2, ce_txt.c_str()},
-        {3, r.s1.c_str()},
-        {4, r.eff.c_str()},
-        {5, r.uni.c_str()},
-        {6, r.fused.c_str()},
-        {7, r.full.c_str()},
-        {8, cerank_fin},
-        {9, r.win.c_str()},
+        {3, r.ce.empty() ? L"·" : r.ce.c_str()},
+        {4, fb_txt.c_str()},
+        {5, u1_txt.c_str()},
+        {6, r.s1.c_str()},
+        {7, r.fused.c_str()},
+        {8, r.full.c_str()},
+        {9, cerank_fin},
+        {10, r.win.c_str()},
     };
     for (auto &c : cells)
       ListView_SetItemText(h_grid, at, c.col, (LPWSTR)c.t);
@@ -268,12 +281,12 @@ static void update_current() {
   const Inv &inv = g_invs[g_view];
   wchar_t line[512];
   swprintf(line, 512,
-           L"%s  输入 %s   预解 %s   %sms   tick %s   就绪 %s"
-           L"   n=%s   来源 %s",
-           inv.t.c_str(), inv.input.c_str(),
+           L"%s  输入 %s   来源 %s   预解 %s   %sms   tick %s   全词数 %s"
+           L"   n=%s   就绪 %s",
+           inv.t.c_str(), inv.input.c_str(), inv.src.c_str(),
            inv.prep.empty() ? L"-" : inv.prep.c_str(), inv.ms.c_str(),
-           inv.tick.c_str(), inv.ready.c_str(), inv.n.c_str(),
-           inv.src.c_str());
+           inv.tick.c_str(), inv.nseen.empty() ? L"-" : inv.nseen.c_str(),
+           inv.n.c_str(), inv.ready.c_str());
   SetWindowTextW(h_info, line);
   SetWindowTextW(h_ctx,
                  (std::wstring(L"上文：") +
@@ -345,6 +358,7 @@ static void handle_line(const std::string &line) {
     inv.ready = u8w(f[8]);
     inv.n = u8w(f[9]);
     inv.prep = f.size() > 10 ? u8w(f[10]) : L"";
+    inv.nseen = f.size() > 11 ? u8w(f[11]) : L"";
     g_invs.push_back(std::move(inv));
     while (g_invs.size() > 50) {
       g_invs.pop_front();
@@ -382,6 +396,10 @@ static void handle_line(const std::string &line) {
       r.ce1 = u8w(f[12]);
       r.ce2 = u8w(f[13]);
       r.ce3 = u8w(f[14]);
+    }
+    if (f.size() > 16) {  // 协议 v3：词频得分 / 累计得分（真正进融合的两项）
+      r.fb = u8w(f[15]);
+      r.u1 = u8w(f[16]);
     }
     g_invs.back().rows.push_back(std::move(r));
     if (!g_paused) {
@@ -434,30 +452,33 @@ static void make_ui() {
 
   h_status = mk_ctl(L"STATIC", L"等待连接…（在方案开启 llm_rerank/debug_fusion"
                                 L" 并重新部署，然后打字）",
-                    SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 8, 520, 22,
+                    SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 8, 700, 22,
                     IDC_STATUS, g_font);
   h_info = mk_ctl(L"STATIC", L"—", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 34,
-                  764, 20, IDC_INFO, g_font_bold);
+                  944, 20, IDC_INFO, g_font_bold);
   h_ctx = mk_ctl(L"STATIC", L"上文：—", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8,
-                 58, 764, 42, IDC_CTX, g_font);
-  mk_ctl(L"BUTTON", L"暂停", BS_PUSHBUTTON, 536, 6, 64, 24, IDC_PAUSE, g_font);
-  mk_ctl(L"BUTTON", L"置顶", BS_AUTOCHECKBOX, 608, 8, 52, 22, IDC_TOP, g_font);
-  mk_ctl(L"BUTTON", L"清空", BS_PUSHBUTTON, 668, 6, 52, 24, IDC_CLEAR, g_font);
+                 58, 944, 42, IDC_CTX, g_font);
+  mk_ctl(L"BUTTON", L"暂停", BS_PUSHBUTTON, 720, 6, 64, 24, IDC_PAUSE, g_font);
+  mk_ctl(L"BUTTON", L"置顶", BS_AUTOCHECKBOX, 792, 8, 52, 22, IDC_TOP, g_font);
+  mk_ctl(L"BUTTON", L"清空", BS_PUSHBUTTON, 852, 6, 52, 24, IDC_CLEAR, g_font);
 
   h_grid = mk_ctl(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT |
                                       LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
-                  8, 104, 560, 298, IDC_GRID, g_font);
+                  8, 104, 728, 298, IDC_GRID, g_font);
   ListView_SetExtendedListViewStyle(
       h_grid, LVS_EX_FULLROWSELECT | LVS_EX_LABELTIP | LVS_EX_DOUBLEBUFFER);
   // 列（2026-11-11 协议 v2）：频两项 = 原始值（衰减频=eff 衰减计数、
   // 累计频=累计 unigram 原始计数）；CE 列加宽到 118 容纳展开的 c1/c2/c3
+  // 列（2026-11-11 方案 B / 计数-得分式命名）：CE 三子项常显；
+  // 词频得分/累计得分 = 真正进融合的项，括号内是原始证据（衰减计数/累计次数）
   struct { const wchar_t *t; int w; } cols[] = {
-      {L"#", 24}, {L"词", 58}, {L"CE", 126}, {L"用户频", 56}, {L"衰减频", 56},
-      {L"累计频", 54}, {L"融合", 64}, {L"满", 28}, {L"序变", 48},
-      {L"窗内", 46}};
+      {L"#", 24}, {L"词", 58}, {L"C1/C2/C3", 128}, {L"CE和", 58},
+      {L"词频得分", 88}, {L"累计得分", 88},
+      {L"用户频分", 66}, {L"融合分", 62}, {L"满", 26}, {L"CE→终", 58},
+      {L"窗", 30}};
   LVCOLUMNW col = {};
   col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-  for (int i = 0; i < 10; i++) {
+  for (int i = 0; i < 11; i++) {  // 列数（方案 B：11 列）
     col.pszText = (LPWSTR)cols[i].t;
     col.cx = ts(cols[i].w);
     col.iSubItem = i;
@@ -467,28 +488,28 @@ static void make_ui() {
   h_hist = mk_ctl(L"LISTBOX", L"",
                   WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL |
                       LBS_NOINTEGRALHEIGHT,
-                  576, 104, 196, 298, IDC_HIST, g_font);
+                  744, 104, 204, 298, IDC_HIST, g_font);
   h_evt = mk_ctl(L"LISTBOX", L"",
                  WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL |
                      LBS_NOINTEGRALHEIGHT,
-                 8, 410, 764, 96, IDC_EVT, g_font);
+                 8, 410, 944, 96, IDC_EVT, g_font);
   // 公式与列义两行灰注（2026-11-11 用户定案：空白处显示融合公式 +
   // 层1/满/展开说明；点 CE 格展开 CE1/2/3）
   mk_ctl(L"STATIC",
-         L"融合分 = CE + β·log(1+衰减频) + log(p1)，β=12；"
-         L"p1=(累计频+1)/(全词数+2万)；用户频 = β·log(1+衰减频)+log(p1)",
-         SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 512, 764, 16, IDC_FOOT,
+         L"融合分 = CE + 词频得分 + 累计得分；词频得分 = 12·log(1+衰减计数)；"
+         L"累计得分 = log((累计次数+1)/(全词数+2万))；用户频分 = 词频得分+累计得分",
+         SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 512, 944, 16, IDC_FOOT,
          g_font_hint);
   mk_ctl(L"STATIC",
-         L"用户频 = 词频预排分（全体候选按它降序取前5进 LLM 评分）；满 = 两码"
-         L"整句满长组；窗内=0 = 尾窗未进 LLM（灰字）；点 CE 格展开 CE1/2/3",
-         SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 530, 764, 16, IDC_FOOT,
+         L"括号内为原始证据（衰减计数 / 累计次数）；用户频分 = 全体候选的预排"
+         L"分，按其降序取前5进 LLM；满 = 两码整句满长组；窗=0 = 尾窗未进 LLM（灰字）",
+         SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 530, 944, 16, IDC_FOOT,
          g_font_hint);
   h_foot = mk_ctl(L"STATIC",
                   L"数据源 \\\\.\\pipe\\rime_llm_live · 开关 = 方案 "
                   L"llm_rerank/debug_fusion（改后重新部署）· 预解 = 上文 KV 预解码"
                   L"命中",
-                  SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 548, 764, 16, IDC_FOOT,
+                  SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 548, 944, 16, IDC_FOOT,
                   g_font_hint);
 }
 
@@ -510,7 +531,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
       g_hwnd = h;
       make_ui();
-      RECT cr = {0, 0, ts(792), ts(576)};
+      RECT cr = {0, 0, ts(976), ts(576)};
       AdjustWindowRect(&cr, (DWORD)GetWindowLongPtrW(h, GWL_STYLE), FALSE);
       SetWindowPos(h, NULL, 0, 0, cr.right - cr.left, cr.bottom - cr.top,
                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -593,23 +614,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       NMHDR *nm = (NMHDR *)lp;
       if (nm->idFrom == IDC_GRID && nm->code == NM_CUSTOMDRAW)
         return on_grid_customdraw((NMLVCUSTOMDRAW *)lp);
-      // CE 单元格点击展开/收起 CE1/CE2/CE3 原始分量（2026-11-11 用户定案：
-      // 默认不展开）
-      if (nm->idFrom == IDC_GRID && nm->code == NM_CLICK) {
-        LPNMITEMACTIVATE ia = (LPNMITEMACTIVATE)lp;
-        if (ia->iItem >= 0 && ia->iSubItem == 2 &&
-            g_view >= 0 && g_view < (int)g_invs.size()) {
-          Inv &inv = g_invs[g_view];
-          if (ia->iItem < (int)inv.rows.size()) {
-            Row &r = inv.rows[(size_t)ia->iItem];
-            r.ce_expanded = !r.ce_expanded;
-            // 只改这一行的 CE 单元格（不整表重建，保持选择与滚动位置）
-            std::wstring t = ce_cell_text(r);
-            ListView_SetItemText(h_grid, ia->iItem, 2, (LPWSTR)t.c_str());
-          }
-        }
-        return 0;
-      }
+      // CE 子项自 2026-11-11 起**常显**（原点击展开已删：NM_CLICK 的
+      // iSubItem 在 report 视图里恒为 0，需 LVM_SUBITEMHITTEST 才准）。
       break;
     }
     case WM_CTLCOLORSTATIC:
