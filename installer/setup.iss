@@ -18,7 +18,7 @@
 ;               （写组件行 + 方案 llm_rerank 节）决定。
 
 #define MyAppName "小狼毫 LLM 版"
-#define MyAppVer "2026.11.11-6"  ; 同日重打安装包在日期后加 -2/-3/-4/-5/-6 序号（2026-09-11 用户定案，避免同号不同内容）
+#define MyAppVer "2026.11.11-7"  ; 同日重打安装包在日期后加 -2/-3/-4/-5/-6/-7 序号（2026-09-11 用户定案，避免同号不同内容）
 #define MyAppId "{{3F8A2D5C-6B1E-4F9A-8D73-9C2E5B7A1F40}"
 
 [Setup]
@@ -160,17 +160,41 @@ begin
 end;
 
 // 系统 TSF DLL 改名腾位：加载中的镜像可改名（实测），旧进程继续用旧镜像；
-// .llm_old 由下次安装清理（此时已无人占用）
+// .llm_old 由下次安装清理（此时已无人占用）。
+// 2026-11-11 本机事故加固：不再假设 .llm_old 一定删得掉——旧 aside 删不掉
+// 时换下一个名字腾位，绝不让残留 aside 挡住本次改名（原写法 dest 存在 →
+// RenameFile 失败 → [Files] 撞锁定文件 → 只能靠 restartreplace 排队）
 procedure RenameAside(path: string);
+var
+  n: Integer;
+  cand, aside: string;
 begin
-  if FileExists(path) then begin
-    // 旧 .llm_old 若仍被进程占用（删不掉），rename 也会失败——此时靠
-    // [Files] restartreplace 兜底，不中止安装
-    if not DeleteFile(path + '.llm_old') then
-      Log(Format('llm_old busy (kept): %s', [path + '.llm_old']));
-    if not RenameFile(path, path + '.llm_old') then
-      Log(Format('rename aside failed (restartreplace fallback): %s', [path]));
+  if not FileExists(path) then Exit;
+  for n := 0 to 8 do begin
+    if n = 0 then
+      cand := path + '.llm_old'
+    else
+      cand := path + '.llm_old' + IntToStr(n);
+    if FileExists(cand) then
+      DeleteFile(cand);  // 能删则删；删不掉就换名，不中止
   end;
+  aside := '';
+  for n := 0 to 8 do begin
+    if n = 0 then
+      cand := path + '.llm_old'
+    else
+      cand := path + '.llm_old' + IntToStr(n);
+    if not FileExists(cand) then begin
+      aside := cand;
+      Break;
+    end;
+  end;
+  if aside = '' then begin
+    Log(Format('no free aside name (all busy): %s', [path]));
+    Exit;  // [Files] restartreplace 兜底排队
+  end;
+  if not RenameFile(path, aside) then
+    Log(Format('rename aside failed (restartreplace fallback): %s', [path]));
 end;
 
 procedure CleanOld(dir: string);
@@ -203,8 +227,39 @@ begin
   RenameAside(ExpandConstant('{syswow64}\weasel.dll'));
 end;
 
+// 装完核对系统位 TSF（2026-11-11 本机事故：装完 System32/SysWOW64 仍是旧版、
+// 队列空、全程静默——根因未明，故装尾核对并与用户对表，不再静默。
+// Inno 无 MULTI_SZ 读取、无法查 restartreplace 是否已排队，但两种情况
+// 处置同一句话：重启电脑，没好就再跑一遍安装器——不需要区分）
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  fso: Variant;
+  ok64, ok32: Boolean;
 begin
-  if CurStep = ssPostInstall then
+  if CurStep = ssPostInstall then begin
     CleanOld(ExpandConstant('{app}'));
+    try
+      fso := CreateOleObject('Scripting.FileSystemObject');
+      // 与 {app} 里同一构建的载荷比大小：一致 = 替换成功；不一致 = 仍为旧版
+      //（restartreplace 已排队时旧版原地保留到重启，同样落入此分支）
+      ok64 := fso.GetFileSize(ExpandConstant('{sys}\weasel.dll')) =
+              fso.GetFileSize(ExpandConstant('{app}\weaselx64.dll'));
+      ok32 := fso.GetFileSize(ExpandConstant('{syswow64}\weasel.dll')) =
+              fso.GetFileSize(ExpandConstant('{app}\weasel32.dll'));
+      if (not ok64) or (not ok32) then begin
+        // 注意：Inno 预处理器把行首的 `[` 当 section 标签——带数组实参的
+        // 调用不能折行（2026-11-11 自检实测）
+        Log('TSF size mismatch: ok64=' + IntToStr(Ord(ok64)) +
+            ' ok32=' + IntToStr(Ord(ok32)));
+        if not WizardSilent() then
+          MsgBox('检测到系统位输入法组件（System32 / SysWOW64 的 weasel.dll）' +
+                 '仍是旧版，本次安装对输入法菜单可能没有生效。' + #13#10 + #13#10 +
+                 '请先重启电脑；重启后若托盘右键菜单仍没有「LLM 调试窗口」，' +
+                 '再次运行本安装器即可补上。',
+                 mbInformation, MB_OK);
+      end;
+    except
+      // 核对环节任何异常不阻断安装
+    end;
+  end;
 end;
