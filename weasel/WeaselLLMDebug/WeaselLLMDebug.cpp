@@ -150,7 +150,27 @@ static void reader_thread() {
           if (!GetOverlappedResult(p, &ov, &got, FALSE) || got == 0)
             fin = true;  // 对端关闭
         } else {
-          continue;  // 1s 超时：回圈检查 g_stop 再继续等（读请求仍在排队）
+          // 1s 超时：必须先取消本次在途读再回圈——任一时刻至多一个在途
+          // 读。旧写法超时后不取消、下轮又挂一个新读：两个在途读共用一
+          // 个事件，下一批数据完成的是**旧读**（字节被丢弃），而
+          // GetOverlappedResult 查的是**新 OVERLAPPED** → INCOMPLETE 被
+          // 误判为断连 → 整批 L/C 丢失后重连。打字节奏（词间停顿 >1s）
+          // 每词必踩：上文/候选表/历史全冻结，只剩重连后到达的 E/R 事件
+          // 行（2026-11-11 真机 + 本地 3s 间隔 4 轮假服务端复现）。
+          CancelIo(p);
+          if (GetOverlappedResult(p, &ov, &got, TRUE) && got > 0) {
+            // 竞态窗口内数据已到（取消前读已完成）——照常处理这批字节
+            pend.append(buf, buf + got);
+            for (;;) {
+              size_t nl = pend.find('\n');
+              if (nl == std::string::npos) break;
+              std::string line = pend.substr(0, nl);
+              pend.erase(0, nl + 1);
+              if (!line.empty() && line.back() == '\r') line.pop_back();
+              if (!line.empty()) q_push(line);
+            }
+          }
+          continue;
         }
       } else {
         fin = true;
