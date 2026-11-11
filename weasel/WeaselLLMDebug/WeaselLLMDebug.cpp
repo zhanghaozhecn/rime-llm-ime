@@ -100,11 +100,13 @@ static void split8(const std::string &s, std::vector<std::string> &out) {
 
 // ---- 数据模型 ----
 struct Row {
-  std::wstring eng, word, s1, ce, fb, u1, fused, full, cerank, fin, win;
+  std::wstring eng, word, s1, ce, eff, uni, fused, full, cerank, fin, win;
+  std::wstring ce1, ce2, ce3;  // CE 三分量原始值（点击 CE 格展开；空=无分量）
   bool win0 = false;  // 尾窗透传（灰字）
+  bool ce_expanded = false;
 };
 struct Inv {
-  std::wstring t, input, cache, src, ctx, tick, ms, ready, n;
+  std::wstring t, input, cache, src, ctx, tick, ms, ready, n, prep;
   std::vector<Row> rows;
 };
 static std::deque<Inv> g_invs;          // 最近 50 次调用（新的在尾）
@@ -208,6 +210,22 @@ static void set_status(const wchar_t *text, bool ok) {
   (void)ok;
 }
 
+// CE 单元格文本：收起 = CE 值（或 ·）；展开 = CE1/CE2/CE3 原始分量
+//（未乘 kCeW 权重；缺分量位显示 ·）。展开态统一压成 2 位小数——
+// 3 位时三段约 24 字符放不进列宽（2026-11-11 实测截断）。
+static std::wstring ce_short(const std::wstring &v) {
+  if (v.empty()) return L"·";
+  size_t dot = v.find(L'.');
+  if (dot == std::wstring::npos || dot + 2 >= v.size()) return v;
+  return v.substr(0, dot + 3);  // 整数部分 + '.' + 2 位
+}
+
+static std::wstring ce_cell_text(const Row &r) {
+  bool has = !(r.ce1.empty() && r.ce2.empty() && r.ce3.empty());
+  if (!r.ce_expanded || !has) return r.ce.empty() ? L"·" : r.ce;
+  return ce_short(r.ce1) + L"/" + ce_short(r.ce2) + L"/" + ce_short(r.ce3);
+}
+
 static void fill_grid(const Inv &inv) {
   ListView_DeleteAllItems(h_grid);
   int i = 0;
@@ -222,12 +240,13 @@ static void fill_grid(const Inv &inv) {
     int at = ListView_InsertItem(h_grid, &it);
     wchar_t cerank_fin[48];
     swprintf(cerank_fin, 48, L"%s→%s", r.cerank.c_str(), r.fin.c_str());
+    std::wstring ce_txt = ce_cell_text(r);
     struct { int col; const wchar_t *t; } cells[] = {
         {1, r.word.c_str()},
-        {2, r.ce.empty() ? L"·" : r.ce.c_str()},
+        {2, ce_txt.c_str()},
         {3, r.s1.c_str()},
-        {4, r.fb.c_str()},
-        {5, r.u1.c_str()},
+        {4, r.eff.c_str()},
+        {5, r.uni.c_str()},
         {6, r.fused.c_str()},
         {7, r.full.c_str()},
         {8, cerank_fin},
@@ -249,9 +268,12 @@ static void update_current() {
   const Inv &inv = g_invs[g_view];
   wchar_t line[512];
   swprintf(line, 512,
-           L"%s  输入 %s   缓存 %s   %sms   tick %s   就绪 %s   n=%s   来源 %s",
-           inv.t.c_str(), inv.input.c_str(), inv.cache.c_str(), inv.ms.c_str(),
-           inv.tick.c_str(), inv.ready.c_str(), inv.n.c_str(), inv.src.c_str());
+           L"%s  输入 %s   评缓 %s   预解 %s   %sms   tick %s   就绪 %s"
+           L"   n=%s   来源 %s",
+           inv.t.c_str(), inv.input.c_str(), inv.cache.c_str(),
+           inv.prep.empty() ? L"-" : inv.prep.c_str(), inv.ms.c_str(),
+           inv.tick.c_str(), inv.ready.c_str(), inv.n.c_str(),
+           inv.src.c_str());
   SetWindowTextW(h_info, line);
   SetWindowTextW(h_ctx,
                  (std::wstring(L"上文：") +
@@ -322,6 +344,7 @@ static void handle_line(const std::string &line) {
     inv.ms = u8w(f[7]);
     inv.ready = u8w(f[8]);
     inv.n = u8w(f[9]);
+    inv.prep = f.size() > 10 ? u8w(f[10]) : L"";
     g_invs.push_back(std::move(inv));
     while (g_invs.size() > 50) {
       g_invs.pop_front();
@@ -347,14 +370,19 @@ static void handle_line(const std::string &line) {
     r.word = u8w(f[2]);
     r.s1 = u8w(f[3]);
     r.ce = u8w(f[4]);
-    r.fb = u8w(f[5]);
-    r.u1 = u8w(f[6]);
+    r.eff = u8w(f[5]);
+    r.uni = u8w(f[6]);
     r.fused = u8w(f[7]);
     r.full = u8w(f[8]);
     r.cerank = u8w(f[9]);
     r.fin = u8w(f[10]);
     r.win = u8w(f[11]);
     r.win0 = (r.win == L"0");
+    if (f.size() > 14) {  // 协议 v2：CE 三分量原始值（未乘权重）
+      r.ce1 = u8w(f[12]);
+      r.ce2 = u8w(f[13]);
+      r.ce3 = u8w(f[14]);
+    }
     g_invs.back().rows.push_back(std::move(r));
     if (!g_paused) {
       if (g_view == (int)g_invs.size() - 1) update_current();
@@ -418,12 +446,15 @@ static void make_ui() {
 
   h_grid = mk_ctl(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT |
                                       LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
-                  8, 104, 548, 298, IDC_GRID, g_font);
+                  8, 104, 560, 298, IDC_GRID, g_font);
   ListView_SetExtendedListViewStyle(
       h_grid, LVS_EX_FULLROWSELECT | LVS_EX_LABELTIP | LVS_EX_DOUBLEBUFFER);
+  // 列（2026-11-11 协议 v2）：频两项 = 原始值（衰减频=eff 衰减计数、
+  // 累计频=累计 unigram 原始计数）；CE 列加宽到 118 容纳展开的 c1/c2/c3
   struct { const wchar_t *t; int w; } cols[] = {
-      {L"#", 24}, {L"词", 58}, {L"CE", 62}, {L"层1", 56}, {L"频+", 56},
-      {L"u1+", 56}, {L"融合", 62}, {L"满", 34}, {L"序变", 44}, {L"窗内", 44}};
+      {L"#", 24}, {L"词", 58}, {L"CE", 126}, {L"层1", 56}, {L"衰减频", 56},
+      {L"累计频", 54}, {L"融合", 64}, {L"满", 28}, {L"序变", 48},
+      {L"窗内", 46}};
   LVCOLUMNW col = {};
   col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
   for (int i = 0; i < 10; i++) {
@@ -436,16 +467,28 @@ static void make_ui() {
   h_hist = mk_ctl(L"LISTBOX", L"",
                   WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL |
                       LBS_NOINTEGRALHEIGHT,
-                  564, 104, 208, 298, IDC_HIST, g_font);
+                  576, 104, 196, 298, IDC_HIST, g_font);
   h_evt = mk_ctl(L"LISTBOX", L"",
                  WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL |
                      LBS_NOINTEGRALHEIGHT,
-                 8, 410, 764, 116, IDC_EVT, g_font);
+                 8, 410, 764, 96, IDC_EVT, g_font);
+  // 公式与列义两行灰注（2026-11-11 用户定案：空白处显示融合公式 +
+  // 层1/满/展开说明；点 CE 格展开 CE1/2/3）
+  mk_ctl(L"STATIC",
+         L"融合分 = CE + β·log(1+衰减频) + log(p1)，β=12；"
+         L"p1=(累计频+1)/(全词数+2万)；层1 = β·log(1+衰减频)+log(p1)",
+         SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 512, 764, 16, IDC_FOOT,
+         g_font_hint);
+  mk_ctl(L"STATIC",
+         L"层1 = 词频预排分（全体候选按层1降序取前5进 LLM 评分）；满 = 两码"
+         L"整句满长组；窗内=0 = 层1尾窗未进 LLM（灰字）；点 CE 格展开 CE1/2/3",
+         SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 530, 764, 16, IDC_FOOT,
+         g_font_hint);
   h_foot = mk_ctl(L"STATIC",
                   L"数据源 \\\\.\\pipe\\rime_llm_live · 开关 = 方案 "
-                  L"llm_rerank/debug_fusion（改后重新部署）· 窗内=0 行 = "
-                  L"层1 尾窗透传（灰字）",
-                  SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 532, 764, 16, IDC_FOOT,
+                  L"llm_rerank/debug_fusion（改后重新部署）· 评缓=评分缓存，"
+                  L"预解=上文 KV 预解码",
+                  SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 548, 764, 16, IDC_FOOT,
                   g_font_hint);
 }
 
@@ -467,7 +510,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
       g_hwnd = h;
       make_ui();
-      RECT cr = {0, 0, ts(780), ts(554)};
+      RECT cr = {0, 0, ts(792), ts(576)};
       AdjustWindowRect(&cr, (DWORD)GetWindowLongPtrW(h, GWL_STYLE), FALSE);
       SetWindowPos(h, NULL, 0, 0, cr.right - cr.left, cr.bottom - cr.top,
                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -550,6 +593,23 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       NMHDR *nm = (NMHDR *)lp;
       if (nm->idFrom == IDC_GRID && nm->code == NM_CUSTOMDRAW)
         return on_grid_customdraw((NMLVCUSTOMDRAW *)lp);
+      // CE 单元格点击展开/收起 CE1/CE2/CE3 原始分量（2026-11-11 用户定案：
+      // 默认不展开）
+      if (nm->idFrom == IDC_GRID && nm->code == NM_CLICK) {
+        LPNMITEMACTIVATE ia = (LPNMITEMACTIVATE)lp;
+        if (ia->iItem >= 0 && ia->iSubItem == 2 &&
+            g_view >= 0 && g_view < (int)g_invs.size()) {
+          Inv &inv = g_invs[g_view];
+          if (ia->iItem < (int)inv.rows.size()) {
+            Row &r = inv.rows[(size_t)ia->iItem];
+            r.ce_expanded = !r.ce_expanded;
+            // 只改这一行的 CE 单元格（不整表重建，保持选择与滚动位置）
+            std::wstring t = ce_cell_text(r);
+            ListView_SetItemText(h_grid, ia->iItem, 2, (LPWSTR)t.c_str());
+          }
+        }
+        return 0;
+      }
       break;
     }
     case WM_CTLCOLORSTATIC:
@@ -581,7 +641,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
                            L"LLM 实时调试 — rime-llm-ime（源码版）",
                            WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX &
                                ~WS_THICKFRAME,
-                           CW_USEDEFAULT, CW_USEDEFAULT, ts(780), ts(554),
+                           CW_USEDEFAULT, CW_USEDEFAULT, ts(792), ts(576),
                            NULL, NULL, inst, NULL);
   ShowWindow(h, show);
   UpdateWindow(h);

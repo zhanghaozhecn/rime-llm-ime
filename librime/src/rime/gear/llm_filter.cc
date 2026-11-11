@@ -24,6 +24,7 @@
 #include <rime_api.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -830,6 +831,7 @@ static std::string               s_cache_ctx;
 static std::string               s_cache_input;
 static std::vector<std::string>  s_cache_ranked;  // 评分后的候选文本顺序
 static std::vector<double>       s_cache_scores;  // 与 ranked 对齐的原始分 (词频融合重放用)
+static std::vector<std::array<double, 3>> s_cache_ce3;  // 与 ranked 对齐的 CE 三分量（未乘权重；调试窗口展开用）
 static int                       s_cache_gen = -1; // 缓存建立时的 reset 代次
 
 // ============================================================
@@ -1084,6 +1086,13 @@ static double user_unigram_term(const std::string &x) {
   double p1 = (double)((g_user_uni.count(x) ? g_user_uni[x] : 0) + 1)
               / (double)(g_user_nseen + kBigramVcap);
   return log(p1);
+}
+
+// 累计 unigram 原始计数（调试窗口"累计频"列用；未平滑未取对数）
+static long long user_uni_count(const std::string &x) {
+  user_bi_ensure_loaded();
+  auto it = g_user_uni.find(x);
+  return it == g_user_uni.end() ? 0 : it->second;
 }
 
 static void user_freq_save() {
@@ -1659,8 +1668,14 @@ static double ce_target(const float *logits, int target_id, float m, double lse)
 // ============================================================
 static void score_batch(const std::vector<llama_token> &ctx_ids,
                         const std::vector<std::vector<llama_token>> &cands,
-                        std::vector<double> &scores_out) {
+                        std::vector<double> &scores_out,
+                        std::vector<std::array<double, 3>> *ce3_out = nullptr,
+                        bool *prep_hit_out = nullptr) {
   scores_out.assign(cands.size(), -1e10);
+  if (ce3_out)  // 三分量初值 NaN（缺 token / 失败位 → 调试端显示空）
+    ce3_out->assign(cands.size(), {NAN, NAN, NAN});
+  if (prep_hit_out)
+    *prep_hit_out = false;
   int n_cands = (int)cands.size();
   if (n_cands == 0)
     return;
@@ -1692,6 +1707,8 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
   // ctx keeps hitting until seq0 is covered by another decode.
   bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx &&
                   g_seq0_gen == g_prep_gen;
+  if (prep_hit_out)
+    *prep_hit_out = use_prep;
   const float *ctx_logits = nullptr;  // 直接指向 prep 存储，免全量 vector 拷贝
   float m0 = 0;
   double lse0 = 0;
@@ -1751,7 +1768,10 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
   // CE 位置权重 (kCeW[0/1/2]): 见文件头注释; 4+ token 只算前三项, 无外推
   static constexpr double kCeW[3] = {1.0, 1.05, 0.45};  // v3 2026-11-06 六维联合标定 (旧 1.13/0.61 出自 2026-09-16 前缀标定)
   for (int i = 0; i < n_cands; i++) {
-    ce_sum[i] = kCeW[0] * ce_target(ctx_logits, cands[i][0], m0, lse0);
+    double c1 = ce_target(ctx_logits, cands[i][0], m0, lse0);
+    ce_sum[i] = kCeW[0] * c1;
+    if (ce3_out)
+      (*ce3_out)[i][0] = c1;  // 原始分量（未乘权重，调试展开用）
   }
   auto ts_ce1_1 = std::chrono::high_resolution_clock::now();
   double ms_ce1 =
@@ -1820,14 +1840,22 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
         float *l = llama_get_logits_ith(g_ctx, u);
         if (!l) {
           for (int ci : r2_cands[u]) ce_sum[ci] = -1e10;
+          if (ce3_out)
+            for (int ci : r2_cands[u]) (*ce3_out)[ci] = {NAN, NAN, NAN};
           continue;
         }
-        for (int ci : r2_cands[u])
-          ce_sum[ci] += kCeW[1] * cross_entropy(l, vs, cands[ci][1]);
+        for (int ci : r2_cands[u]) {
+          double c2 = cross_entropy(l, vs, cands[ci][1]);
+          ce_sum[ci] += kCeW[1] * c2;
+          if (ce3_out)
+            (*ce3_out)[ci][1] = c2;
+        }
       }
     } else {
       for (int ci : idx2)
         ce_sum[ci] = -1e10;
+      if (ce3_out)
+        for (int ci : idx2) (*ce3_out)[ci] = {NAN, NAN, NAN};
       log_msg("WARN: step2 decode failed");
       // 失败自愈：prep 命中路径无 memory_clear，decode 失败多为 KV 耗尽
       // （见下方 worker 清理说明）——置无效强制下次 score 走全流程重建
@@ -1875,14 +1903,23 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
         float *l = llama_get_logits_ith(g_ctx, v);
         if (!l) {
           for (int ci : rows3[v].cands) ce_sum[ci] = -1e10;
+          if (ce3_out)
+            for (int ci : rows3[v].cands) (*ce3_out)[ci] = {NAN, NAN, NAN};
           continue;
         }
-        for (int ci : rows3[v].cands)
-          ce_sum[ci] += kCeW[2] * cross_entropy(l, vs, cands[ci][2]);
+        for (int ci : rows3[v].cands) {
+          double c3 = cross_entropy(l, vs, cands[ci][2]);
+          ce_sum[ci] += kCeW[2] * c3;
+          if (ce3_out)
+            (*ce3_out)[ci][2] = c3;
+        }
       }
     } else {
       for (auto &r : rows3)
         for (int ci : r.cands) ce_sum[ci] = -1e10;
+      if (ce3_out)
+        for (auto &r : rows3)
+          for (int ci : r.cands) (*ce3_out)[ci] = {NAN, NAN, NAN};
       log_msg("WARN: step3 decode failed");
       g_prep_ready = false;  // 同 Step2：失败自愈
     }
@@ -2108,9 +2145,12 @@ void LlmRerankTranslation::Collect() {
 
     bool did_score = false;
     double ev_ms = 0;
+    bool prep_hit = false;  // 上文 KV 预解码命中（调试 L 行"预解"列）
     std::vector<int> order;                     // candidate indices, score desc
     std::vector<double> score_of(candidates_.size(), 0.0);  // 词频融合重放用
     std::vector<char> has_score(candidates_.size(), 0);
+    std::vector<std::array<double, 3>> ce3_of(  // CE 三分量原始值（调试展开）
+        candidates_.size(), {NAN, NAN, NAN});
 
     // debug_fusion 块缓冲: 头行先写, 明细在各段补, 末尾统一落盘
     std::vector<std::string> dbg;
@@ -2135,6 +2175,7 @@ void LlmRerankTranslation::Collect() {
       // cache hit: 同一 (ctx, input) 的评分结果复用 — 翻页/候选窗重建
       // 不再跑 S2/S3 (~36ms/次)。缓存存评分顺序+原始分, 词频融合与徽章按
       // 当前配置重放; 候选集变化时新候选未命中 → 落到尾部 (与插件版一致)。
+      prep_hit = true;  // 评分缓存命中 = 整段推理热路径（预解必在）
       for (size_t k = 0; k < s_cache_ranked.size(); k++)
         for (size_t i = 0; i < candidates_.size(); i++)
           if (candidates_[i]->text() == s_cache_ranked[k]) {
@@ -2143,6 +2184,8 @@ void LlmRerankTranslation::Collect() {
               score_of[i] = s_cache_scores[k];
               has_score[i] = s_cache_scores[k] > -1e9;
             }
+            if (k < s_cache_ce3.size())
+              ce3_of[i] = s_cache_ce3[k];
             break;
           }
     } else {
@@ -2163,8 +2206,9 @@ void LlmRerankTranslation::Collect() {
         }
 
         std::vector<double> scores;
+        std::vector<std::array<double, 3>> ce3;
         auto ev_t0 = std::chrono::high_resolution_clock::now();
-        score_batch(ctx_ids, cand_ids, scores);
+        score_batch(ctx_ids, cand_ids, scores, &ce3, &prep_hit);
         auto ev_t1 = std::chrono::high_resolution_clock::now();
         ev_ms =
             std::chrono::duration<double, std::milli>(ev_t1 - ev_t0).count();
@@ -2173,6 +2217,7 @@ void LlmRerankTranslation::Collect() {
           for (size_t i = 0; i < scores.size(); i++) {
             score_of[i] = scores[i];
             has_score[i] = scores[i] > -1e9;
+            ce3_of[i] = ce3[i];
           }
           std::vector<int> ord(scores.size());
           for (size_t i = 0; i < ord.size(); i++)
@@ -2186,9 +2231,11 @@ void LlmRerankTranslation::Collect() {
           s_cache_input = input_;
           s_cache_ranked.clear();
           s_cache_scores.clear();
+          s_cache_ce3.clear();
           for (int i : order) {
             s_cache_ranked.push_back(candidates_[i]->text());
             s_cache_scores.push_back(scores[i]);
+            s_cache_ce3.push_back(ce3[i]);
           }
           did_score = true;
         } else if (g_debug_fusion) {
@@ -2310,10 +2357,13 @@ void LlmRerankTranslation::Collect() {
       dbg.push_back(moved.empty() ? "  名次变化: 无 (CE 序即融合序)"
                                   : "  名次变化: " + moved);
     }
-    // 实时调试 C 行（2026-11-10）：窗口候选按最终序（ce/fused/cerank 取自
-    // 重排状态）+ 层1 尾窗透传（win=0，无 CE 分），上限 20 行。
-    // order 空时（评分整体失败）窗口按引擎序全 win=1 无分。
-    // L 头行也在此发（评分/融合后 ev_ms 才是终值；HIT 时为 0）。
+    // 实时调试 C 行（2026-11-10；2026-11-11 协议 v2：频两项改发原始值
+    // eff/uni——"显示未乘系数的数字"，尾接 CE 三分量原始值 ce1/ce2/ce3
+    // （未乘 kCeW 权重，查看器点击 CE 单元格展开））：窗口候选按最终序
+    // （ce/fused/cerank 取自重排状态）+ 层1 尾窗透传（win=0，无 CE 分），
+    // 上限 20 行。order 空时（评分整体失败）窗口按引擎序全 win=1 无分。
+    // L 头行也在此发（评分/融合后 ev_ms 才是终值；HIT 时为 0；尾字段
+    // prep = 上文 KV 预解码命中）。
     if (g_debug_fusion) {
       char msb[16];
       snprintf(msb, sizeof(msb), "%.0f", ev_ms);
@@ -2321,48 +2371,59 @@ void LlmRerankTranslation::Collect() {
                 (cache_hit ? "HIT" : "MISS") + "|" + src_ + "|" +
                 live_esc(ctx) + "|" + std::to_string((long long)g_user_tick) +
                 "|" + msb + "|1|" +
-                std::to_string((int)candidates_.size()));
+                std::to_string((int)candidates_.size()) + "|" +
+                (prep_hit ? "1" : "0"));
       user_freq_ensure_loaded();
       std::map<std::string, int> eng_rank;  // 引擎原序（首现位置）
       for (size_t i = 0; i < allc.size(); i++)
         if (!eng_rank.count(allc[i]->text()))
           eng_rank[allc[i]->text()] = (int)i + 1;
       int emitted = 0;
-      auto live_c = [&](const an<Candidate> &c, const std::string &ce,
-                        const std::string &fused, int cerank, int fin,
-                        int full, int win) {
+      // src_idx = ce3_of 下标（层2 窗内候选）；-1 = 尾窗/无评分分量
+      auto live_c = [&](const an<Candidate> &c, int src_idx,
+                        const std::string &ce, const std::string &fused,
+                        int cerank, int fin, int full, int win) {
         if (emitted >= 20)
           return;
         emitted++;
         double eff = user_freq_eff(c->text());
         double fb = g_freq_beta * std::log1p(eff);
         double u1 = user_unigram_term(c->text());
+        std::string ce1, ce2, ce3s;
+        if (src_idx >= 0 &&
+            src_idx < (int)ce3_of.size()) {
+          ce1 = live_num(ce3_of[(size_t)src_idx][0]);
+          ce2 = live_num(ce3_of[(size_t)src_idx][1]);
+          ce3s = live_num(ce3_of[(size_t)src_idx][2]);
+        }
         auto er = eng_rank.find(c->text());
         live_send("C|" +
                   std::to_string(er != eng_rank.end() ? er->second : 0) +
                   "|" + live_esc(c->text()) + "|" + live_num(fb + u1) + "|" +
-                  ce + "|" + live_num(fb) + "|" + live_num(u1) + "|" + fused +
+                  ce + "|" + live_num(eff) + "|" +
+                  std::to_string(user_uni_count(c->text())) + "|" + fused +
                   "|" + std::to_string(full) + "|" + std::to_string(cerank) +
-                  "|" + std::to_string(fin) + "|" + std::to_string(win));
+                  "|" + std::to_string(fin) + "|" + std::to_string(win) +
+                  "|" + ce1 + "|" + ce2 + "|" + ce3s);
       };
       if (!order.empty()) {
         std::vector<int> fin_rank(candidates_.size(), 0);
         for (size_t k = 0; k < order.size(); k++)
           fin_rank[(size_t)order[k]] = (int)k + 1;
         for (int i : order)
-          live_c(candidates_[(size_t)i],
+          live_c(candidates_[(size_t)i], i,
                  has_score[(size_t)i] ? live_num(score_of[(size_t)i]) : "",
                  live_num(fused_of[(size_t)i]), ce_rank[(size_t)i],
                  fin_rank[(size_t)i], dbg_full[(size_t)i] ? 1 : 0, 1);
         int base = (int)candidates_.size();
         for (size_t j = 0; j < tail.size(); j++)
-          live_c(tail[j], "", "", 0, base + (int)j + 1, 0, 0);
+          live_c(tail[j], -1, "", "", 0, base + (int)j + 1, 0, 0);
       } else {
         for (size_t i = 0; i < candidates_.size(); i++)
-          live_c(candidates_[i], "", "", 0, (int)i + 1, 0, 1);
+          live_c(candidates_[i], (int)i, "", "", 0, (int)i + 1, 0, 1);
         int base = (int)candidates_.size();
         for (size_t j = 0; j < tail.size(); j++)
-          live_c(tail[j], "", "", 0, base + (int)j + 1, 0, 0);
+          live_c(tail[j], -1, "", "", 0, base + (int)j + 1, 0, 0);
       }
     }
     if (g_debug_fusion)

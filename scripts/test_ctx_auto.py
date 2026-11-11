@@ -8,10 +8,20 @@ COM/UIA/历史 上文来源在 commit/退格/Ctrl+Z/点击/粘贴 等信号后�
 （2026-09-12 信号层统一的回归工具）。
 
 用法（普通权限 python，目标应用由脚本拉起并置前）:
-  python scripts\\test_ctx_auto.py                # 记事本全场景 s1-s5
+  python scripts\\test_ctx_auto.py                # 记事本全场景 s1-s5，双节奏
+                                                  # （先 fast 后 slow 各一遍）
   python scripts\\test_ctx_auto.py -s s2,s4       # 指定场景
+  python scripts\\test_ctx_auto.py --rhythm slow  # 只跑慢档（每键500ms/词间2s）
   python scripts\\test_ctx_auto.py --app wps      # WPS：先手动开好空文档置前，
                                                   # 脚本倒计时后开始（断言 src=com）
+
+打字节奏（2026-11-11 用户定案：模拟打字测试必须两档都跑）：
+  fast  = 每键 ~50ms、词间 50ms（时序设计标准的按键间隔下限——密集突发，
+          考验不丢键/不串行）；slow = 每键 ~500ms、词间 2s（词间 >1s 空闲
+          触发 TSF/上文采集的超时重读路径——调试窗口 v2026.11.11-2 缺陷
+          即只在 slow 档现形）。classic = 旧缺省（键周期 ~140ms、词间
+          ~0.45s）仅作对照。场景内的引擎等待（顶屏/kick 读链/粘贴浮窗）
+          是引擎行为时序，不随节奏缩放。
 
 前提:
   - 输入法处于中文态、方案为四码定长（拼读双拼）、无 CapsLock
@@ -46,6 +56,18 @@ MOUSEEVENTF_LEFTUP = 0x0004
 VK_CONTROL = 0x11
 VK_BACK = 0x08
 
+# ── 打字节奏（2026-11-11 用户定案：模拟打字测试两档都要跑）─────────
+# hold = 键按下→抬起；gap = 抬起→下一键（key_tap 路径，编辑键/导航键）
+# tgap = type_code 的编码键间隔（down/up 各一次 tgap，键周期 = 2×tgap）
+# word = 词间（type_word_and_wait 的 settle）
+RHYTHMS = {
+    "classic": {"hold": 0.03, "gap": 0.06, "tgap": 0.07, "word": 0.45},
+    "fast":    {"hold": 0.02, "gap": 0.03, "tgap": 0.025, "word": 0.05},
+    "slow":    {"hold": 0.20, "gap": 0.30, "tgap": 0.25, "word": 2.0},
+}
+RHY = RHYTHMS["classic"]
+TAG = ""  # 断言名前缀（区分双节奏轮次，如 "[fast] S1 w2 ctx has w1"）
+
 
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [("wVk", wt.WORD), ("wScan", wt.WORD), ("dwFlags", wt.DWORD),
@@ -71,8 +93,11 @@ def send_key(vk, up=False):
     user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
 
-def key_tap(vk, ctrl=False, hold=0.03):
-    """单击一键；ctrl=True 时以 Ctrl+key 组合发出（down→key→up 顺序真实）。"""
+def key_tap(vk, ctrl=False, hold=None):
+    """单击一键；ctrl=True 时以 Ctrl+key 组合发出（down→key→up 顺序真实）。
+    hold/键间隔缺省按当前打字节奏（RHY）取值。"""
+    if hold is None:
+        hold = RHY["hold"]
     if ctrl:
         send_key(VK_CONTROL)
         time.sleep(hold)
@@ -82,10 +107,12 @@ def key_tap(vk, ctrl=False, hold=0.03):
     if ctrl:
         time.sleep(0.02)
         send_key(VK_CONTROL, up=True)
-    time.sleep(0.06)  # 键间隔（模拟真实节奏，输入法/引擎有时间处理）
+    time.sleep(RHY["gap"])  # 键间隔（模拟真实节奏，输入法/引擎有时间处理）
 
 
-def type_code(code, gap=0.07):
+def type_code(code, gap=None):
+    if gap is None:
+        gap = RHY["tgap"]
     for ch in code:
         send_key(ord(ch.upper()))
         time.sleep(gap)
@@ -218,6 +245,7 @@ PASS, FAIL, WARN = [], [], []
 
 
 def check(cond, name, detail=""):
+    name = TAG + name
     if cond:
         PASS.append(name)
         print("  PASS  %s %s" % (name, detail))
@@ -227,12 +255,17 @@ def check(cond, name, detail=""):
 
 
 def warn(name, detail=""):
+    name = TAG + name
     WARN.append(name)
     print("  WARN  %s %s" % (name, detail))
 
 
-def type_word_and_wait(code, log, settle=0.45):
-    """打一个四码词 → 等它自己的评分行。settle 给 kick 读链留时间。"""
+def type_word_and_wait(code, log, settle=None):
+    """打一个四码词 → 等它自己的评分行。settle = 词间（打字节奏定案：
+    fast 50ms / slow 2s / classic 0.45s）——评分行在第 4 键同步写出，
+    wait_new 自行轮询，settle 只承担词间节奏与 kick 读链余量。"""
+    if settle is None:
+        settle = RHY["word"]
     sub = log.mark
     type_code(code)
     time.sleep(settle)
@@ -275,11 +308,17 @@ def s1_base(log):
             continue
         check(row["src"] in ("uia", "com", "tsf"), "S1 %s src" % code,
               "src=%s ctx=…%s" % (row["src"], row["ctx"][-12:]))
-    # 第 2/3 词的上文应含前一上屏词
+    # 第 2/3 词的上文应含前一上屏词。上屏词 = 前一词评分行结果序的首选
+    # （LLM 重排可能不选词表首选：v3 常数下"发现"后 wkjl 合法改选 痢疾，
+    # 2026-11-11 本机实测——断言跟随实际提交而非词表，避免环境态漂移误报。
+    # w1 冷启动无评分行，其上屏词是方案原始首选，w2 断言仍用词表的 发现）
+    w2_committed = (rows["wkjl"] or {}).get("result", "nil").split(",")[0]
     check(ctx_has(rows["wkjl"], "发现"), "S1 w2 ctx has w1",
           "ctx=…%s" % (rows["wkjl"] or {}).get("ctx", "")[-12:])
-    check(ctx_has(rows["krng"], "立即"), "S1 w3 ctx has w2",
-          "ctx=…%s" % (rows["krng"] or {}).get("ctx", "")[-12:])
+    check(w2_committed != "nil" and ctx_has(rows["krng"], w2_committed),
+          "S1 w3 ctx has w2",
+          "w2=%s ctx=…%s" % (w2_committed,
+                             (rows["krng"] or {}).get("ctx", "")[-12:]))
 
 
 def s2_backspace(log):
@@ -496,10 +535,16 @@ SCENARIOS = {"s1": s1_base, "s2": s2_backspace, "s3": s3_ctrlz,
 
 
 def main():
-    global hwnd_holder
+    global RHY, TAG
     ap = argparse.ArgumentParser()
     ap.add_argument("-s", "--scenarios", default="s1,s2,s3,s4,s5")
     ap.add_argument("--app", default="notepad", choices=["notepad", "wps"])
+    ap.add_argument("--rhythm", default="both",
+                    choices=["classic", "fast", "slow", "both"],
+                    help="打字节奏（2026-11-11 定案：模拟打字两档都要跑，"
+                         "both=先 fast 后 slow 各一遍场景表，为缺省）："
+                         "fast=每键50ms/词间50ms；slow=每键500ms/词间2s；"
+                         "classic=旧缺省节奏仅作对照")
     ap.add_argument("--engine", default="plugin", choices=["plugin", "source"],
                     help="plugin=lua 版 events 日志（rime_llm_events.txt）；"
                          "source=原生组件（rime_llm_filter_log.txt，event_log"
@@ -553,21 +598,32 @@ def main():
     key_tap(VK_BACK)
 
     names = [s.strip() for s in args.scenarios.split(",") if s.strip()]
-    for name in names:
-        fn = SCENARIOS.get(name)
-        if not fn:
-            print("unknown scenario %s" % name)
-            continue
-        if not ensure_foreground(hwnd, office=(args.app == "wps")):
-            print("ABORT: target window not foreground (%s)" % name)
-            sys.exit(2)
-        clear_doc()
-        try:
-            fn(log)
-        except Exception as e:
-            FAIL.append("%s exception" % name)
-            print("  EXC   %s: %r" % (name, e))
-        time.sleep(0.6)
+    rhythm_list = ["fast", "slow"] if args.rhythm == "both" else [args.rhythm]
+    for rh in rhythm_list:
+        RHY = RHYTHMS[rh]
+        TAG = "[%s] " % rh if len(rhythm_list) > 1 else ""
+        print("==> rhythm=%s (key %dms, word %dms)" % (
+            rh, int((RHY["hold"] + RHY["gap"]) * 1000),
+            int(RHY["word"] * 1000)))
+        for name in names:
+            fn = SCENARIOS.get(name)
+            if not fn:
+                print("unknown scenario %s" % name)
+                continue
+            if not ensure_foreground(hwnd, office=(args.app == "wps")):
+                print("ABORT: target window not foreground (%s)" % name)
+                sys.exit(2)
+            clear_doc()
+            # 场景起点推进观察位：同名码在上一场景/上一节奏轮的旧行不作数
+            #（wait_new 反向找最新行，不推进的话陈旧行会假 PASS——双节奏
+            # 同码跑两遍放大了这一既有隐患）
+            log.mark = log._nlines()
+            try:
+                fn(log)
+            except Exception as e:
+                FAIL.append("%s exception" % name)
+                print("  EXC   %s: %r" % (name, e))
+            time.sleep(0.6)
 
     total = len(PASS) + len(FAIL)
     print("\n== %d/%d passed, %d warn ==" % (len(PASS), total, len(WARN)))
