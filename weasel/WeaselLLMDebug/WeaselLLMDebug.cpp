@@ -309,7 +309,8 @@ static std::wstring fb_proc(const Row &r, int wl, int we) {
   return lead + L"=12·ln(1+" + padl(f1(eff), we) + L")";
 }
 
-// 累计词频格：ln(uni+1)（2026-11-11 公式简化，分母为窗内常数已去除）
+// 累计词频格：ln(1+uni)（2026-11-11 公式简化，分母为窗内常数已去除；
+// 1 在前与衰减词频分格统一——v2026.11.11-13 定案，本格曾漏改显示 ln(uni+1)）
 static std::wstring u1_proc(const Row &r, int wl, int wu) {
   double u1, uni;
   if (!num_of(r.u1, u1)) return L"—";
@@ -317,7 +318,7 @@ static std::wstring u1_proc(const Row &r, int wl, int wu) {
   if (!num_of(r.uni, uni)) return lead;
   wchar_t ub[16], b[48];
   swprintf(ub, 16, L"%d", (int)uni);
-  swprintf(b, 48, L"=ln(%s+1)", padl(ub, wu).c_str());
+  swprintf(b, 48, L"=ln(1+%s)", padl(ub, wu).c_str());
   return lead + b;
 }
 
