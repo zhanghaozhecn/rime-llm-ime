@@ -8,7 +8,9 @@
 //   L|HH:MM:SS|input|cache|src|ctx|tick|ms|ready|n|prep|n_seen
 //                                                    每次触发评分的调用头
 //                                                    （ctx=完整上文；prep=KV 预解
-//                                                    命中；n_seen=全词数）
+//                                                    命中；n_seen=全词数，
+//                                                    2026-11-12 起查看器不显示
+//                                                    ——公式已不含分母）
 //   C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1
 //                                                    逐候选按最终序（上限 20）：
 //                                                    s1=层1分(=fb+u1)
@@ -111,7 +113,7 @@ struct Row {
   bool win0 = false;  // 尾窗透传（灰字）
 };
 struct Inv {
-  std::wstring t, input, cache, src, ctx, tick, ms, ready, n, prep, nseen;
+  std::wstring t, input, cache, src, ctx, tick, ms, ready, n, prep;
   std::vector<Row> rows;
 };
 static std::deque<Inv> g_invs;          // 最近 50 次调用（新的在尾）
@@ -267,7 +269,8 @@ static void measure_widths(const Inv &inv, ColW &w) {
 
 // CE 格：加权 CE 与三分量。生产语义 = ce = -(Σ kCeW·分量)（分量是原始
 // 交叉熵、正值；分值取负号进融合），故等号右为带负号的括号和。
-// 1.00/1.05/0.45 = kCeW 位置权重（librime v3 标定内置常数）；
+// ce2/ce3 带 kCeW 权重前缀（1.05/0.45 = librime v3 标定内置常数，原样显示）；
+// ce1 权重恒 1 → 前缀不显示（2026-11-12 用户定案）；
 // 分量缺（无分/未参与）的项整项省略。
 static std::wstring ce_proc(const Row &r, int wl, int wc) {
   double ce;
@@ -276,16 +279,19 @@ static std::wstring ce_proc(const Row &r, int wl, int wc) {
   std::wstring t = lead + L"=-(";
   bool any = false;
   const struct {
-    const wchar_t *w;
+    const wchar_t *w;  // nullptr = 权重恒 1，不显前缀
     const std::wstring *raw;
-  } t3[3] = {{L"1.00", &r.ce1}, {L"1.05", &r.ce2}, {L"0.45", &r.ce3}};
+  } t3[3] = {{nullptr, &r.ce1}, {L"1.05", &r.ce2}, {L"0.45", &r.ce3}};
   for (auto &x : t3) {
     double v;
     if (!num_of(*x.raw, v)) continue;
-    wchar_t b[48];
-    swprintf(b, 48, L"%s·", x.w);
     if (any) t += L"+";
-    t += b + padl(f1(v), wc);
+    if (x.w) {
+      wchar_t b[48];
+      swprintf(b, 48, L"%s·", x.w);
+      t += b;
+    }
+    t += padl(f1(v), wc);
     any = true;
   }
   if (!any) return lead;  // 旧协议无分量 → 只显分数
@@ -365,12 +371,11 @@ static void update_current() {
   const Inv &inv = g_invs[g_view];
   wchar_t line[512];
   swprintf(line, 512,
-           L"%s  输入 %s   来源 %s   预解 %s   %sms   tick %s   全词数 %s"
+           L"%s  输入 %s   来源 %s   预解 %s   %sms   tick %s"
            L"   n=%s   就绪 %s",
            inv.t.c_str(), inv.input.c_str(), inv.src.c_str(),
            inv.prep.empty() ? L"-" : inv.prep.c_str(), inv.ms.c_str(),
-           inv.tick.c_str(), inv.nseen.empty() ? L"-" : inv.nseen.c_str(),
-           inv.n.c_str(), inv.ready.c_str());
+           inv.tick.c_str(), inv.n.c_str(), inv.ready.c_str());
   SetWindowTextW(h_info, line);
   SetWindowTextW(h_ctx,
                  (std::wstring(L"上文：") +
@@ -442,7 +447,8 @@ static void handle_line(const std::string &line) {
     inv.ready = u8w(f[8]);
     inv.n = u8w(f[9]);
     inv.prep = f.size() > 10 ? u8w(f[10]) : L"";
-    inv.nseen = f.size() > 11 ? u8w(f[11]) : L"";
+    // 协议 L 行第 12 字段 n_seen（全词数）自 2026-11-12 不再解析/显示
+    //（公式简化后无消费方）——协议保留，字段被忽略
     g_invs.push_back(std::move(inv));
     while (g_invs.size() > 50) {
       g_invs.pop_front();
