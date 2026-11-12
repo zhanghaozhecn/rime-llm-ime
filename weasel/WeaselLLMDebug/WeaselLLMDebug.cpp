@@ -5,12 +5,12 @@
 // 同协议；插件版查看器为 rime-llm-rerank 仓库 debug\llm_debug_view.ps1，
 // 行语义注释两边逐字一致）：
 //   V|rime-llm-live|1|source|<日期>                  连接后服务端立即推
-//   L|HH:MM:SS|input|cache|src|ctx|tick|ms|ready|n|prep|n_seen
+//   L|HH:MM:SS|input|cache|src|ctx|tick|ms|ready|n|prep|n_seen|ctx_used
 //                                                    每次触发评分的调用头
-//                                                    （ctx=完整上文；prep=KV 预解
-//                                                    命中；n_seen=全词数，
-//                                                    2026-11-12 起查看器不显示
-//                                                    ——公式已不含分母）
+//                                                    （ctx=完整去空白上文；prep=KV 预解
+//                                                    命中；n_seen=全词数，查看器不显示；
+//                                                    v4 尾字段 ctx_used=推理用尾部
+//                                                    ——查看器灰显其余前缀）
 //   C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1
 //                                                    逐候选按最终序（上限 20）：
 //                                                    s1=层1分(=fb+u1)
@@ -30,6 +30,7 @@
 // 不碰跨线程控件访问。
 #include <windows.h>
 #include <commctrl.h>
+#include <richedit.h>
 #include <objbase.h>
 #include <string>
 #include <vector>
@@ -113,7 +114,7 @@ struct Row {
   bool win0 = false;  // 尾窗透传（灰字）
 };
 struct Inv {
-  std::wstring t, input, cache, src, ctx, tick, ms, ready, n, prep;
+  std::wstring t, input, cache, src, ctx, tick, ms, ready, n, prep, ctxused;
   std::vector<Row> rows;
 };
 static std::deque<Inv> g_invs;          // 最近 50 次调用（新的在尾）
@@ -211,6 +212,7 @@ static HWND g_hwnd = NULL;
 static HFONT g_font = NULL, g_font_bold = NULL, g_font_hint = NULL,
               g_font_mono = NULL;
 static HWND h_status, h_info, h_ctx, h_grid, h_hist, h_evt, h_foot;
+static bool g_ctx_is_rich = false;  // 上文行 = RichEdit（false = 退回 STATIC，不灰显）
 
 static void set_status(const wchar_t *text, bool ok) {
   SetWindowTextW(h_status, text);
@@ -361,6 +363,30 @@ static void fill_grid(const Inv &inv) {
   }
 }
 
+// 上文行灰显（协议 v4 ctx_used）：'上文：' 头 + 未用前缀灰（RGB 150）+
+// 推理用尾部正常色；used 空/找不到/非 RichEdit → 全文正常色
+static void ctx_render(const std::wstring &ctx, const std::wstring &used) {
+  std::wstring full = L"上文：" + (ctx.empty() ? L"（空）" : ctx);
+  SetWindowTextW(h_ctx, full.c_str());
+  if (!g_ctx_is_rich) return;
+  size_t pos = used.empty() ? std::wstring::npos : full.rfind(used);
+  if (pos == std::wstring::npos || pos <= 3) return;  // 无前缀可灰
+  CHARFORMAT2W cf = {};
+  cf.cbSize = sizeof(cf);
+  cf.dwMask = CFM_COLOR;
+  CHARRANGE cr;
+  cr.cpMin = 3;  // '上文：' 3 字符头保持正常色
+  cr.cpMax = (LONG)pos;
+  SendMessageW(h_ctx, EM_EXSETSEL, 0, (LPARAM)&cr);
+  cf.crTextColor = RGB(150, 150, 150);
+  SendMessageW(h_ctx, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+  cr.cpMin = (LONG)pos;
+  cr.cpMax = -1;
+  SendMessageW(h_ctx, EM_EXSETSEL, 0, (LPARAM)&cr);
+  cf.crTextColor = RGB(0, 0, 0);
+  SendMessageW(h_ctx, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+}
+
 static void update_current() {
   if (g_view < 0 || g_view >= (int)g_invs.size()) {
     SetWindowTextW(h_info, L"—");
@@ -377,9 +403,7 @@ static void update_current() {
            inv.prep.empty() ? L"-" : inv.prep.c_str(), inv.ms.c_str(),
            inv.tick.c_str(), inv.n.c_str(), inv.ready.c_str());
   SetWindowTextW(h_info, line);
-  SetWindowTextW(h_ctx,
-                 (std::wstring(L"上文：") +
-                  (inv.ctx.empty() ? L"（空）" : inv.ctx)).c_str());
+  ctx_render(inv.ctx, inv.ctxused);
   fill_grid(inv);
 }
 
@@ -447,6 +471,9 @@ static void handle_line(const std::string &line) {
     inv.ready = u8w(f[8]);
     inv.n = u8w(f[9]);
     inv.prep = f.size() > 10 ? u8w(f[10]) : L"";
+    // 协议 v4（2026-11-12）：第 13 字段 = 推理用尾部文本（灰显）；
+    // 旧 DLL 无该字段 → 空 = 全文正常色不灰显
+    inv.ctxused = f.size() > 12 ? u8w(f[12]) : L"";
     // 协议 L 行第 12 字段 n_seen（全词数）自 2026-11-12 不再解析/显示
     //（公式简化后无消费方）——协议保留，字段被忽略
     g_invs.push_back(std::move(inv));
@@ -529,6 +556,31 @@ static HWND mk_ctl(const wchar_t *cls, const wchar_t *text, DWORD style, int x,
   return c;
 }
 
+// 上文行控件 = 只读 RichEdit（2026-11-12 灰显，协议 v4）：STATIC 无分段
+// 着色能力；Msftedit 动态加载（系统组件），缺失退回 STATIC（不灰显仅全文）。
+// 竖滚动条承接长上文（原 STATIC 单行省略号退役）
+static HWND mk_ctx(int x, int y, int w, int h, int id, HFONT f) {
+  static bool msft_tried = false;
+  if (!msft_tried) {
+    msft_tried = true;
+    LoadLibraryW(L"Msftedit.dll");
+  }
+  HWND c = CreateWindowW(L"RichEdit50W", L"上文：—",
+                         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY |
+                             WS_VSCROLL,
+                         ts(x), ts(y), ts(w), ts(h), g_hwnd,
+                         (HMENU)(INT_PTR)id, NULL, NULL);
+  if (c) {
+    g_ctx_is_rich = true;
+    SendMessageW(c, EM_SETBKGNDCOLOR, 0, RGB(255, 255, 255));
+  } else {
+    c = mk_ctl(L"STATIC", L"上文：—", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, x, y,
+               w, h, id, f);
+  }
+  SendMessageW(c, WM_SETFONT, (WPARAM)f, TRUE);
+  return c;
+}
+
 static void make_ui() {
   g_font = CreateFontW(-ts(13), 0, 0, 0, FW_NORMAL, 0, 0, 0,
                        DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0,
@@ -552,8 +604,7 @@ static void make_ui() {
                     IDC_STATUS, g_font);
   h_info = mk_ctl(L"STATIC", L"—", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 34,
                   1048, 20, IDC_INFO, g_font_bold);
-  h_ctx = mk_ctl(L"STATIC", L"上文：—", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8,
-                 58, 1048, 42, IDC_CTX, g_font);
+  h_ctx = mk_ctx(8, 58, 1048, 42, IDC_CTX, g_font);
   mk_ctl(L"BUTTON", L"暂停", BS_PUSHBUTTON, 720, 6, 64, 24, IDC_PAUSE, g_font);
   mk_ctl(L"BUTTON", L"置顶", BS_AUTOCHECKBOX, 792, 8, 52, 22, IDC_TOP, g_font);
   mk_ctl(L"BUTTON", L"清空", BS_PUSHBUTTON, 852, 6, 52, 24, IDC_CLEAR, g_font);

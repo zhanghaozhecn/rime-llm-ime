@@ -32,8 +32,11 @@ function Send-Word {
   }
   # 协议 v2（2026-11-11）：L 尾加 prep；C 第 5/6 字段 = 衰减频(eff)/累计频(uni)
   # 原始值，尾接 CE 三分量 ce1/ce2/ce3（未乘权重）
+  # 协议 v4（2026-11-12）：L 尾追加 ctx_used = 推理用尾部文本（灰显验证；
+  # 假数据取上文末 4 字符，前缀应显灰色）
   $t = Get-Date -Format HH:mm:ss
-  $w.WriteLine("L|$t|$code4|-|tsf|$ctx|$tick|4$n|1|3|$($n % 2)|12345")
+  $used = if ($ctx.Length -gt 4) { $ctx.Substring($ctx.Length - 4) } else { $ctx }
+  $w.WriteLine("L|$t|$code4|-|tsf|$ctx|$tick|4$n|1|3|$($n % 2)|12345|$used")
   # 数值一律 F3 格式化（与生产 %.3f 一致；PowerShell 浮点直接插值会输出
   # 17 位长串，查看器列宽会截断 —— 2026-11-11 实测踩过）
   for ($i = 0; $i -lt $cands.Count; $i++) {
@@ -64,7 +67,7 @@ function Send-Word {
 if ($Rhythm -in 'fast', 'both') {
   Write-Output '== fast phase: 50ms/key, 50ms/word =='
   for ($i = 1; $i -le $Words; $i++) {
-    Send-Word $i 'fast' 50 50 ("f" + $i * 1111) @("快词A$i", "快词B$i", "快词C$i") "快节奏第$i词的上文" (100 + $i)
+    Send-Word $i 'fast' 50 50 ("f" + $i * 1111) @("快词A$i", "快词B$i", "快词C$i") "快节奏第$($i)词的上文" (100 + $i)
   }
 }
 if ($Rhythm -in 'slow', 'both') {
@@ -73,7 +76,7 @@ if ($Rhythm -in 'slow', 'both') {
     if ($i -gt 1) {
       $w.WriteLine("R|$(Get-Date -Format HH:mm:ss)|编辑键(BackSpace) 慢速词间重置")
     }
-    Send-Word $i 'slow' 500 2000 ("s" + $i * 1111) @("慢词A$i", "慢词B$i", "慢词C$i") "慢节奏第$i词的上文" (200 + $i)
+    Send-Word $i 'slow' 500 2000 ("s" + $i * 1111) @("慢词A$i", "慢词B$i", "慢词C$i") "慢节奏第$($i)词的上文" (200 + $i)
   }
 }
 Start-Sleep -Seconds 2

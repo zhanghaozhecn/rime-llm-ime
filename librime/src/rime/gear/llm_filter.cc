@@ -1606,6 +1606,19 @@ static std::vector<llama_token> tokenize(const char *text) {
   return toks;
 }
 
+// 推理用上文尾部文本（2026-11-12 调试窗口协议 v4，灰显用）：截尾保留的
+// ids 逐 token 拼 piece —— 字节级 BPE 的各 token piece 恰好等于原文中
+// 连续字节段，拼接 = 精确尾部（真实 token 边界，非字符数估算）。
+static std::string tokens_piece(const std::vector<llama_token> &ids) {
+  std::string s;
+  char buf[256];
+  for (auto id : ids) {
+    int n = llama_token_to_piece(g_vocab, id, buf, sizeof(buf), 0, true);
+    if (n > 0) s.append(buf, n);
+  }
+  return s;
+}
+
 // ============================================================
 // CE helper: -log(softmax(x)[target])
 // 通用优化（2026-11-06，两版同步；不依赖特定指令集、不改评分语义）：
@@ -2165,14 +2178,22 @@ void LlmRerankTranslation::Collect() {
       dbg.push_back(head);
     }
 
+    // 推理用上文尾部文本（协议 v4，调试窗口灰显；截尾分支内赋值）
+    std::string ctx_used;
     {
       if (ctx != ctx_)  // newline/whitespace differences worth showing
         log_msg("ctx raw: [%s]", escape_ctx(ctx_).c_str());
       log_msg("ctx: [%s]", escape_ctx(ctx).c_str());
       std::vector<llama_token> ctx_ids = tokenize(ctx.c_str());
       if ((int)ctx_ids.size() >= g_min_tokens) {
-        if ((int)ctx_ids.size() > g_max_ctx_tokens)
+        // 协议 v4（2026-11-12）：推理用尾部文本（调试窗口灰显）——截尾时 =
+        // 截尾保留 ids 的 piece 拼接（精确 token 边界）；未截尾 = 全文
+        if ((int)ctx_ids.size() > g_max_ctx_tokens) {
           ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - g_max_ctx_tokens);
+          ctx_used = tokens_piece(ctx_ids);
+        } else {
+          ctx_used = ctx;
+        }
 
         std::vector<std::vector<llama_token>> cand_ids;
         for (auto &c : candidates_) {
@@ -2329,8 +2350,9 @@ void LlmRerankTranslation::Collect() {
     // kCeW 权重，查看器常显）：窗口候选按最终序（ce/fused/cerank 取自重排
     // 状态）+ 层1 尾窗透传（win=0，无 CE 分），上限 20 行。order 空时（评分
     // 整体失败）窗口按引擎序全 win=1 无分。
-    // L 头行也在此发（评分/融合后 ev_ms 才是终值；尾两字段 prep = 上文 KV
-    // 预解码命中、nseen = 累计 unigram 全词数（累计得分的分母，n_seen）。
+    // L 头行也在此发（评分/融合后 ev_ms 才是终值；尾部字段 prep = 上文 KV
+    // 预解码命中、nseen = 累计 unigram 全词数（累计得分的分母，n_seen）、
+    // v4 追加 ctx_used = 推理实际使用的上文尾部文本（调试窗口灰显前缀）。
     // 第 3 字段原为评分缓存 HIT/MISS——缓存已删（2026-11-11），保留字段位置
     // 发 "-"：旧查看器显示"评缓 -"，新查看器不显示该列，字段数只增不改位。
     if (g_debug_fusion) {
@@ -2343,7 +2365,8 @@ void LlmRerankTranslation::Collect() {
                 "|" + msb + "|1|" +
                 std::to_string((int)candidates_.size()) + "|" +
                 (prep_hit ? "1" : "0") + "|" +
-                std::to_string((long long)g_user_nseen));
+                std::to_string((long long)g_user_nseen) + "|" +
+                live_esc(ctx_used));
       user_freq_ensure_loaded();
       std::map<std::string, int> eng_rank;  // 引擎原序（首现位置）
       for (size_t i = 0; i < allc.size(); i++)
