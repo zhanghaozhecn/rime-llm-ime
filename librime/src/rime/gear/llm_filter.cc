@@ -919,7 +919,6 @@ static void user_freq_ensure_loaded() {
   if (!f)
     return;
   long long max_tick = 0;
-  std::vector<std::pair<std::string, long long>> legacy;
   char line[512];
   while (fgets(line, sizeof(line), f)) {
     size_t len = strlen(line);
@@ -929,28 +928,30 @@ static void user_freq_ensure_loaded() {
       g_user_tick = atoll(line + 6);
       continue;
     }
+    // 词码对格式（2026-11-13, 与插件版同格式）: 词\t码\t累计\tdee\ttick。
+    // 旧词级格式（4/2 字段, 合并口径语义）不再迁移——读取端忽略, 落盘
+    // 自然剥除（分键语义下旧数据无法拆到词码对）。
     char *t1 = strchr(line, '\t');
     if (!t1)
       continue;
     *t1 = 0;
     char *t2 = strchr(t1 + 1, '\t');
-    if (!t2) {  // 旧版 2 字段: 词\t次数
-      long long n = atoll(t1 + 1);
-      if (n > 0)
-        legacy.emplace_back(std::string(line), n);
+    if (!t2)
       continue;
-    }
     *t2 = 0;
     char *t3 = strchr(t2 + 1, '\t');
     if (!t3)
       continue;
     *t3 = 0;
+    char *t4 = strchr(t3 + 1, '\t');
+    if (!t4)
+      continue;  // 非 5 字段（旧词级行）→ 忽略
     UserFreqEntry e;
-    e.commits = atoll(t1 + 1);
-    e.dee = atof(t2 + 1);
-    e.tick = atoll(t3 + 1);
+    e.commits = atoll(t2 + 1);
+    e.dee = atof(t3 + 1);
+    e.tick = atoll(t4 + 1);
     if (e.dee > 0) {
-      g_user_freq[std::string(line)] = e;
+      g_user_freq[std::string(line) + "\t" + std::string(t1 + 1)] = e;
       if (e.tick > max_tick)
         max_tick = e.tick;
     }
@@ -958,13 +959,11 @@ static void user_freq_ensure_loaded() {
   fclose(f);
   if (g_user_tick <= 0)
     g_user_tick = max_tick;
-  for (auto &kv : legacy)  // 旧计数视为刚提交过
-    g_user_freq[kv.first] = UserFreqEntry{kv.second, (double)kv.second, g_user_tick};
 }
 
-// 衰减有效计数 (融合用): rime formula_d 查询式
-static double user_freq_eff(const std::string &w) {
-  auto it = g_user_freq.find(w);
+// 衰减有效计数 (融合用): rime formula_d 查询式（词码对）
+static double user_freq_eff(const std::string &w, const std::string &code) {
+  auto it = g_user_freq.find(w + "\t" + code);
   if (it == g_user_freq.end() || it->second.dee <= 0)
     return 0;
   return it->second.dee *
@@ -1041,9 +1040,15 @@ static void user_bi_ensure_loaded() {
       continue;
     *t2 = 0;
     char *t3 = strchr(t2 + 1, '\t');
-    long long cnt = atoll(t3 ? t3 + 1 : t2 + 1);
-    if (line[0] == 'u') {
-      g_user_uni[std::string(t1 + 1)] = cnt;
+    if (!t3)
+      continue;
+    *t3 = 0;
+    char *t4 = strchr(t3 + 1, '\t');
+    if (line[0] == 'u' && t4) {
+      // 词码对格式（2026-11-13）: u\t词\t码\t次数（码可空 = 捕获失败提交）;
+      // 旧词级 u\t词\t次数（3 字段, 合并口径语义）忽略, 落盘自然剥除
+      g_user_uni[std::string(t1 + 1) + "\t" + std::string(t2 + 1)] =
+          atoll(t4 + 1);
     }
     // 旧版 b 行: 累计 Bigram 已退役, 忽略
   }
@@ -1063,33 +1068,36 @@ static void user_bi_save() {
   fclose(f);
 }
 
-static void user_bi_bump(const std::string &w) {
+static void user_bi_bump(const std::string &w, const std::string &code) {
   user_bi_ensure_loaded();
   if (!text_has_cjk_utf8(w))
     return;
   ++g_user_nseen;
-  ++g_user_uni[w];
+  ++g_user_uni[w + "\t" + code];
   if (++g_user_bi_dirty >= 20) {
     user_bi_save();
     g_user_bi_dirty = 0;
   }
 }
 
-// 融合项查询: 用户累计 Unigram 项
+// 融合项查询: 用户累计 Unigram 项（词码对）
 // 2026-11-11 简化：log(uni+1)。原 log p1=(uni+1)/(n_seen+2万) 的分母与 δ
 // 缩放均为窗内常数（同窗所有候选同减同值），对排序零影响——log(a/b)=
 // log a − log b，常数项不改变大小关系，位级等价去除（用户定案）。
 // 概率语义（log p1）与 δ=0.5/1 cohort 终审记录见研究库历史口径；
 // uni 原始计数不衰减，存储 user_bigram.tsv 与 #n=N 头行不变。
-static double user_unigram_term(const std::string &x) {
+// 2026-11-13 词码对记账: 键 = 词\t码。
+static double user_unigram_term(const std::string &x, const std::string &code) {
   user_bi_ensure_loaded();
-  return log((double)((g_user_uni.count(x) ? g_user_uni[x] : 0) + 1));
+  return log((double)((g_user_uni.count(x + "\t" + code)
+                           ? g_user_uni[x + "\t" + code]
+                           : 0) + 1));
 }
 
 // 累计 unigram 原始计数（调试窗口"累计频"列用；未平滑未取对数）
-static long long user_uni_count(const std::string &x) {
+static long long user_uni_count(const std::string &x, const std::string &code) {
   user_bi_ensure_loaded();
-  auto it = g_user_uni.find(x);
+  auto it = g_user_uni.find(x + "\t" + code);
   return it == g_user_uni.end() ? 0 : it->second;
 }
 
@@ -1114,7 +1122,7 @@ static void user_freq_save() {
   fclose(f);
 }
 
-static void user_freq_bump(const std::string &w) {
+static void user_freq_bump(const std::string &w, const std::string &code) {
   // 仅计非 ASCII 上屏（>=0x80）：与 Rime userdb "任何词条提交推 tick"
   // 同源口径——全角标点也计，有意为之（2026-09-03 tick 含一字词定案的
   // 同源原则；严格汉字判定反而偏离引擎口径）
@@ -1128,7 +1136,7 @@ static void user_freq_bump(const std::string &w) {
     return;
   user_freq_ensure_loaded();
   ++g_user_tick;
-  UserFreqEntry &e = g_user_freq[w];
+  UserFreqEntry &e = g_user_freq[w + "\t" + code];
   e.dee = 1 + e.dee * exp((double)(e.tick - g_user_tick) / kFreqTau);
   e.commits += 1;
   e.tick = g_user_tick;
@@ -1136,7 +1144,42 @@ static void user_freq_bump(const std::string &w) {
     user_freq_save();
     g_user_freq_dirty = 0;
   }
-  user_bi_bump(w);
+  user_bi_bump(w, code);
+}
+
+// 最近一次候选窗的输入码（词码对记账 OnCommit 用; engine thread 写读）
+static std::string g_last_input;
+
+// ── 训练语料记录（2026-11-13 源码版原生补齐; 此前为插件版
+// llm_processor.lua 独有, 本机 09-14 切源码版后停写两个月）──
+// 格式对齐插件版 llm_training.txt（研究 prep_user_sc 消费）:
+//   词1\t码1[\t窗快照]|词2\t码2|←|…
+//   | 分隔词条、\t 分隔词/码(/快照)、← 退格修正、场景 = 一行。
+// 码 = 完整提交码不截断（研究资格门需要 3 码单字）。
+// 信号近似: 退格 ← 用 reset 代次变化（librime 编辑键统一信号——
+// 导航/回车无法与退格区分, 统一记 ← 保守截断上下文链）; 场景分隔
+// 仅在会话首词写一次（跨应用切换的真实场景断裂记录不了, 可接受）。
+// 快照 = 层1 前 k 候选逗号分隔（Collect 重排发生时记录, 窗码匹配
+// 才附——与插件版 llm_last_window 握手语义一致）。
+static std::string g_train_window_input;   // 最近重排窗码（空 = 未重排）
+static std::string g_train_window_cands;   // 层1 前 k 逗号分隔
+static int g_train_gen = -1;               // 上次 commit 见到的 reset 代次
+static bool g_train_line_open = false;     // 当前场景行已开始
+
+static void train_append(const std::string &text) {
+  const RimeApi *api = rime_get_api();
+  if (!api || !api->get_user_data_dir)
+    return;
+  const char *ud = api->get_user_data_dir();
+  if (!ud || !*ud)
+    return;
+  char path[MAX_PATH];
+  snprintf(path, sizeof(path), "%s\\llm_training.txt", ud);
+  FILE *f = fopen(path, "a");
+  if (!f)
+    return;
+  fputs(text.c_str(), f);
+  fclose(f);
 }
 
 static void log_msg(const char *fmt, ...) {
@@ -2062,6 +2105,9 @@ LlmRerankTranslation::LlmRerankTranslation(an<Translation> translation,
                                            const std::string &ctx,
                                            const std::string &src)
     : translation_(translation), input_(input), ctx_(ctx), src_(src) {
+  // 词码对记账（2026-11-13）: 记最近窗码供 OnCommit 用（commit 时 input
+  // 已清空; 同插件版 pending_code 捕获语义。engine thread, 无竞争）
+  g_last_input = input;
   Collect();
 }
 
@@ -2102,8 +2148,9 @@ void LlmRerankTranslation::Collect() {
     std::vector<double> s1(allc.size());
     for (size_t i = 0; i < allc.size(); i++) {
       idx[i] = i;
-      s1[i] = g_freq_beta * std::log(1.0 + user_freq_eff(allc[i]->text())) +
-              user_unigram_term(allc[i]->text());
+      // 词码对记账（2026-11-13）: eff/uni 查询键 = (候选, 当前窗码 input_)
+      s1[i] = g_freq_beta * std::log(1.0 + user_freq_eff(allc[i]->text(), input_)) +
+              user_unigram_term(allc[i]->text(), input_);
     }
     std::stable_sort(idx.begin(), idx.end(),
                      [&s1](size_t a, size_t b) { return s1[a] > s1[b]; });
@@ -2114,6 +2161,14 @@ void LlmRerankTranslation::Collect() {
     }
     for (size_t i = nk; i < allc.size(); i++)
       tail.push_back(allc[idx[i]]);
+    // 训练快照（词码对研究用）: 层1 前 k 候选 + 窗码（OnCommit 匹配才附）
+    g_train_window_input = input_;
+    g_train_window_cands.clear();
+    for (size_t i = 0; i < nk; i++) {
+      if (i)
+        g_train_window_cands += ",";
+      g_train_window_cands += candidates_[i]->text();
+    }
   } else {
     // 未加载/单候选: 引擎原序（行为与两层之前一致）
     live_send(std::string("S|") + now_hms() + "|" +
@@ -2125,6 +2180,7 @@ void LlmRerankTranslation::Collect() {
       else
         tail.push_back(allc[i]);
     }
+    g_train_window_cands.clear();  // 未重排 → 无快照
   }
 
   if (candidates_.size() >= 2 && g_loaded.load()) {
@@ -2258,17 +2314,29 @@ void LlmRerankTranslation::Collect() {
     std::vector<double> fused_of(candidates_.size(), -1e308);
     if (order.size() > 1) {
       user_freq_ensure_loaded();
+      // 无 CE 分候选的融合（2026-11-13 用户定案，取代"回退后两项和"）:
+      // CE 取窗内已算 CE 的**最低分**（score = −CE 负值域，最低分 = 最差
+      // 证据 → 该候选排到窗底但保留与层1 的正常耦合）。旧语义（融合=层1
+      // 分）会让无法表示的字（tokenizer 打不出的生僻字「𬤊」）以 S1=0
+      // 压过全部负分候选跳首选——aki 实况窗两例实证。全窗无有效 CE 时
+      // 回退层1 分（加 0）。
+      double min_valid = 1e308;
+      for (int i : order)
+        if (has_score[i] && score_of[i] < min_valid)
+          min_valid = score_of[i];
       std::vector<std::pair<double, int>> fused;  // (total, idx)
       fused.reserve(order.size());
       for (int i : order) {
-        double t = has_score[i]
-                       ? score_of[i] +
-                             g_freq_beta * std::log(1.0 + user_freq_eff(
-                                                 candidates_[i]->text())) +
-                             user_unigram_term(candidates_[i]->text())
-                       : (i < s1_head.size() ? s1_head[i]
-                                             : -1e308);  // 无 CE 分 → 后两项和
-                                                         // （层1 分, 两层语义）
+        double t;
+        if (has_score[i]) {
+          t = score_of[i] +
+              g_freq_beta * std::log(1.0 + user_freq_eff(
+                                  candidates_[i]->text(), input_)) +
+              user_unigram_term(candidates_[i]->text(), input_);
+        } else {
+          double s1v = i < s1_head.size() ? s1_head[i] : -1e308;
+          t = s1v + (min_valid < 1e308 ? min_valid : 0.0);
+        }
         fused_of[i] = t;
         fused.emplace_back(t, i);
       }
@@ -2317,9 +2385,9 @@ void LlmRerankTranslation::Collect() {
       size_t shown = order.size() < 8 ? order.size() : 8;
       for (size_t k = 0; k < shown; k++) {
         int i = order[k];
-        double eff = has_score[i] ? user_freq_eff(candidates_[i]->text()) : 0;
+        double eff = has_score[i] ? user_freq_eff(candidates_[i]->text(), input_) : 0;
         double fb = has_score[i] ? g_freq_beta * std::log1p(eff) : 0;
-        double u1 = has_score[i] ? user_unigram_term(candidates_[i]->text()) : 0;
+        double u1 = has_score[i] ? user_unigram_term(candidates_[i]->text(), input_) : 0;
         char line[320];
         snprintf(line, sizeof(line),
                  "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f u1+%6.3f 满=%d key=%s"
@@ -2380,9 +2448,9 @@ void LlmRerankTranslation::Collect() {
         if (emitted >= 20)
           return;
         emitted++;
-        double eff = user_freq_eff(c->text());
+        double eff = user_freq_eff(c->text(), input_);
         double fb = g_freq_beta * std::log1p(eff);
-        double u1 = user_unigram_term(c->text());
+        double u1 = user_unigram_term(c->text(), input_);
         std::string ce1, ce2, ce3s;
         if (src_idx >= 0 &&
             src_idx < (int)ce3_of.size()) {
@@ -2395,7 +2463,7 @@ void LlmRerankTranslation::Collect() {
                   std::to_string(er != eng_rank.end() ? er->second : 0) +
                   "|" + live_esc(c->text()) + "|" + live_num(fb + u1) + "|" +
                   ce + "|" + live_num(eff) + "|" +
-                  std::to_string(user_uni_count(c->text())) + "|" + fused +
+                  std::to_string(user_uni_count(c->text(), input_)) + "|" + fused +
                   "|" + std::to_string(full) + "|" + std::to_string(cerank) +
                   "|" + std::to_string(fin) + "|" + std::to_string(win) +
                   "|" + ce1 + "|" + ce2 + "|" + ce3s + "|" +
@@ -2608,8 +2676,11 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
   }
   g_fallback_buffer += commit_text;
   // 用户词频累计 (freq_beta 对数融合; 仅含中文的词, 每 20 词落盘)。
-  // debug_fusion commit 行: eff/tick/脏计数 bump 前后 (码字段插件版有、
-  // 源码版无 — OnCommit 只收到上屏文本, 拿不到已提交的编码)
+  // 词码对记账（2026-11-13）: bump 键 = (词, 最近窗码 g_last_input——
+  // commit 时 input 已清空, Collect 构造时快照; 消费即清, 非输入路径
+  // 的 commit 不误记旧码)。debug commit 行: eff/tick/脏计数 bump 前后。
+  std::string code = g_last_input;
+  g_last_input.clear();
   if (g_debug_fusion) {
     user_freq_ensure_loaded();  // before 读数须在懒加载后 (插件版同修)
     bool has_cjk = false;
@@ -2622,25 +2693,50 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
     long long tick_before = g_user_tick;
     int dirty_before = g_user_freq_dirty;
     if (has_cjk)
-      eff_before = user_freq_eff(commit_text);
-    user_freq_bump(commit_text);
+      eff_before = user_freq_eff(commit_text, code);
+    user_freq_bump(commit_text, code);
     if (has_cjk) {
       char line[256];
       snprintf(line, sizeof(line),
-               "%s|commit|词=%s|eff %.3f→%.3f|tick %lld→%lld|flush脏%d/20",
-               now_hms().c_str(), commit_text.c_str(), eff_before,
-               user_freq_eff(commit_text), tick_before, (long long)g_user_tick,
-               dirty_before);
+               "%s|commit|词=%s|码=%s|eff %.3f→%.3f|tick %lld→%lld|flush脏%d/20",
+               now_hms().c_str(), commit_text.c_str(), code.c_str(),
+               eff_before, user_freq_eff(commit_text, code), tick_before,
+               (long long)g_user_tick, dirty_before);
       debug_fusion_write({line});
       // 实时调试 E 行（2026-11-10）：commit 落账（eff/tick 前后值）
       live_send(std::string("E|") + now_hms() + "|" + live_esc(commit_text) +
                 "|" + live_num(eff_before) + "|" +
-                live_num(user_freq_eff(commit_text)) + "|" +
+                live_num(user_freq_eff(commit_text, code)) + "|" +
                 std::to_string(tick_before) + "|" +
                 std::to_string((long long)g_user_tick));
     }
   } else {
-    user_freq_bump(commit_text);
+    user_freq_bump(commit_text, code);
+  }
+  // 训练语料记录（2026-11-13 源码版原生补齐; 格式与信号近似见
+  // g_train_* 声明处注释——研究 prep_user_sc 消费本文件）
+  {
+    int gen = api && api->context_reset_generation
+                  ? api->context_reset_generation()
+                  : 0;
+    bool gen_changed = (g_train_gen != -1 && gen != g_train_gen);
+    g_train_gen = gen;
+    std::string seg;
+    if (!g_train_line_open) {
+      seg += "\n";          // 会话首词: 开新场景行
+      g_train_line_open = true;
+    } else if (gen_changed) {
+      seg += "|←";          // 编辑键近似（导航/回车不可分, 统一 ←）
+      seg += "|";
+    } else {
+      seg += "|";
+    }
+    seg += commit_text + "\t" + code;
+    if (!g_train_window_cands.empty() && g_train_window_input == code) {
+      seg += "\t" + g_train_window_cands;   // 层1 前 k 候选快照
+      g_train_window_cands.clear();         // 已消费（插件版握手同语义）
+    }
+    train_append(seg);
   }
   // bound the fallback buffer: LLM context is at most ~20 tokens
   // (1-2 chars/token = 40 chars), keep only the most recent 64 UTF-8
