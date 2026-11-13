@@ -1101,6 +1101,81 @@ static long long user_uni_count(const std::string &x, const std::string &code) {
   return it == g_user_uni.end() ? 0 : it->second;
 }
 
+// ── 多音词码对预置降分修正（2026-11-13 用户定案：机制部署、表作参考）──
+// LLM 只见词不见码义——高频字在低频读音的码上被 CE 系统性抬分（如
+// 与@vkh：无法区分 yǔ/yù，按字频给分）。该类错误跨用户普适（结构性，
+// 不随用户词频积累消失——污染对恰恰是用户不爱打的码对），但**词码表
+// 是方案特异的**（码表结构与候选集随方案不同）→ 表不内置、放用户目
+// 录 llm_pairfix.tsv（行 `词\t码[\tλ]`，λ 缺省 kPairFixLambdaDefault，
+// `#` 注释；**无文件 = 机制休眠**，其他方案零影响）。每次融合触发轻量
+// 重读（每窗一次，相对推理成本可忽略）——编辑文件即时生效。软降分
+// 非禁用：只破 CE 险胜的近平局。fade 门：用户自身该词码对累计
+// ≥kPairFixFadeUni 次 = 正向使用证据 → 预置让位（与 clamp 的"计数值
+// 小"横截面判据方向相反——clamp 在用户域 +13 错证伪）。推导与用户域
+// 验证（wiki 无泄漏拆半 +0.0630pp; 用户域双域回放净增益 +5 窗无损失;
+// 拼读双拼参考表 = 研究资料库 eval/pairfix_pool_ratio.tsv 193 对,
+// 复制为用户目录 llm_pairfix.tsv 启用）见研究库"词码对预置降分修正"节。
+static const double kPairFixLambdaDefault = 5.0;
+static const long long kPairFixFadeUni = 3;
+
+static bool pairfix_file(char *path, size_t n) {
+  const RimeApi *api = rime_get_api();
+  if (api && api->get_user_data_dir) {
+    const char *ud = api->get_user_data_dir();
+    if (ud && *ud) {
+      snprintf(path, n, "%s\\llm_pairfix.tsv", ud);
+      return true;
+    }
+  }
+  return false;
+}
+
+// 读参考表 → out[key 词\t码] = λ；返回 false = 文件缺失（机制休眠）
+static bool pairfix_table(std::map<std::string, double> *out) {
+  char path[MAX_PATH];
+  if (!pairfix_file(path, sizeof(path)))
+    return false;
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return false;
+  char line[512];
+  while (fgets(line, sizeof(line), f)) {
+    size_t len = strlen(line);
+    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len] = '\0';
+    if (!len || line[0] == '#')
+      continue;
+    char *t1 = strchr(line, '\t');
+    if (!t1)
+      continue;
+    *t1 = '\0';
+    char *t2 = strchr(t1 + 1, '\t');
+    double lam = kPairFixLambdaDefault;
+    if (t2) {
+      *t2 = '\0';
+      lam = atof(t2 + 1);
+      if (lam <= 0.0)
+        lam = kPairFixLambdaDefault;
+    }
+    if (*line && *(t1 + 1))
+      (*out)[std::string(line) + "\t" + (t1 + 1)] = lam;
+  }
+  fclose(f);
+  return true;
+}
+
+// 命中且未 fade 返回修正分（融合分 −λ）；否则 0
+static double pairfix_penalty(const std::map<std::string, double> &tbl,
+                              const std::string &w,
+                              const std::string &code) {
+  auto it = tbl.find(w + "\t" + code);
+  if (it == tbl.end())
+    return 0.0;
+  if (user_uni_count(w, code) >= kPairFixFadeUni)
+    return 0.0;
+  return it->second;
+}
+
 static void user_freq_save() {
   char path[MAX_PATH];
   if (!user_freq_file(path, sizeof(path)))
@@ -2311,7 +2386,13 @@ void LlmRerankTranslation::Collect() {
     // (高频首选获自保护)。失败哨兵/缺分不参与融合, 保序排尾。
     // 应用于评分/缓存顺序之上、两码整句段之前 (与插件版一致);
     // 缓存只存分数序, 融合每次按当前衰减重放。稳定排序保同分原序 (CE 序)。
+    // 融合分另叠加多音词码对预置降分修正（2026-11-13, pairfix_penalty:
+    // 预置表 + fade 让位, debug.txt 行尾 修正-λ 标注; 与插件版一致）。
     std::vector<double> fused_of(candidates_.size(), -1e308);
+    // 多音词码对预置修正参考表（每窗轻量重读, 无文件 = 机制休眠; 见
+    // pairfix_table 注）。调试明细段共用本表。
+    std::map<std::string, double> pf_tbl;
+    const bool pf_on = pairfix_table(&pf_tbl);
     if (order.size() > 1) {
       user_freq_ensure_loaded();
       // 无 CE 分候选的融合（2026-11-13 用户定案，取代"回退后两项和"）:
@@ -2336,6 +2417,12 @@ void LlmRerankTranslation::Collect() {
         } else {
           double s1v = i < s1_head.size() ? s1_head[i] : -1e308;
           t = s1v + (min_valid < 1e308 ? min_valid : 0.0);
+        }
+        // 多音词码对预置降分修正（2026-11-13; 见 pairfix_penalty 注）
+        if (pf_on) {
+          double pf = pairfix_penalty(pf_tbl, candidates_[i]->text(), input_);
+          if (pf > 0.0)
+            t -= pf;
         }
         fused_of[i] = t;
         fused.emplace_back(t, i);
@@ -2388,6 +2475,9 @@ void LlmRerankTranslation::Collect() {
         double eff = has_score[i] ? user_freq_eff(candidates_[i]->text(), input_) : 0;
         double fb = has_score[i] ? g_freq_beta * std::log1p(eff) : 0;
         double u1 = has_score[i] ? user_unigram_term(candidates_[i]->text(), input_) : 0;
+        double pf = pf_on ? pairfix_penalty(pf_tbl, candidates_[i]->text(),
+                                            input_)
+                          : 0.0;
         char line[320];
         snprintf(line, sizeof(line),
                  "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f u1+%6.3f 满=%d key=%s"
@@ -2396,6 +2486,10 @@ void LlmRerankTranslation::Collect() {
                  dbg_num8(has_score[i] ? score_of[i] : -1e308).c_str(), eff,
                  fb, u1, (int)dbg_full[i], dbg_num(fused_of[i]).c_str(),
                  ce_rank[i], final_rank[i]);
+        if (pf > 0.0) {
+          size_t len = strlen(line);
+          snprintf(line + len, sizeof(line) - len, "  修正-λ%.0f", pf);
+        }
         dbg.push_back(line);
       }
       std::string moved;
