@@ -82,7 +82,10 @@ static std::atomic<bool> g_loading{false};
 // 排序管线（顺序固定，与插件版一致）: CE 评分序 → 词频融合（融合应用于
 //   评分序之上）→ 两码整句满长组优先（开关开启时）→ 稳定排序（失败哨兵
 //   分排尾部）。
-// CE 位置权重 (2026-09-16, 与插件版同源, 首项归一规范形 (1,1.05,0.45) (v3 2026-11-06 六维联合标定)): ce2 判别
+// CE 位置权重 (与插件版同源, 首项归一规范形; 2026-11-14 默认模型改
+//   Qwen2.5-0.5B 后重标定 (1,1.10,0.60)+β14, 用户域 34k + wiki 池化 180k
+//   网格, 偶半选→奇半验四半区一致, 见研究库 calibrate_model_05b; 旧
+//   (1,1.05,0.45) 为 0.8B v3 值): ce2 判别
 //   力最强(上下文契合+词内连贯), ce3 深入词内部降权; 4+ token 词只算前三
 //   项——尾部外推证伪删除(λ 0→1 端到端命中率单调递减, λ=0 最优)。
 // 参数来源（2026-09-30 用户定案，两版统一）：**只读方案的 llm_rerank 配置节**
@@ -97,13 +100,16 @@ static std::atomic<bool> g_loading{false};
 // 自定义位置用 llm_rerank model_path 显式指向。
 // 注意 Service.deployer().user_data_dir 在引擎启动后才就绪，故不能在
 // 静态初始化求值——g_model_path 留空，加载时懒取默认。
+// 默认模型 = Qwen2.5-0.5B-Q4_K_M（2026-11-14 用户定案：0.5B 候选段延迟
+// 0.69×、弱 CPU 机友好，精度代价 −0.12~−0.30pp 可接受；旧默认
+// Qwen3.5-0.8B）
 static std::string default_model_path() {
   try {
     return (Service::instance().deployer().user_data_dir /
-            "Qwen3.5-0.8B-Q4_K_M.gguf")
+            "Qwen2.5-0.5B-Q4_K_M.gguf")
         .string();
   } catch (...) {
-    return "Qwen3.5-0.8B-Q4_K_M.gguf";
+    return "Qwen2.5-0.5B-Q4_K_M.gguf";
   }
 }
 static std::string g_model_path;  // 空 = 未配置，load_model 时按默认兜底
@@ -122,12 +128,12 @@ static int g_min_code_len = 4;          // 保留：仅日志/兼容，不再作
 static int g_max_code_len = 0;          // 保留：同上（0 = 无上限）
 static bool g_two_code_sentence = false;  // 两码整句：满长组优先 (2026-11-07
 // 用户定案取代 expected_length_weight——elw·span 间接量退役)
-// 用户词频对数融合 (2026-09-02): fused = score + β·log(1+eff), β=12 **内置常数**
+// 用户词频对数融合 (2026-09-02): fused = score + β·log(1+eff), β **内置常数**
 // (2026-11-05 标定产物退出用户配置面——用户没有标定能力, 与 kFreqTau 同待遇;
-//  **2026-11-06 v3 六维联合标定** w2×w3×β×τ×γ×λ 68,640 点: 用户域标定 →
-//  wiki 平台内就近点 (1.05/0.45/β12/τ400/γ1/λ0.5), 见研究库 §三十三;
-//  旧 8 出自 2026-11-02 连续文章语料重标定)
-static double g_freq_beta = 12.0;
+//  **2026-11-14 默认模型改 Qwen2.5-0.5B 后重标定** β=14 + kCeW (1.0,1.10,
+//  0.60), 用户域 34k + wiki 池化 180k 网格, 偶半选→奇半验四半区一致, 见
+//  研究库 calibrate_model_05b; 旧 β=12/(1.05,0.45) 为 0.8B v3 六维值)
+static double g_freq_beta = 14.0;
 // debug_fusion 诊断 (2026-09-03 插件版先行、本文件移植): true = 逐块记录
 // 评分→词频融合→词长加成全过程写 rime_llm_debug.txt (与插件版同名同格式;
 // 差异: commit 行无码字段 — OnCommit 只收到上屏文本; reset 行按代次触发,
@@ -161,7 +167,7 @@ struct LlmParamSet {
   bool has_max_code_len = false; int max_code_len = 0;   // 旧键：解析保留、不再生效
   bool has_code_pattern = false; std::string code_pattern;  // 2026-09-30 新键
   bool has_tcs = false;          bool two_code_sentence = false;
-  // freq_beta 字段已删（2026-11-05 退出用户配置面）→ g_freq_beta=8.0 内置常数
+  // freq_beta 字段已删（2026-11-05 退出用户配置面）→ g_freq_beta 内置常数
   bool has_min_tokens = false;   int min_tokens = 1;
   bool has_max_tokens = false;   int max_tokens = 10;
   bool has_max_cand = false;     int max_cand = 5;
@@ -197,7 +203,7 @@ static void llm_apply_params() {
   g_min_code_len = s.has_min_code_len ? s.min_code_len : 4;
   g_max_code_len = s.has_max_code_len ? s.max_code_len : 0;
   g_two_code_sentence = s.has_tcs ? s.two_code_sentence : false;
-  // g_freq_beta 恒为内置常数 8.0（2026-11-05 退出用户配置面，不再从方案读取；
+  // g_freq_beta 恒为内置常数（2026-11-05 退出用户配置面，不再从方案读取；
   // 方案残留 freq_beta 旧行忽略，保存时由 GUI 剥除）
   g_debug_fusion = s.has_debug_fusion ? s.debug_fusion : false;
   // g_com_ctx_enabled 不再读配置（2026-09-29 删 com_context 配置项）——
@@ -1923,7 +1929,7 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
   auto ts_ce1_0 = std::chrono::high_resolution_clock::now();
   std::vector<double> ce_sum(n_cands, 0.0);
   // CE 位置权重 (kCeW[0/1/2]): 见文件头注释; 4+ token 只算前三项, 无外推
-  static constexpr double kCeW[3] = {1.0, 1.05, 0.45};  // v3 2026-11-06 六维联合标定 (旧 1.13/0.61 出自 2026-09-16 前缀标定)
+  static constexpr double kCeW[3] = {1.0, 1.10, 0.60};  // 2026-11-14 随默认模型 0.5B 重标定 (旧 1.05/0.45 为 0.8B v3 值, 见文件头注释)
   for (int i = 0; i < n_cands; i++) {
     double c1 = ce_target(ctx_logits, cands[i][0], m0, lse0);
     ce_sum[i] = kCeW[0] * c1;
