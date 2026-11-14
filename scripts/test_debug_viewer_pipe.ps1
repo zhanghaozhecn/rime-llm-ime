@@ -53,10 +53,13 @@ function Send-Word {
     # fused = CE + 两项之和（查看器总分格显示连加过程，假数据须自洽）
     $fbS = 12.0 * [Math]::Log(1.0 + $eff)
     $u1S = [Math]::Log($uni + 1.0)
-    $fusedS = $weighted + $fbS + $u1S
-    $w.WriteLine(('C|{0}|{1}|{2:F3}|{3:F3}|{4:F3}|{5}|{6:F3}|0|1|1|1|{7:F3}|{8:F3}|{9:F3}|{10:F3}|{11:F3}' -f
+    # v5: 修正分 pf——首候选 5、其余 0；fusedS 含 −pf（与生产同语义，
+    # 查看器总分格尾追 −λ 标注恢复逐项验算）
+    $pfS = if ($i -eq 0) { 5.0 } else { 0.0 }
+    $fusedS = $weighted + $fbS + $u1S - $pfS
+    $w.WriteLine(('C|{0}|{1}|{2:F3}|{3:F3}|{4:F3}|{5}|{6:F3}|0|1|1|1|{7:F3}|{8:F3}|{9:F3}|{10:F3}|{11:F3}|{12:F3}' -f
       ($i + 1), $cands[$i], (1.0 + $i), $weighted, $eff, $uni,
-      $fusedS, $c1, $c2, $c3, $fbS, $u1S))
+      $fusedS, $c1, $c2, $c3, $fbS, $u1S, $pfS))
   }
   $t2 = Get-Date -Format HH:mm:ss
   $w.WriteLine("E|$t2|$($cands[0])|0.5|1.0|$tick|$($tick + 1)")

@@ -2540,7 +2540,9 @@ void LlmRerankTranslation::Collect() {
     // /累计得分(log p1) 是真正进融合的项；尾接 CE 三分量 ce1/ce2/ce3（未乘
     // kCeW 权重，查看器常显）：窗口候选按最终序（ce/fused/cerank 取自重排
     // 状态）+ 层1 尾窗透传（win=0，无 CE 分），上限 20 行。order 空时（评分
-    // 整体失败）窗口按引擎序全 win=1 无分。
+    // 整体失败）窗口按引擎序全 win=1 无分。v5（2026-11-14）行尾再追加修正
+    // 分 pf = 词码对预置降分修正的 λ（0 = 未命中）——总分已含 −λ, 查看器
+    // 总分格据此补 −λ 标注恢复逐项验算（append-only, 旧查看器忽略）。
     // L 头行也在此发（评分/融合后 ev_ms 才是终值；尾部字段 prep = 上文 KV
     // 预解码命中、nseen = 累计 unigram 全词数（累计得分的分母，n_seen）、
     // v4 追加 ctx_used = 推理实际使用的上文尾部文本（调试窗口灰显前缀）。
@@ -2574,6 +2576,9 @@ void LlmRerankTranslation::Collect() {
         double eff = user_freq_eff(c->text(), input_);
         double fb = g_freq_beta * std::log1p(eff);
         double u1 = user_unigram_term(c->text(), input_);
+        // v5: 词码对预置修正分（λ, 0=未命中）——总分已含 −λ, 查看器总分格
+        // 据此补 −λ 标注恢复逐项验算（debug_fusion 门控内, 零生产影响）
+        double pf = pf_on ? pairfix_penalty(pf_tbl, c->text(), input_) : 0.0;
         std::string ce1, ce2, ce3s;
         if (src_idx >= 0 &&
             src_idx < (int)ce3_of.size()) {
@@ -2590,7 +2595,8 @@ void LlmRerankTranslation::Collect() {
                   "|" + std::to_string(full) + "|" + std::to_string(cerank) +
                   "|" + std::to_string(fin) + "|" + std::to_string(win) +
                   "|" + ce1 + "|" + ce2 + "|" + ce3s + "|" +
-                  live_num(fb) + "|" + live_num(u1));  // v3: 词频得分/累计得分
+                  live_num(fb) + "|" + live_num(u1) + "|" +
+                  live_num(pf));  // v3: 词频得分/累计得分; v5: 修正分 pf
       };
       if (!order.empty()) {
         std::vector<int> fin_rank(candidates_.size(), 0);
