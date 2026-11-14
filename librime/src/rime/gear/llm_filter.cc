@@ -77,7 +77,7 @@ static std::atomic<bool> g_loading{false};
 //                 用户词频对数融合 fused = score + β·log(1+eff)（score=原始
 //                 LLM 分 −CE；对数域加法=词频无上限可翻盘），eff=Rime
 //                 formula_d 时间衰减计数（tick 每词提交+1，与引擎调频同源；
-//                 user_freq.tsv 持久化）。β=8 连续文章语料重标定 (2026-11-02,
+//                 user_eff.tsv 持久化（旧名 user_freq.tsv）。β=8 连续文章语料重标定 (2026-11-02,
 //                 平台 8~30 取左段; 旧 1.5 出自独立窗口径)
 // 排序管线（顺序固定，与插件版一致）: CE 评分序 → 词频融合（融合应用于
 //   评分序之上）→ 两码整句满长组优先（开关开启时）→ 稳定排序（失败哨兵
@@ -834,7 +834,7 @@ static int                       s_seen_gen = -1;  // 上次见到的 reset 代�
 
 // ============================================================
 // 用户词频 (freq_beta 对数融合, 2026-09-02; 衰减 2026-08-21 起 Rime 时间衰减):
-// OnCommit 累计 (仅含中文的词), RIME 用户目录 user_freq.tsv 持久化
+// OnCommit 累计 (仅含中文的词), RIME 用户目录 user_eff.tsv 持久化
 // (每 20 词落盘, 崩溃最多丢 19 次)。engine thread only, 无锁。
 // 衰减 = librime algo::formula_d (引擎调频同源):
 //   提交: dee = 1 + dee·exp((t_old - t_now)/τ)
@@ -895,13 +895,17 @@ static FILE *open_log_file(const char *filename) {
 #endif
 }
 
-// user_freq.tsv 路径 (RIME 用户目录; 与日志同目录解析)
+// user_eff.tsv 路径 (RIME 用户目录; 与日志同目录解析)。
+// 文件名 (2026-11-14 用户定案: 与实际语义对应): user_eff.tsv = 衰减
+// 计数账本 (查询 user_freq_eff); 旧名 user_freq.tsv 历史沿用至本版——
+// 读取端新名缺失时回退旧名 (行格式相同, 无损接管), 落盘一律写新名,
+// 旧文件保留不删 (手动清理)。
 static bool user_freq_file(char *path, size_t n) {
   const RimeApi *api = rime_get_api();
   if (api && api->get_user_data_dir) {
     const char *ud = api->get_user_data_dir();
     if (ud && *ud) {
-      snprintf(path, n, "%s\\user_freq.tsv", ud);
+      snprintf(path, n, "%s\\user_eff.tsv", ud);
       return true;
     }
   }
@@ -916,6 +920,17 @@ static void user_freq_ensure_loaded() {
   if (!user_freq_file(path, sizeof(path)))
     return;
   FILE *f = fopen(path, "r");
+  if (!f) {  // 旧名回退 (改名前数据, 行格式相同)
+    char old_path[MAX_PATH];
+    const RimeApi *api = rime_get_api();
+    if (api && api->get_user_data_dir) {
+      const char *ud = api->get_user_data_dir();
+      if (ud && *ud) {
+        snprintf(old_path, sizeof(old_path), "%s\\user_freq.tsv", ud);
+        f = fopen(old_path, "r");
+      }
+    }
+  }
   if (!f)
     return;
   long long max_tick = 0;
@@ -975,8 +990,11 @@ static double user_freq_eff(const std::string &w, const std::string &code) {
 // （曾配套累计 Bigram 项 log(0.5·p2+0.5·p1)——cohort 生产量级评测实证其在
 //   真实用户龄仅 fired ~2%、剔除零损失（研究库 §三十七），2026-11-08 退役：
 //   停记 b 行、查询只剩 p1；旧 user_bigram.tsv 里的 b 行读取时忽略。）
-// 与插件版 llm_processor.lua 同格式同文件 user_bigram.tsv (两版共用,
-// user_freq.tsv 先例; 文件名历史沿用)。
+// 与插件版 llm_processor.lua 同格式同文件 user_unigram.tsv (两版共用,
+// user_eff.tsv 先例)。文件名 (2026-11-14 用户定案: 与实际语义对应):
+// 本文件自 2026-11-08 起只存 unigram 累计计数, "bigram" 名随该项退役
+// 已名不副实 → user_unigram.tsv (查询 user_unigram_term 同名对应);
+// 旧名 user_bigram.tsv 读取端回退 (行格式相同), 落盘一律写新名。
 // 只计含中文字符的词 (字节级 CJK 判定, 比插件 utf8 精确判定略宽, 可忽略);
 // **原始计数不衰减** (标定语义), 冷启动自然回退。
 // 存储: 首行 "#n=N", 行 "u	词	次数"。
@@ -991,7 +1009,7 @@ static bool user_bi_file(char *path, size_t n) {
   if (api && api->get_user_data_dir) {
     const char *ud = api->get_user_data_dir();
     if (ud && *ud) {
-      snprintf(path, n, "%s\\user_bigram.tsv", ud);
+      snprintf(path, n, "%s\\user_unigram.tsv", ud);
       return true;
     }
   }
@@ -1020,6 +1038,17 @@ static void user_bi_ensure_loaded() {
   if (!user_bi_file(path, sizeof(path)))
     return;
   FILE *f = fopen(path, "r");
+  if (!f) {  // 旧名回退 (改名前数据, 行格式相同)
+    char old_path[MAX_PATH];
+    const RimeApi *api = rime_get_api();
+    if (api && api->get_user_data_dir) {
+      const char *ud = api->get_user_data_dir();
+      if (ud && *ud) {
+        snprintf(old_path, sizeof(old_path), "%s\\user_bigram.tsv", ud);
+        f = fopen(old_path, "r");
+      }
+    }
+  }
   if (!f)
     return;
   char line[1024];
@@ -1085,7 +1114,7 @@ static void user_bi_bump(const std::string &w, const std::string &code) {
 // 缩放均为窗内常数（同窗所有候选同减同值），对排序零影响——log(a/b)=
 // log a − log b，常数项不改变大小关系，位级等价去除（用户定案）。
 // 概率语义（log p1）与 δ=0.5/1 cohort 终审记录见研究库历史口径；
-// uni 原始计数不衰减，存储 user_bigram.tsv 与 #n=N 头行不变。
+// uni 原始计数不衰减，存储 user_unigram.tsv 与 #n=N 头行不变。
 // 2026-11-13 词码对记账: 键 = 词\t码。
 static double user_unigram_term(const std::string &x, const std::string &code) {
   user_bi_ensure_loaded();
