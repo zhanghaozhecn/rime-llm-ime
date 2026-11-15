@@ -59,6 +59,8 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_HIST   2008
 #define IDC_EVT    2009
 #define IDC_FOOT   2010
+#define IDC_TYPE   2011  // 打字测试框（在此输入即走本机 IME，2026-11-16）
+#define IDC_TYPELBL 2012
 #define TIMER_DRAIN 1
 
 static const wchar_t *kPipeName = L"\\\\.\\pipe\\rime_llm_live";
@@ -241,15 +243,14 @@ static std::wstring padl(const std::wstring &s, int w) {
   return std::wstring((size_t)(w - (int)s.size()), L' ') + s;
 }
 
-// v5 修正标注：pf>0 时总分格尾追 −λ（λ=词码对预置降分），恢复逐项验算
-// （总分 = CE + 衰减词频分 + 累计词频分 − 修正）；未命中返回空
-static std::wstring pf_tag(const Row &r) {
+// 修正分格（2026-11-16 用户定案：专属列取代 v5 的总分格尾追 −λ 标注——
+// pf=0 时总分格尾什么都不显示，命中与否完全不可见）：λ=词码对预置降分，
+// 命中显示 -λ（负值，验算 总分 = CE + 衰减词频分 + 累计词频分 + 修正分），
+// 未命中 0.0；协议缺 pf 字段（旧发送端）→ —
+static std::wstring pf_proc(const Row &r, int wl) {
   double pf;
-  if (!num_of(r.pf, pf) || pf <= 0)
-    return L"";
-  wchar_t b[16];
-  swprintf(b, 16, L"−%g", pf);
-  return b;
+  if (!num_of(r.pf, pf)) return L"—";
+  return padl(pf > 0 ? (L"-") + f1(pf) : f1(0.0), wl);
 }
 
 // 动态对齐（2026-11-11 用户定案）：本次调用内每个数值组向最宽者看齐。
@@ -258,10 +259,11 @@ struct ColW {
   int ce_l, ce_c;  // CE 列：分数 / 三分量
   int fb_l, fb_e;  // 衰减词频分列：分数 / eff（2 位小数）
   int u1_l, uni;   // 累计词频列：分数 / 累计次数（整数）
-  int fu_l;        // 总分列：分值 + v5 修正标注（−λ）
+  int fu_l;        // 总分列：纯分值（修正分已单列，2026-11-16）
+  int pf_l;        // 修正分列：-λ / 0.0
 };
 static void measure_widths(const Inv &inv, ColW &w) {
-  w = {0, 0, 0, 0, 0, 0, 0};
+  w = {0, 0, 0, 0, 0, 0, 0, 0};
   auto mx = [](int a, int b) { return a > b ? a : b; };
   double v;
   for (auto &r : inv.rows) {
@@ -277,18 +279,18 @@ static void measure_widths(const Inv &inv, ColW &w) {
       swprintf(b, 16, L"%d", (int)v);
       w.uni = mx(w.uni, (int)wcslen(b));
     }
-    if (num_of(r.fused, v)) {
-      double pf;
-      int ext = (num_of(r.pf, pf) && pf > 0)
-                    ? (int)pf_tag(r).size() : 0;
-      w.fu_l = mx(w.fu_l, (int)f1(v).size() + ext);
+    if (num_of(r.fused, v)) w.fu_l = mx(w.fu_l, (int)f1(v).size());
+    if (num_of(r.pf, v)) {
+      int n = v > 0 ? (int)(f1(v).size() + 1) : 3;  // -λ 带 ASCII 负号 / "0.0"
+      w.pf_l = mx(w.pf_l, n);
     }
   }
 }
 
 // CE 格：加权 CE 与三分量。生产语义 = ce = -(Σ kCeW·分量)（分量是原始
 // 交叉熵、正值；分值取负号进融合），故等号右为带负号的括号和。
-// ce2/ce3 带 kCeW 权重前缀（1.05/0.45 = librime v3 标定内置常数，原样显示）；
+// ce2/ce3 带 kCeW 权重前缀（1.10/0.60 = librime 标定内置常数，原样显示；
+// 2026-11-14 随默认模型 0.5B 重标定，旧 1.05/0.45 为 0.8B v3 值）；
 // ce1 权重恒 1 → 前缀不显示（2026-11-12 用户定案）；
 // 分量缺（无分/未参与）的项整项省略。
 static std::wstring ce_proc(const Row &r, int wl, int wc) {
@@ -300,7 +302,7 @@ static std::wstring ce_proc(const Row &r, int wl, int wc) {
   const struct {
     const wchar_t *w;  // nullptr = 权重恒 1，不显前缀
     const std::wstring *raw;
-  } t3[3] = {{nullptr, &r.ce1}, {L"1.05", &r.ce2}, {L"0.45", &r.ce3}};
+  } t3[3] = {{nullptr, &r.ce1}, {L"1.10", &r.ce2}, {L"0.60", &r.ce3}};
   for (auto &x : t3) {
     double v;
     if (!num_of(*x.raw, v)) continue;
@@ -317,13 +319,14 @@ static std::wstring ce_proc(const Row &r, int wl, int wc) {
   return t + L")";
 }
 
-// 衰减词频分格：β·ln(1+eff)，β=12 内置常数（log/ln = 自然对数）
+// 衰减词频分格：β·ln(1+eff)，β=14 内置常数（log/ln = 自然对数；
+// 2026-11-14 随默认模型 0.5B 重标定，旧 β=12 为 0.8B v3 值）
 static std::wstring fb_proc(const Row &r, int wl, int we) {
   double fb, eff;
   if (!num_of(r.fb, fb)) return L"—";
   std::wstring lead = padl(f1(fb), wl);
   if (!num_of(r.eff, eff)) return lead;
-  return lead + L"=12·ln(1+" + padl(f1(eff), we) + L")";
+  return lead + L"=14·ln(1+" + padl(f1(eff), we) + L")";
 }
 
 // 累计词频格：ln(1+uni)（2026-11-11 公式简化，分母为窗内常数已去除；
@@ -339,12 +342,12 @@ static std::wstring u1_proc(const Row &r, int wl, int wu) {
   return lead + b;
 }
 
-// 总分格：融合分值 + 修正标注（v5：pf>0 尾追 −λ；三项已各自带过程，
-// 不重复连加式；尾窗透传行无融合分 → —）
+// 总分格：融合分纯分值（三项过程各在自带格内，修正分见专属列；
+// 尾窗透传行无融合分 → —）
 static std::wstring fused_proc(const Row &r, int wl) {
   double fu;
   if (!num_of(r.fused, fu)) return L"—";
-  return padl(f1(fu), wl) + pf_tag(r);
+  return padl(f1(fu), wl);
 }
 
 static void fill_grid(const Inv &inv) {
@@ -366,14 +369,14 @@ static void fill_grid(const Inv &inv) {
     std::wstring ce_txt = ce_proc(r, w.ce_l, w.ce_c);
     std::wstring fb_txt = fb_proc(r, w.fb_l, w.fb_e);
     std::wstring u1_txt = u1_proc(r, w.u1_l, w.uni);
+    std::wstring pf_txt = pf_proc(r, w.pf_l);
     struct { int col; const wchar_t *t; } cells[] = {
         {1, r.word.c_str()},
         {2, fu_txt.c_str()},
         {3, ce_txt.c_str()},
         {4, fb_txt.c_str()},
         {5, u1_txt.c_str()},
-        {6, r.full.c_str()},
-        {7, r.win.c_str()},
+        {6, pf_txt.c_str()},
     };
     for (auto &c : cells)
       ListView_SetItemText(h_grid, at, c.col, (LPWSTR)c.t);
@@ -634,17 +637,20 @@ static void make_ui() {
                   8, 104, 862, 314, IDC_GRID, g_font_mono);
   ListView_SetExtendedListViewStyle(
       h_grid, LVS_EX_FULLROWSELECT | LVS_EX_LABELTIP | LVS_EX_DOUBLEBUFFER);
-  // 分数部分四列（2026-11-11 用户定案"分数=计算过程"）：CE / 衰减词频分 /
-  // 累计词频 / 总分，格内 = 得分 + '=' + 具体计算（成分统一 3 位小数，
-  // 等宽字体逐位对齐），底部公式行随之删除；其余列 = 身份(#/词)+状态(满/窗)。
+  // 分数部分五列（2026-11-11 用户定案"分数=计算过程"）：CE / 衰减词频分 /
+  // 累计词频 / 总分 / 修正分，格内 = 得分 + '=' + 具体计算（成分统一 3 位小数，
+  // 等宽字体逐位对齐），底部公式行随之删除；身份列 = #/词。
+  // 「窗」「匹配词长」列均已删（2026-11-16 用户定案：窗内/尾窗灰字区分、
+  // 满长准入优先下"有无 CE 分"即满长标志——列冗余）；
+  // 修正分为专属列（取代 v5 总分格尾追 −λ，pf=0 可见）。
   // 列宽按 GDI 实测取（TextRenderer：数字 ~7px/字符，'·' 字体链接后
   // 14px 全角——比 WinForms 宽一倍），含 3 位整数的最坏情况余量。
   // 插入循环上界按数组长度推导——曾把循环写死 i<10 而 11 列，第 11 列
   // 从未创建（表现为"最后一列消失"，2026-11-11 踩过）
   struct { const wchar_t *t; int w; } cols[] = {
-      {L"#", 26}, {L"词", 64}, {L"总分", 90}, {L"CE", 310},
-      {L"衰减词频分", 140}, {L"累计词频分", 112}, {L"匹配词长", 72},
-      {L"窗", 30}};  // 总分 90 = v5 容 −λ 修正标注
+      {L"#", 26}, {L"词", 64}, {L"总分", 64}, {L"CE", 310},
+      {L"衰减词频分", 140}, {L"累计词频分", 112},
+      {L"修正分", 64}};  // 总分 64 = 纯分值（v5 的 90 容 −λ 标注已不需要）
   LVCOLUMNW col = {};
   col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
   for (int i = 0; i < (int)(sizeof(cols) / sizeof(cols[0])); i++) {
@@ -661,14 +667,23 @@ static void make_ui() {
   h_evt = mk_ctl(L"LISTBOX", L"",
                  WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL |
                      LBS_NOINTEGRALHEIGHT,
-                 8, 426, 1078, 96, IDC_EVT, g_font);
+                 8, 514, 1078, 96, IDC_EVT, g_font);
+  // 打字测试框（2026-11-16 用户定案）：在此输入即走本机 IME——组词/候选/
+  // 上屏全程在本窗口内完成，逐候选数据实时刷新，免切窗口测试。
+  // 标准多行 EDIT，TSF 对其自动生效（同记事本）；事件栏下移腾位。
+  mk_ctl(L"STATIC", L"打字测试（在此输入即走本机 IME，逐候选数据实时刷新）",
+         SS_LEFT, 8, 424, 460, 16, IDC_TYPELBL, g_font_hint);
+  mk_ctl(L"EDIT", L"",
+         WS_BORDER | WS_VSCROLL | WS_TABSTOP | ES_LEFT | ES_MULTILINE |
+             ES_AUTOVSCROLL | ES_WANTRETURN,
+         8, 442, 1078, 64, IDC_TYPE, g_font);
   // 公式行/列义行已删（2026-11-11 用户定案：计算过程直接写在分数格里，
   // 无需再对照底部公式）；只剩数据源一行灰注
   h_foot = mk_ctl(L"STATIC",
                   L"数据源 \\\\.\\pipe\\rime_llm_live · 开关 = 方案 "
                   L"llm_rerank/debug_fusion（改后重新部署）· 预解 = 上文 KV 预解码"
                   L"命中",
-                  SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 528, 1078, 16, IDC_FOOT,
+                  SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 616, 1078, 16, IDC_FOOT,
                   g_font_hint);
 }
 
@@ -690,7 +705,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
       g_hwnd = h;
       make_ui();
-      RECT cr = {0, 0, ts(1094), ts(548)};
+      RECT cr = {0, 0, ts(1094), ts(640)};
       AdjustWindowRect(&cr, (DWORD)GetWindowLongPtrW(h, GWL_STYLE), FALSE);
       SetWindowPos(h, NULL, 0, 0, cr.right - cr.left, cr.bottom - cr.top,
                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);

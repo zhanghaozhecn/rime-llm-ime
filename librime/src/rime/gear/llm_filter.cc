@@ -1078,12 +1078,14 @@ static void user_bi_ensure_loaded() {
     if (!t3)
       continue;
     *t3 = 0;
-    char *t4 = strchr(t3 + 1, '\t');
-    if (line[0] == 'u' && t4) {
-      // 词码对格式（2026-11-13）: u\t词\t码\t次数（码可空 = 捕获失败提交）;
-      // 旧词级 u\t词\t次数（3 字段, 合并口径语义）忽略, 落盘自然剥除
+    if (line[0] == 'u') {
+      // 词码对格式（2026-11-13）: u\t词\t码\t次数（码可空 = 捕获失败提交）。
+      // 次数 = 第 4 字段（t3+1）——原按 eff 5 字段格式错写成 t4（第 5 字段）,
+      // 4 字段行全部读不进 → 服务重启后累计词频清零（2026-11-16 真机发现,
+      // 落盘正确、读取端笔误; 衰减账 eff 5 字段格式与其解析器匹配故正常）。
+      // 旧词级 u\t词\t次数（3 字段, t3 无）→ 忽略, 落盘自然剥除
       g_user_uni[std::string(t1 + 1) + "\t" + std::string(t2 + 1)] =
-          atoll(t4 + 1);
+          atoll(t3 + 1);
     }
     // 旧版 b 行: 累计 Bigram 已退役, 忽略
   }
@@ -2243,6 +2245,8 @@ void LlmRerankTranslation::Collect() {
   const size_t kMaxRerank = (size_t)(g_max_candidates > 0 ? g_max_candidates : 5);
   std::vector<an<Candidate>> tail;
   std::vector<double> s1_head;   // 层1 分（对齐 candidates_; 无 CE 分回退用）
+  // two_code_sentence 满长准入（2026-11-16）：⌊码长/2⌋（码 <2 字时 0 = 不启用）
+  int tcs_elen = g_two_code_sentence ? (int)(input_.length() / 2) : 0;
 
   std::vector<an<Candidate>> allc;
   while (!translation_->exhausted()) {
@@ -2265,16 +2269,37 @@ void LlmRerankTranslation::Collect() {
     std::stable_sort(idx.begin(), idx.end(),
                      [&s1](size_t a, size_t b) { return s1[a] > s1[b]; });
     size_t nk = (std::min)(kMaxRerank, allc.size());
-    for (size_t i = 0; i < nk; i++) {
-      candidates_.push_back(allc[idx[i]]);
-      s1_head.push_back(s1[idx[i]]);
+    // two_code_sentence 准入优先（2026-11-16 用户定案，取代 2026-11-07 的
+    // "词频前 k 全参评 + 最终排序满长组置顶"）：层1 序里词长==⌊码长/2⌋ 的
+    // 候选优先占满评分窗，前 k 个才算 CE；不足 k 个就空着——不匹配词长的
+    // 候选不进窗、不算 CE（调试窗口"有没有 CE 分"即满长组成员的可观察
+    // 标志，「匹配词长」专用列随之删除）。层1 排序本身不变，只改窗口准入。
+    {
+      std::vector<bool> in_win(idx.size(), false);
+      if (tcs_elen >= 1) {
+        size_t taken = 0;
+        for (size_t i = 0; i < idx.size() && taken < nk; i++)
+          if (utf8_len(allc[idx[i]]->text()) == tcs_elen) {
+            in_win[i] = true;
+            taken++;
+          }
+      } else {
+        for (size_t i = 0; i < nk; i++) in_win[i] = true;
+      }
+      for (size_t i = 0; i < idx.size(); i++) {
+        if (in_win[i]) {
+          candidates_.push_back(allc[idx[i]]);
+          s1_head.push_back(s1[idx[i]]);
+        } else {
+          tail.push_back(allc[idx[i]]);
+        }
+      }
     }
-    for (size_t i = nk; i < allc.size(); i++)
-      tail.push_back(allc[idx[i]]);
-    // 训练快照（词码对研究用）: 层1 前 k 候选 + 窗码（OnCommit 匹配才附）
+    // 训练快照（词码对研究用）: 层1 窗内候选 + 窗码（OnCommit 匹配才附）；
+    // 满长准入后窗可能不足 nk，按 candidates_ 实际数界取（2026-11-16）
     g_train_window_input = input_;
     g_train_window_cands.clear();
-    for (size_t i = 0; i < nk; i++) {
+    for (size_t i = 0; i < candidates_.size() && i < nk; i++) {
       if (i)
         g_train_window_cands += ",";
       g_train_window_cands += candidates_[i]->text();
@@ -2292,6 +2317,12 @@ void LlmRerankTranslation::Collect() {
     }
     g_train_window_cands.clear();  // 未重排 → 无快照
   }
+
+  // 满长准入后窗不足 2 个（不足即空着的极端形态）：无重排意义、整窗跳过
+  // 评分——显式发 S 事件（此前该路径静默，调试窗口对此窗零输出）
+  if (tcs_elen >= 1 && candidates_.size() < 2 && allc.size() >= 2)
+    live_send(std::string("S|") + now_hms() + "|full_len_lt2|" +
+              live_esc(input_) + "|" + src_);
 
   if (candidates_.size() >= 2 && g_loaded.load()) {
     // rerank with LLM (ctx_ computed by LlmFilter::Apply: TSF context
@@ -2476,6 +2507,8 @@ void LlmRerankTranslation::Collect() {
     // ⌊码长/2⌋ 的候选一组直接优先 (组内融合分降序, 同分稳定保融合序),
     // 其余按融合分降序——即原 elw 的极限行为 (elw·span 加成→∞),
     // 不再需要 span 间接量。失败哨兵分排尾部 (与插件版一致)。
+    // 2026-11-16 起满长组已在层1 准入时优先占满评分窗（见上方层1 块），
+    // 窗内候选全为满长组 → 本块对最终序恒 no-op，保留作保险 + dbg_full 标记。
     if (g_two_code_sentence && order.size() > 1) {
       int expected_len = (int)(input_.length() / 2);
       if (expected_len >= 1) {
