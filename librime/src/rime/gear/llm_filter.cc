@@ -1569,7 +1569,7 @@ static void load_model_async() {
     llama_backend_init();
 
     llama_model_params mparams = llama_model_default_params();
-    mparams.use_mmap = 1;
+    mparams.load_mode = LLAMA_LOAD_MODE_MMAP;  // 2026-11-15 升级: use_mmap 字段已删, load_mode 显式 mmap 等价
 
     g_model = llama_model_load_from_file(g_model_path.c_str(), mparams);
     if (!g_model) {
@@ -1585,7 +1585,7 @@ static void load_model_async() {
     cparams.n_threads_batch = g_n_threads;
     cparams.n_seq_max = g_n_seq_max;
 
-    g_ctx = llama_new_context_with_model(g_model, cparams);
+    g_ctx = llama_init_from_model(g_model, cparams);
     if (!g_ctx) {
       log_msg("ERROR: failed to create context");
       llama_model_free(g_model);
@@ -1850,7 +1850,7 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
 
 
   int ctx_len = (int)ctx_ids.size();
-  int vs = llama_n_vocab(g_vocab);
+  int vs = llama_vocab_n_tokens(g_vocab);
 
   // group candidates by token count
   std::vector<int> idx2, idx3;
@@ -2163,7 +2163,7 @@ static void prepare(const std::vector<llama_token> &ctx_ids, int seq) {
     return;
   }
   auto t0 = std::chrono::high_resolution_clock::now();
-  int vs = llama_n_vocab(g_vocab);
+  int vs = llama_vocab_n_tokens(g_vocab);
   auto *mem = llama_get_memory(g_ctx);
 
   g_prep_ready = false;
