@@ -616,7 +616,8 @@ static bool schema_needs_rebuild(const std::vector<std::string>& lines, wchar_t*
 }
 
 // 触发重新部署：WeaselRoot 注册表定位 WeaselDeployer，15s 有界等待
-//（deployer 曾在 EndMaintenance 管道应答中挂死——超时留后台不杀）
+//（deployer 曾在 EndMaintenance 管道应答中挂死——超时留后台不杀）；
+// /deploy 静默部署不弹任何窗口（同插件版 Invoke-Redeploy 口径）
 static void trigger_redeploy() {
   // 测试开关：静默跳过（结果状态行不被覆盖）
   if (GetEnvironmentVariableW(L"WEASEL_LLM_SETUP_NO_REDEPLOY", NULL, 0)) return;
@@ -637,8 +638,11 @@ static void trigger_redeploy() {
   }
   STARTUPINFOW si = {sizeof(si)};
   PROCESS_INFORMATION pi;
-  wchar_t cmd[MAX_PATH] = L"";
-  wcscpy_s(cmd, deployer.c_str());
+  // 必须带 /deploy（2026-11-16 用户报告）：裸启动时 WeaselDeployer.cpp Run()
+  // 对无参数命令行走 configurator.Run() = 打开设置 UI（方案选单/风格选单
+  // 两个弹窗）；/deploy = 静默 UpdateWorkspace。路径加引号防空格逐词试探。
+  wchar_t cmd[MAX_PATH + 32] = L"";
+  wcscpy_s(cmd, (L"\"" + deployer + L"\" /deploy").c_str());
   if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
     CloseHandle(pi.hThread);
     if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_TIMEOUT) {

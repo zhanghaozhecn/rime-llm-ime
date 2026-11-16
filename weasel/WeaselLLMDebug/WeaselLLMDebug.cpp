@@ -5,10 +5,13 @@
 // 同协议；插件版查看器为 rime-llm-rerank 仓库 debug\llm_debug_view.ps1，
 // 行语义注释两边逐字一致）：
 //   V|rime-llm-live|1|source|<日期>                  连接后服务端立即推
+//                                                    （协议握手保留；版本/日期徽章
+//                                                    自 2026-11-16 不再显示）
 //   L|HH:MM:SS|input|cache|src|ctx|tick|ms|ready|n|prep|n_seen|ctx_used
 //                                                    每次触发评分的调用头
 //                                                    （ctx=完整去空白上文；prep=KV 预解
-//                                                    命中；n_seen=全词数，查看器不显示；
+//                                                    命中；n=候选数、n_seen=全词数
+//                                                    ——协议保留，查看器不显示；
 //                                                    v4 尾字段 ctx_used=推理用尾部
 //                                                    ——查看器灰显其余前缀）
 //   C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1|pf
@@ -117,14 +120,13 @@ struct Row {
   bool win0 = false;  // 尾窗透传（灰字）
 };
 struct Inv {
-  std::wstring t, input, cache, src, ctx, tick, ms, ready, n, prep, ctxused;
+  std::wstring t, input, cache, src, ctx, tick, ms, ready, prep, ctxused;
   std::vector<Row> rows;
 };
 static std::deque<Inv> g_invs;          // 最近 50 次调用（新的在尾）
 static std::deque<std::wstring> g_evts; // 最近 200 条事件（新的在头）
 static int g_view = -1;                 // 当前展示下标（相对 g_invs 头）
 static bool g_paused = false;
-static std::wstring g_ver;
 
 // ---- 管道读取线程 ----
 static std::atomic<bool> g_stop{false};
@@ -419,10 +421,10 @@ static void update_current() {
   wchar_t line[512];
   swprintf(line, 512,
            L"%s  输入 %s   来源 %s   预解 %s   %sms   tick %s"
-           L"   n=%s   就绪 %s",
+           L"   就绪 %s",
            inv.t.c_str(), inv.input.c_str(), inv.src.c_str(),
            inv.prep.empty() ? L"-" : inv.prep.c_str(), inv.ms.c_str(),
-           inv.tick.c_str(), inv.n.c_str(), inv.ready.c_str());
+           inv.tick.c_str(), inv.ready.c_str());
   SetWindowTextW(h_info, line);
   ctx_render(inv.ctx, inv.ctxused);
   fill_grid(inv);
@@ -458,9 +460,7 @@ static void hist_refresh_item() {
 static void handle_line(const std::string &line) {
   if (line == "::CONNECTED") {
     g_connected.store(true);
-    if (!g_paused)
-      set_status((L"● 已连接" + (g_ver.empty() ? L"" : L" · " + g_ver)).c_str(),
-                 true);
+    if (!g_paused) set_status(L"● 已连接", true);
     return;
   }
   if (line == "::DISCONNECTED") {
@@ -475,9 +475,8 @@ static void handle_line(const std::string &line) {
   split8(line, f);
   if (f.empty()) return;
   if (f[0] == "V" && f.size() >= 5 && f[1] == "rime-llm-live") {
-    g_ver = u8w(f[2]) + L" · " + u8w(f[3]) + L" 版 · " + u8w(f[4]);
-    if (g_connected.load() && !g_paused)
-      set_status((L"● 已连接 · 协议 v" + g_ver).c_str(), true);
+    // 协议握手行仅作识别；版本/日期徽章自 2026-11-16 不再显示
+    //（状态行保持「● 已连接」），行本身保留供协议升级判别
     return;
   }
   if (f[0] == "L" && f.size() >= 10) {
@@ -490,13 +489,13 @@ static void handle_line(const std::string &line) {
     inv.tick = u8w(f[6]);
     inv.ms = u8w(f[7]);
     inv.ready = u8w(f[8]);
-    inv.n = u8w(f[9]);
     inv.prep = f.size() > 10 ? u8w(f[10]) : L"";
     // 协议 v4（2026-11-12）：第 13 字段 = 推理用尾部文本（灰显）；
     // 旧 DLL 无该字段 → 空 = 全文正常色不灰显
     inv.ctxused = f.size() > 12 ? u8w(f[12]) : L"";
-    // 协议 L 行第 12 字段 n_seen（全词数）自 2026-11-12 不再解析/显示
-    //（公式简化后无消费方）——协议保留，字段被忽略
+    // 协议 L 行第 10 字段 n（候选数，信息行 2026-11-16 起不再显示）与
+    // 第 12 字段 n_seen（全词数，2026-11-12 起不再解析/显示——公式简化
+    // 后无消费方）均协议保留，字段被忽略
     g_invs.push_back(std::move(inv));
     while (g_invs.size() > 50) {
       g_invs.pop_front();
