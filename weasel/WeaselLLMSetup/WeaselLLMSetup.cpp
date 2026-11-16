@@ -131,8 +131,8 @@ static std::wstring default_model_path() {
   // 2026-10-01：改用 rime_user_dir()（注册表 RimeUserDir 优先），与运行期
   // 默认（deployer().user_data_dir）在便携部署下保持一致
   std::wstring dir = rime_user_dir();
-  if (!dir.empty()) return dir + L"\\Qwen2.5-0.5B-Q4_K_M.gguf";
-  return L"Qwen2.5-0.5B-Q4_K_M.gguf";
+  if (!dir.empty()) return dir + L"\\qwen2.5-0.5b-instruct-q4_k_m.gguf";
+  return L"qwen2.5-0.5b-instruct-q4_k_m.gguf";
 }
 
 static std::wstring shown_model() {
@@ -303,7 +303,7 @@ static std::vector<std::string> build_llm_section() {
   } else {
     sec.push_back("  # model_path: <绝对路径；默认 = " +
                   wide_to_utf8(rime_user_dir()) +
-                  "\\Qwen2.5-0.5B-Q4_K_M.gguf>");
+                  "\\qwen2.5-0.5b-instruct-q4_k_m.gguf>");
   }
   return sec;
 }
@@ -1162,8 +1162,8 @@ static const wchar_t* const TIP_MODEL =
     L"换模型保存后会自动卸载并重载。";
 static const wchar_t* const TIP_BROWSE = L"浏览…：选择 .gguf 模型文件。";
 static const wchar_t* const TIP_DOWNLOAD =
-    L"下载模型：hf-mirror 断点续传（curl -C -），落点 = 左边的模型路径框\n"
-    L"（留空 = 用户文件夹里的默认名 Qwen2.5-0.5B-Q4_K_M.gguf）。\n"
+    L"下载模型：ModelScope 直连断点续传（curl -C -），落点 = 左边的模型路径框\n"
+    L"（留空 = 用户文件夹里的默认名 qwen2.5-0.5b-instruct-q4_k_m.gguf）。\n"
     L"失败会保留 .download 分片，再点一次即续传。";
 static const wchar_t* const TIP_SCHEMA =
     L"配置就写在选中的方案文件里。下拉列出**用户文件夹** %APPDATA%\\Rime 与\n"
@@ -1626,7 +1626,7 @@ static void draw_button(const DRAWITEMSTRUCT* d) {
 // 与插件版逐字同源：curl.exe（Win10 1803+ 自带）断点续传 -L -C - -o <目标>.download，
 // 轮询分片大小打进度；完成后剥掉 .download 后缀转正；失败保留分片可重试续传。
 static const wchar_t* const kModelUrl =
-    L"https://hf-mirror.com/QuantFactory/Qwen2.5-0.5B-GGUF/resolve/main/Qwen2.5-0.5B.Q4_K_M.gguf";
+    L"https://www.modelscope.cn/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/master/qwen2.5-0.5b-instruct-q4_k_m.gguf";
 static HANDLE g_dl_proc = NULL;
 static std::wstring g_dl_tmp, g_dl_target;
 #define DL_TIMER_ID 1
@@ -1718,7 +1718,7 @@ static void on_download_model() {
       log_error(L"[下载] APPDATA 缺失，无法定默认落点");
       return;
     }
-    target = dir + L"\\Qwen2.5-0.5B-Q4_K_M.gguf";
+    target = dir + L"\\qwen2.5-0.5b-instruct-q4_k_m.gguf";
   }
   for (wchar_t* c = &target[0]; *c; ++c)
     if (*c == L'/') *c = L'\\';

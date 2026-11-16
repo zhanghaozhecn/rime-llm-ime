@@ -483,7 +483,7 @@ model_path: d:/gguf_models/legacy.gguf
   Reload-Params $hw
   $modelCtl = [W]::GetDlgItem($hw, 1002)
   $cur = Read-Ctl $hw 1002
-  $expectDefault = Join-Path (Join-Path $sandbox "Rime") "Qwen2.5-0.5B-Q4_K_M.gguf"
+  $expectDefault = Join-Path (Join-Path $sandbox "Rime") "qwen2.5-0.5b-instruct-q4_k_m.gguf"
   Write-Host ("  模型路径框 = " + $cur + "（方案节已无 model_path + 无旧全局 yaml）")
   Assert ("默认模型路径 = 用户目录下的默认名（实测 '$cur'）") ($cur -eq $expectDefault)
   # ① 指向一个明显偏小的 .gguf → 状态行报"可疑"（不再谎报已就绪）

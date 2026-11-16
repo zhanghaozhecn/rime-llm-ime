@@ -40,7 +40,7 @@ LLM 候选重排**源码级集成**进 RIME 小狼毫：本地小语言模型（
 ### 安装包（推荐）
 
 1. 到 [Releases 最新版](https://github.com/zhanghaozhecn/rime-llm-ime/releases/latest) 下载 `weasel-llm-setup-<日期>.exe`（约 10MB）双击（未签名——SmartScreen 弹"Windows 已保护你的电脑"时选"更多信息 → 仍要运行"）。全新机器无需先装官方小狼毫；已有官方小狼毫则原地升级、不动注册。系统要求：Windows 10 或更高（更早版本未验证）
-2. 安装向导**不再询问模型下载**（2026-10-01 定案：下载功能统一挪进配置 GUI）：装完在托盘「LLM 重排设置」→ **总控** → 点**「下载模型」**（约 380MB，hf-mirror，curl 断点续传；落点 = 模型路径框，留空 = `%APPDATA%\Rime\Qwen2.5-0.5B-Q4_K_M.gguf`）。**安装过程不写任何配置文件**
+2. 安装向导**不再询问模型下载**（2026-10-01 定案：下载功能统一挪进配置 GUI）：装完在托盘「LLM 重排设置」→ **总控** → 点**「下载模型」**（约 470MB，ModelScope 直连，curl 断点续传；落点 = 模型路径框，留空 = `%APPDATA%\Rime\qwen2.5-0.5b-instruct-q4_k_m.gguf`）。**安装过程不写任何配置文件**
 3. **在要启用的方案里加组件与配置节**（一次性，三选一）：托盘右键 → "LLM 重排设置" → 选方案点"保存并生效"（缺组件行/配置节时会自动补齐：幂等插入 `llm_filter` + 写入 `llm_rerank:` 配置节 + 自动重新部署）；或运行安装目录下的 `schema_add.ps1`（右键"使用 PowerShell 运行"，交互同上、另支持 CLI 自动化）；或按下文"方案接入"手动加。之后托盘右键 → **重新部署**（用 GUI 保存则自动）
 4. 若还没下模型：托盘右键 → **"LLM 重排设置"** → 总控 → 点**「下载模型」**（或"浏览…"选已有的 `.gguf`；状态行会提示文件是否存在）→ 点**保存并生效**（写入该方案并自动重新部署）
 5. 验证：**先上屏一个词**（光标前无文字时不重排——刚装好打的第一个词必然保持原序），再打满 4 码观察候选顺序按上下文变化；确凿验证开 [实时调试窗口](#实时调试窗口)（托盘右键 → "LLM 调试窗口"）看逐候选分数
@@ -130,7 +130,7 @@ llm_rerank:            # 参数节（GUI / schema_add.ps1 自动写入，键名�
   cpu_cores: 4
   two_code_sentence: false
   debug_fusion: false
-  # model_path: <绝对路径；留注释 = 默认 %APPDATA%\Rime\Qwen2.5-0.5B-Q4_K_M.gguf>
+  # model_path: <绝对路径；留注释 = 默认 %APPDATA%\Rime\qwen2.5-0.5b-instruct-q4_k_m.gguf>
   # 词频权重 β=14 / τ=400 为内置常数（2026-11-05 起退出配置面；旧 freq_beta 行保存时自动剥除）
 ```
 
@@ -147,7 +147,7 @@ llm_rerank:            # 参数节（GUI / schema_add.ps1 自动写入，键名�
 
 ### 手动安装（无法运行安装包时）
 
-1. 下载 GGUF 模型（建议 ≤2B Q4；默认 `Qwen2.5-0.5B-Q4_K_M.gguf`）放到 `%APPDATA%\Rime\`（RIME 用户文件夹根，模型直接放根）
+1. 下载 GGUF 模型（建议 ≤2B Q4；默认 `qwen2.5-0.5b-instruct-q4_k_m.gguf`）放到 `%APPDATA%\Rime\`（RIME 用户文件夹根，模型直接放根）
 2. 将 `bin/` 下 **10 个文件**复制到小狼毫安装目录（`C:\Program Files\Rime\weasel-0.17.4`）：`rime.dll`、`weaselx64.dll`、`weasel32.dll`（改名为 `weasel.dll`）、`WeaselServer.exe`、`WeaselDeployer.exe`、`WeaselLLMSetup.exe`、`bench_threads.exe`（线程数实测，与设置程序同目录）、`opencc.dll`、`vcomp140.dll`、`WinSparkle.dll`（后三个是运行依赖，官方安装目录有前例可拷）
 3. 原位替换系统 TSF 组件（不碰注册表）：`weaselx64.dll` → `C:\Windows\System32\weasel.dll`，`weasel32.dll` → `C:\Windows\SysWOW64\weasel.dll`。先停 `WeaselServer.exe`/`WeaselDeployer.exe`，旧文件改名 `*.llm_old` 腾位后复制。**切勿运行 `WeaselSetup /u`**——它会删 TSF 注册且难以恢复（应急：`installer\repair_tsf.ps1`）
 4. 托盘右键 → **重新部署**（词典 build 必须由本版 librime 编译）

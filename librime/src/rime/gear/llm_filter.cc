@@ -100,16 +100,18 @@ static std::atomic<bool> g_loading{false};
 // 自定义位置用 llm_rerank model_path 显式指向。
 // 注意 Service.deployer().user_data_dir 在引擎启动后才就绪，故不能在
 // 静态初始化求值——g_model_path 留空，加载时懒取默认。
-// 默认模型 = Qwen2.5-0.5B-Q4_K_M（2026-11-14 用户定案：0.5B 候选段延迟
-// 0.69×、弱 CPU 机友好，精度代价 −0.12~−0.30pp 可接受；旧默认
-// Qwen3.5-0.8B）
+// 默认模型 = qwen2.5-0.5b-instruct-q4_k_m（2026-11-16 用户定案 base→instruct
+// 切换：聚合效果与 base 无差异（2 万窗对照 +0.02pp）、下载源 ModelScope
+// 官方仓国内直连快；CPU 延迟与 base 无差异（三轮交替配对 ≈50.5ms，
+// 张量逐层同量化——首测 +9% 系小样本非交替测量误差）。
+// 前身 2026-11-14 的 Qwen2.5-0.5B-Q4_K_M（base），更旧 Qwen3.5-0.8B）
 static std::string default_model_path() {
   try {
     return (Service::instance().deployer().user_data_dir /
-            "Qwen2.5-0.5B-Q4_K_M.gguf")
+            "qwen2.5-0.5b-instruct-q4_k_m.gguf")
         .string();
   } catch (...) {
-    return "Qwen2.5-0.5B-Q4_K_M.gguf";
+    return "qwen2.5-0.5b-instruct-q4_k_m.gguf";
   }
 }
 static std::string g_model_path;  // 空 = 未配置，load_model 时按默认兜底
