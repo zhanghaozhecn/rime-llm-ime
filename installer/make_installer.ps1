@@ -1,5 +1,5 @@
 ﻿# make_installer.ps1 — 二进制载荷同步（源码版仓库内开发工具）
-# 仓库根 bin\ → installer\source\（11 个载荷文件；setup.iss 与安装包的载荷来源）。
+# 仓库根 bin\ → installer\source\（13 个载荷文件；setup.iss 与安装包的载荷来源）。
 # WinSparkle.dll = WeaselServer.exe 的静态导入依赖（从官方小狼毫安装目录拷入 bin\）；
 #   2026-08-27 依赖审计发现：缺它全新机 WeaselServer 起不来（升级机被官方文件掩盖）。
 # WeaselSetup.exe = 全新机 TSF 注册工具（scripts\build_setup.bat 产物拷入 bin\）。
@@ -34,7 +34,8 @@ Write-Host "+ bench_threads.exe ← 插件版 bin\（规范源）"
 foreach ($f in @("rime.dll", "WeaselServer.exe", "WeaselDeployer.exe",
                  "weaselx64.dll", "weasel32.dll", "opencc.dll", "vcomp140.dll",
                  "WeaselLLMSetup.exe", "WeaselSetup.exe", "WinSparkle.dll",
-                 "bench_threads.exe", "WeaselLLMDebug.exe")) {
+                 "bench_threads.exe", "WeaselLLMDebug.exe",
+                 "WeaselLLMStudio.exe")) {
   $s = Join-Path $SourceBin $f
   if (Test-Path $s) { Copy-Item $s $dst -Force; Write-Host "+ $f" }
   else { Write-Host "MISS $f" -ForegroundColor Yellow }

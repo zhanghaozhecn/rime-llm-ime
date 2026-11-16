@@ -18,7 +18,7 @@
 ;               （写组件行 + 方案 llm_rerank 节）决定。
 
 #define MyAppName "小狼毫 LLM 版"
-#define MyAppVer "2026.11.16-3"  ; 同日重打安装包在日期后加 -2…-N 序号（2026-09-11 用户定案，避免同号不同内容）
+#define MyAppVer "2026.11.16-4"  ; 同日重打安装包在日期后加 -2…-N 序号（2026-09-11 用户定案，避免同号不同内容）
 #define MyAppId "{{3F8A2D5C-6B1E-4F9A-8D73-9C2E5B7A1F40}"
 
 [Setup]
@@ -51,7 +51,7 @@ Root: HKLM; Subkey: "Software\Rime\Weasel"; ValueType: string; ValueName: "Wease
 Root: HKLM; Subkey: "Software\WOW6432Node\Rime\Weasel"; ValueType: string; ValueName: "WeaselRoot"; ValueData: "{app}"; Flags: uninsdeletevalue
 
 [Files]
-; 应用目录：source\* = 11 个载荷（8 个 LLM 组件 + WinSparkle.dll 依赖 +
+; 应用目录：source\* = 13 个载荷（LLM 组件 + WinSparkle.dll 依赖 +
 ; WeaselSetup.exe 注册工具 + bench_threads.exe 线程数实测工具——2026-08-27 起
 ; 统一由 make_installer.ps1 同步入 source\，不再从 weasel\output 单独引用）
 ; + 数据目录 + TSF 应急修复 + 方案接入助手（schema_add.ps1，幂等插入/剥离
@@ -204,7 +204,7 @@ var
 begin
   names := ['rime.dll', 'WeaselServer.exe', 'WeaselDeployer.exe', 'opencc.dll',
             'vcomp140.dll', 'weaselx64.dll', 'weasel32.dll', 'WeaselLLMSetup.exe',
-            'WeaselLLMDebug.exe'];
+            'WeaselLLMDebug.exe', 'WeaselLLMStudio.exe'];
   for i := 0 to GetArrayLength(names) - 1 do
     if FileExists(dir + '\' + names[i] + '.llm_old') then
       if not DeleteFile(dir + '\' + names[i] + '.llm_old') then

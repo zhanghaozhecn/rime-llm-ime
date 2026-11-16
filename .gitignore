@@ -56,6 +56,8 @@ scripts/*
 !scripts/run_test_rime.bat
 !scripts/build_llm_setup.bat
 !scripts/build_llm_debug.bat
+!scripts/build_llm_studio.bat
+!scripts/gen_studio.py
 !scripts/build_setup.bat
 !scripts/build_pkg.bat
 !scripts/test_debug_viewer_pipe.ps1
