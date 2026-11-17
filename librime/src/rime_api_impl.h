@@ -1072,11 +1072,12 @@ static unsigned long long RimeContextTextAgeMs() {
 // 代次递增瞬间 (server IPC 线程) 即失效 COM 快照 + kick 延迟重读。
 // 仅挂 GetContextTextPair (满码评分时) 比插件版 processor 按键回调慢
 // 一拍: 编辑后首词 ctx 空 -> 不推理。钩子须无阻塞 (微秒级 mutex+cv)。
-static void (*g_context_reset_hook)(void*) = nullptr;
+static void (*g_context_reset_hook)(void*, const char*) = nullptr;
 static void* g_context_reset_hook_arg = nullptr;
 static void RimeResetContextText(const char* reason) {
-  void (*hook)(void*) = nullptr;
+  void (*hook)(void*, const char*) = nullptr;
   void* hook_arg = nullptr;
+  const char* hook_reason = reason ? reason : "unknown";
   {
     std::lock_guard<std::mutex> lock(g_context_text_mutex);
     g_context_text.clear();
@@ -1084,16 +1085,15 @@ static void RimeResetContextText(const char* reason) {
     ++g_context_reset_gen;
     hook = g_context_reset_hook;
     hook_arg = g_context_reset_hook_arg;
-    // 诊断: 记录 reset 触发 + 原因 (谁清空了 TSF 上下文, ESC 场景排查)
-    FILE *f = fopen("C:/Users/Administrator/AppData/Roaming/Rime/rime_llm_filter_log.txt", "a");
-    if (f) { fprintf(f, "RESET: context cleared (gen=%d reason=%s)\n",
-                     g_context_reset_gen, reason ? reason : "unknown");
-             fclose(f); }
+    // 记录文件统一由 llm_filter 的 corpus/debug writer 写（2026-11-17
+    // 用户定案：只保留 rime_llm_corpus.tsv + rime_llm_debug.txt）——
+    // 此处不再硬编码绝对路径写日志，reason 透传给 hook。
   }
   if (hook)
-    hook(hook_arg);  // 锁外调用 (llm_filter: comctx invalidate+kick)
+    hook(hook_arg, hook_reason);  // 锁外调用 (invalidate+kick+记录)
 }
-static void RimeSetContextResetHookImpl(void (*hook)(void*), void* arg) {
+static void RimeSetContextResetHookImpl(void (*hook)(void*, const char*),
+                                        void* arg) {
   std::lock_guard<std::mutex> lock(g_context_text_mutex);
   g_context_reset_hook = hook;
   g_context_reset_hook_arg = arg;

@@ -538,7 +538,8 @@ typedef struct RIME_FLAVORED(rime_api_t) {
 //! instead of at the next full-code scoring pass (one keystroke late: first
 //! word after an edit got an empty context). Hook runs on the server IPC
 //! thread outside locks and must be non-blocking. Pass nullptr to unregister.
-RIME_API void RimeSetContextResetHook(void (*hook)(void* user_data),
+RIME_API void RimeSetContextResetHook(void (*hook)(void* user_data,
+                                                  const char* reason),
                                       void* user_data);
 
 //! API entry

@@ -149,7 +149,9 @@ static int g_min_tokens = 1;
 static int g_max_ctx_tokens = 10;  // tok=10: 93.4% acc, 10->17 gains only +1.1pp
 static int g_n_threads = 4;        // default = GGML_DEFAULT_N_THREADS; override via cpu_cores
 
-static void log_msg(const char *fmt, ...);  // defined below (fwd decl)
+static void log_msg(const char *fmt, ...);    // defined below (fwd decl)
+static void log_error(const char *fmt, ...);  // defined below (fwd decl)
+static void write_m(const char *reason);      // defined below (fwd decl)
 static std::vector<llama_token> tokenize(const char *text);  // fwd decl
 static double cross_entropy(const float *logits, int vs, int target_id);  // fwd decl
 
@@ -190,7 +192,7 @@ static void llm_apply_params() {
     try {
       g_code_re = boost::regex(g_code_pattern);
     } catch (const std::exception &e) {
-      log_msg("code_pattern invalid ('%s': %s) -> fallback '%s'",
+      log_error("code_pattern invalid ('%s': %s) -> fallback '%s'",
               g_code_pattern.c_str(), e.what(), kDefaultCodePattern);
       g_code_pattern = kDefaultCodePattern;
       try {
@@ -755,7 +757,7 @@ static void thread_proc() {
 }
 
 #ifdef _WIN32
-static void llm_context_reset_hook(void*);  // 定义在 invalidate/kick 之后
+static void llm_context_reset_hook(void*, const char*);  // 定义在 invalidate/kick 之后
 #endif
 static void ensure_started() {  // 首次粘性降级命中时调用 (引擎线程)
   bool expect = false;
@@ -787,9 +789,10 @@ static void invalidate() {
   g_title.clear();
 }
 #ifdef _WIN32
-static void llm_context_reset_hook(void*) {
+static void llm_context_reset_hook(void*, const char* reason) {
   comctx::invalidate();
   comctx::kick();
+  write_m(reason);  // 常开语料 M 事件 + 按需 debug R 行
 }
 #endif
 
@@ -865,22 +868,21 @@ static bool g_user_freq_loaded = false;
 static int  g_user_freq_dirty = 0;
 static constexpr double kFreqTau = 400.0;  // rime formula_d 时间常数 (v3 2026-11-06 六维联合标定; 旧 800 出自 2026-11-02)
 
-// Log file: RIME user data dir, single file rime_llm_filter_log.txt
-// (performance lines + per-inference event lines); falls back to %TEMP%.
-// resolve log file path: RIME user data dir + filename, fallback %TEMP%
-// 日志轮转（2026-09-04）：>5MB 改名 .old（单文件轮转）防无限增长；
-// 改名失败（被占等罕见）则继续追加，不丢日志
-static void rotate_if_large(const char *path) {
+// 日志轮转（2026-09-04）：超过 limit 改名 .old（单文件轮转）防无限增长；
+// 改名失败（被占等罕见）则继续追加，不丢日志。
+static void rotate_if_large(const char *path, unsigned long long limit) {
   WIN32_FILE_ATTRIBUTE_DATA fa;
   if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa) &&
       ((((unsigned long long)fa.nFileSizeHigh << 32) |
-        (unsigned long long)fa.nFileSizeLow) > 5ull * 1024 * 1024)) {
+        (unsigned long long)fa.nFileSizeLow) > limit)) {
     std::string oldp = std::string(path) + ".old";
     DeleteFileA(oldp.c_str());
     MoveFileA(path, oldp.c_str());
   }
 }
 
+// 旧 open_log_file 已由下方 log_file_path/corpus_write_raw/debug_write_raw
+// 取代（2026-11-17 记录重构）。保留此实现仅供旧调用兼容，新代码不再使用。
 static FILE *open_log_file(const char *filename) {
   char path[MAX_PATH];
   const RimeApi *api = rime_get_api();
@@ -888,14 +890,14 @@ static FILE *open_log_file(const char *filename) {
     const char *ud = api->get_user_data_dir();
     if (ud && *ud && strlen(ud) < MAX_PATH - 64) {
       snprintf(path, sizeof(path), "%s\\%s", ud, filename);
-      rotate_if_large(path);
+      rotate_if_large(path, 5ull * 1024 * 1024);
       return fopen(path, "a");
     }
   }
 #ifdef _WIN32
   GetTempPathA(sizeof(path), path);
   strncat(path, filename, sizeof(path) - strlen(path) - 1);
-  rotate_if_large(path);
+  rotate_if_large(path, 5ull * 1024 * 1024);
   return fopen(path, "a");
 #else
   (void)path;
@@ -1267,87 +1269,75 @@ static void user_freq_bump(const std::string &w, const std::string &code) {
 // 最近一次候选窗的输入码（词码对记账 OnCommit 用; engine thread 写读）
 static std::string g_last_input;
 
-// ── 训练语料记录（2026-11-13 源码版原生补齐; 此前为插件版
-// llm_processor.lua 独有, 本机 09-14 切源码版后停写两个月）──
-// 格式对齐插件版 llm_training.txt（研究 prep_user_sc 消费）:
-//   词1\t码1[\t窗快照]|词2\t码2|←|…
-//   | 分隔词条、\t 分隔词/码(/快照)、← 退格修正、场景 = 一行。
-// 码 = 完整提交码不截断（研究资格门需要 3 码单字）。
-// 信号近似: 退格 ← 用 reset 代次变化（librime 编辑键统一信号——
-// 导航/回车无法与退格区分, 统一记 ← 保守截断上下文链）; 场景分隔
-// 仅在会话首词写一次（跨应用切换的真实场景断裂记录不了, 可接受）。
-// 快照 = 层1 前 k 候选逗号分隔（Collect 重排发生时记录, 窗码匹配
-// 才附——与插件版 llm_last_window 握手语义一致）。
-static std::string g_train_window_input;   // 最近重排窗码（空 = 未重排）
-static std::string g_train_window_cands;   // 层1 前 k 逗号分隔
-static int g_train_gen = -1;               // 上次 commit 见到的 reset 代次
-static bool g_train_line_open = false;     // 当前场景行已开始
+// ============================================================
+// 记录文件（2026-11-17 用户定案：只保留两个文件）
+//   常开语料 rime_llm_corpus.tsv（TSV，不轮转，独立可分析）
+//   按需 debug rime_llm_debug.txt（| 分隔，10MB 单轮转）
+// 事件 ID 串联两文件；debug 只写语料没有的字段（CE/eff/耗时/错误），
+// 不重复词/码/上下文/候选序/配置。
+// ============================================================
+static const char *kCorpusFile = "rime_llm_corpus.tsv";
+static const char *kDebugFile = "rime_llm_debug.txt";
+static const char *kCorpusMagic = "#RIME_CORPUS\tv2\t";
+static const char *kDebugMagic = "#RIME_DEBUG|v2|";
+static const unsigned long long kDebugRotateBytes = 10ull * 1024 * 1024;
+static std::mutex g_log_mu;
+static bool g_corpus_checked = false;
+static bool g_corpus_ok = true;
+static bool g_debug_checked = false;
+static bool g_debug_ok = true;
+static std::atomic<long long> g_event_seq{0};
+static std::mutex g_event_mu;
+static std::string g_last_event_id;
 
-static void train_append(const std::string &text) {
+struct LastWindow {
+  std::string id;
+  std::string code;
+  std::vector<std::string> engine;
+  std::vector<std::string> window;
+  std::vector<std::string> final_list;
+  long long tick = 0;
+};
+static LastWindow g_last_window;  // engine thread only (Apply/Collect/OnCommit)
+
+static bool log_file_path(const char *filename, char *path, size_t n) {
   const RimeApi *api = rime_get_api();
-  if (!api || !api->get_user_data_dir)
-    return;
-  const char *ud = api->get_user_data_dir();
-  if (!ud || !*ud)
-    return;
-  char path[MAX_PATH];
-  snprintf(path, sizeof(path), "%s\\llm_training.txt", ud);
-  FILE *f = fopen(path, "a");
-  if (!f)
-    return;
-  fputs(text.c_str(), f);
-  fclose(f);
+  if (api && api->get_user_data_dir) {
+    const char *ud = api->get_user_data_dir();
+    if (ud && *ud && strlen(ud) < n - 64) {
+      snprintf(path, n, "%s\\%s", ud, filename);
+      return true;
+    }
+  }
+#ifdef _WIN32
+  char tmp[MAX_PATH];
+  GetTempPathA(sizeof(tmp), tmp);
+  snprintf(path, n, "%s%s", tmp, filename);
+  return true;
+#else
+  (void)path;
+  (void)n;
+  return false;
+#endif
 }
 
-static void log_msg(const char *fmt, ...) {
-  char buf[512];
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, ap);
-  va_end(ap);
-
-  FILE *f = open_log_file("rime_llm_filter_log.txt");
-  if (f) {
-    fprintf(f, "%s\n", buf);
-    fclose(f);
-  }
-}
-
-// ============================================================
-// per-inference event line (merged into rime_llm_filter_log.txt):
-//   HH:MM:SS|seq|input|cands_before|ctx|result|elapsed_ms|src
-// Written once per real inference; '|' -> '/', newline -> space.
-// ============================================================
-static long g_event_cnt = 0;
-
-// Escape control chars for log lines: ctx may contain newlines (multi-line
-// caret text) which would otherwise break line-based log viewing in
-// Notepad. \n/\r/\t -> literal "\\n" etc.
-static std::string escape_ctx(const std::string &s) {
-  std::string t;
-  t.reserve(s.size());
-  for (char c : s) {
-    if (c == '\n')
-      t += "\\n";
-    else if (c == '\r')
-      t += "\\r";
-    else if (c == '\t')
-      t += "\\t";
-    else
-      t += c;
-  }
-  return t;
-}
-
-static std::string sanitize_field(const std::string &s) {
-  std::string t = s;
-  for (auto &c : t) {
-    if (c == '|')
-      c = '/';
-    else if (c == '\n' || c == '\r')
-      c = ' ';
-  }
-  return t;
+static std::string now_stamp() {
+#ifdef _WIN32
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  char b[40];
+  snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d.%03d", st.wYear,
+           st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+           st.wMilliseconds);
+  return b;
+#else
+  std::time_t t = std::time(nullptr);
+  std::tm tm_buf;
+  localtime_r(&t, &tm_buf);
+  char b[32];
+  std::strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", &tm_buf);
+  return b;
+#endif
 }
 
 static std::string now_hms() {
@@ -1363,35 +1353,295 @@ static std::string now_hms() {
   return ts;
 }
 
-static void event_log(const std::string &input, const std::string &before,
-                      const std::string &ctx, const std::string &after,
-                      double elapsed_ms, const std::string &src) {
-  FILE *f = open_log_file("rime_llm_filter_log.txt");
+static std::string new_event_id(const char *kind, long long tick) {
+  (void)kind;
+  long long seq = ++g_event_seq;
+#ifdef _WIN32
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  char b[96];
+  snprintf(b, sizeof(b), "%04d%02d%02dT%02d%02d%02d%03d-%lld-%04lld",
+           st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+           st.wMilliseconds, tick, seq);
+  return b;
+#else
+  char b[64];
+  snprintf(b, sizeof(b), "0-%lld-%04lld", tick, seq);
+  return b;
+#endif
+}
+
+static void remember_event(const std::string &id) {
+  std::lock_guard<std::mutex> lk(g_event_mu);
+  g_last_event_id = id;
+}
+
+static std::string last_event_id() {
+  std::lock_guard<std::mutex> lk(g_event_mu);
+  return g_last_event_id;
+}
+
+static std::string tsv_escape(const std::string &s) {
+  std::string t;
+  t.reserve(s.size() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '\\': t += "\\\\"; break;
+      case '\t': t += "\\t"; break;
+      case '\n': t += "\\n"; break;
+      case '\r': t += "\\r"; break;
+      default: t += c;
+    }
+  }
+  return t;
+}
+
+static std::string pipe_escape(const std::string &s) {
+  std::string t = s;
+  for (auto &c : t) {
+    if (c == '|')
+      c = '/';
+    else if (c == '\n' || c == '\r')
+      c = ' ';
+  }
+  return t;
+}
+
+static std::string cand_escape(const std::string &s) {
+  std::string t;
+  t.reserve(s.size() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '\\': t += "\\\\"; break;
+      case ',': t += "\\,"; break;
+      case '\t': t += "\\t"; break;
+      case '\n': t += "\\n"; break;
+      case '\r': t += "\\r"; break;
+      default: t += c;
+    }
+  }
+  return t;
+}
+
+static std::string join_strs(const std::vector<std::string> &v, size_t maxn) {
+  std::string t;
+  size_t n = v.size() < maxn ? v.size() : maxn;
+  for (size_t i = 0; i < n; i++) {
+    if (i)
+      t += ',';
+    t += cand_escape(v[i]);
+  }
+  return t;
+}
+
+static std::vector<std::string> texts_of(const std::vector<an<Candidate>> &v,
+                                         size_t maxn) {
+  std::vector<std::string> out;
+  size_t n = v.size() < maxn ? v.size() : maxn;
+  out.reserve(n);
+  for (size_t i = 0; i < n; i++)
+    out.push_back(v[i]->text());
+  return out;
+}
+
+static std::string ctx_tail(const std::string &s, size_t n) {
+  if (s.size() <= n)
+    return s;
+  size_t cut = s.size() - n;
+  while (cut < s.size() && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80)
+    ++cut;
+  return s.substr(cut);
+}
+
+static std::string path_base(const std::string &p) {
+  size_t x = p.find_last_of("\\/");
+  return x == std::string::npos ? p : p.substr(x + 1);
+}
+
+static bool check_header_locked(const char *path, const char *magic,
+                                const char *header_line) {
+  FILE *f = fopen(path, "rb");
+  if (f) {
+    char line[512] = {0};
+    bool ok = fgets(line, sizeof(line), f) &&
+              strncmp(line, magic, strlen(magic)) == 0;
+    fclose(f);
+    return ok;
+  }
+  f = fopen(path, "ab");
+  if (!f)
+    return false;
+  fputs(header_line, f);
+  fputc('\n', f);
+  fclose(f);
+  return true;
+}
+
+static void corpus_write_raw(const std::string &line) {
+  std::lock_guard<std::mutex> lk(g_log_mu);
+  char path[MAX_PATH];
+  if (!log_file_path(kCorpusFile, path, sizeof(path)))
+    return;
+  if (!g_corpus_checked) {
+    g_corpus_checked = true;
+    g_corpus_ok = check_header_locked(
+        path, kCorpusMagic,
+        (std::string(kCorpusMagic) + now_stamp() + "\tsource").c_str());
+  }
+  if (!g_corpus_ok)
+    return;
+  FILE *f = fopen(path, "ab");
   if (!f)
     return;
-  long n = ++g_event_cnt;
-  fprintf(f, "%s|%ld|%s|%s|%s|%s|%.0fms|%s\n", now_hms().c_str(), n,
-          input.c_str(), before.c_str(), ctx.c_str(), after.c_str(),
-          elapsed_ms, src.c_str());
+  fwrite(line.data(), 1, line.size(), f);
+  fputc('\n', f);
   fclose(f);
 }
 
-// ============================================================
-// debug_fusion 诊断输出 (与插件版 llm_filter.lua/llm_processor.lua
-// 同名同格式, 写 rime_llm_debug.txt): score 块 = 头行 + 负路径行 +
-// 逐候选明细 + 名次变化 + span; commit 行 = 词频 bump 前后; reset 行 =
-// 代次变化清缓存。块尾空行分隔。
-// ============================================================
-static void debug_fusion_write(const std::vector<std::string> &lines) {
-  if (lines.empty())
+static void debug_write_raw(const std::string &line, bool force) {
+  if (!force && !g_debug_fusion)
     return;
-  FILE *f = open_log_file("rime_llm_debug.txt");
+  std::lock_guard<std::mutex> lk(g_log_mu);
+  char path[MAX_PATH];
+  if (!log_file_path(kDebugFile, path, sizeof(path)))
+    return;
+  if (!g_debug_checked) {
+    g_debug_checked = true;
+    g_debug_ok = check_header_locked(
+        path, kDebugMagic,
+        (std::string(kDebugMagic) + now_stamp() + "|source").c_str());
+  }
+  if (!g_debug_ok)
+    return;
+  rotate_if_large(path, kDebugRotateBytes);
+  FILE *f = fopen(path, "ab");
   if (!f)
     return;
-  for (auto &l : lines)
-    fprintf(f, "%s\n", l.c_str());
-  fprintf(f, "\n");
+  fwrite(line.data(), 1, line.size(), f);
+  fputc('\n', f);
   fclose(f);
+}
+
+static void log_msg(const char *fmt, ...) {
+  if (!g_debug_fusion)
+    return;
+  char buf[2048];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  debug_write_raw(std::string("-|X|scope=ops|msg=") + pipe_escape(buf), false);
+}
+
+static void log_error(const char *fmt, ...) {
+  char buf[2048];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  debug_write_raw(std::string("-|X|scope=error|msg=") + pipe_escape(buf), true);
+}
+
+static std::string write_w(const std::string &id, const std::string &src,
+                           const std::string &code, const std::string &ctx,
+                           const std::vector<std::string> &engine,
+                           const std::vector<std::string> &window,
+                           const std::vector<std::string> &final_list,
+                           long long tick, const std::string &status,
+                           const std::string &skip, bool prep,
+                           const std::string &flags) {
+  std::string line = "W\t" + id + "\t" + now_stamp() + "\t" +
+                     tsv_escape(src) + "\t" + tsv_escape(code) + "\t" +
+                     tsv_escape(ctx_tail(ctx, 120)) + "\t" +
+                     join_strs(engine, 10) + "\t" + join_strs(window, 20) +
+                     "\t" + join_strs(final_list, 20) + "\t" +
+                     std::to_string(tick) + "\t" + status + "\t" +
+                     tsv_escape(skip) + "\t" + (prep ? "1" : "0") + "\t" +
+                     tsv_escape(flags);
+  corpus_write_raw(line);
+  remember_event(id);
+  g_last_window.id = id;
+  g_last_window.code = code;
+  g_last_window.engine = engine;
+  g_last_window.window = window;
+  g_last_window.final_list = final_list;
+  g_last_window.tick = tick;
+  return id;
+}
+
+static int rank_of(const std::vector<std::string> &v, const std::string &w) {
+  for (size_t i = 0; i < v.size(); i++)
+    if (v[i] == w)
+      return (int)i + 1;
+  return -1;
+}
+
+static std::string write_c(const std::string &word, const std::string &code,
+                           long long tick, bool cjk) {
+  std::string ref;
+  int re = -1, rw = -1, rf = -1;
+  if (!code.empty() && g_last_window.code == code) {
+    ref = g_last_window.id;
+    re = rank_of(g_last_window.engine, word);
+    rw = rank_of(g_last_window.window, word);
+    rf = rank_of(g_last_window.final_list, word);
+  }
+  // 窗口只对应一次输入尝试：任何提交后消费，避免空码提交后旧窗被
+  // 后续同码简码提交误引用。
+  g_last_window = LastWindow();
+  std::string id = new_event_id("C", tick);
+  std::string line = "C\t" + id + "\t" + now_stamp() + "\t" + ref + "\t" +
+                     tsv_escape(word) + "\t" + tsv_escape(code) + "\t" +
+                     std::to_string(re) + "\t" + std::to_string(rw) + "\t" +
+                     std::to_string(rf) + "\t" + std::to_string(tick) + "\t" +
+                     (cjk ? "cjk=1" : "");
+  corpus_write_raw(line);
+  remember_event(id);
+  return id;
+}
+
+static const char *reset_kind(const char *reason) {
+  if (!reason)
+    return "unknown";
+  if (strcmp(reason, "focus:switch") == 0)
+    return "focus";
+  if (strcmp(reason, "editkey:backspace") == 0)
+    return "backspace";
+  if (strcmp(reason, "editkey:delete") == 0)
+    return "delete";
+  if (strcmp(reason, "editkey:navigation") == 0)
+    return "navigation";
+  if (strcmp(reason, "editkey:enter") == 0)
+    return "enter";
+  if (strcmp(reason, "editkey:undo-clipboard") == 0)
+    return "undo-clipboard";
+  return "unknown";
+}
+
+static void write_m(const char *reason) {
+  std::string id = new_event_id("M", 0);
+  std::string ref = last_event_id();
+  std::string line = "M\t" + id + "\t" + now_stamp() + "\t" + ref + "\t" +
+                     reset_kind(reason) + "\t\t";
+  corpus_write_raw(line);
+  int gen = 0;
+  const RimeApi *api = rime_get_api();
+  if (api && api->context_reset_generation)
+    gen = api->context_reset_generation();
+  debug_write_raw(id + "|R|gen=" + std::to_string(gen), false);
+}
+
+static void write_h(const std::string &schema, const std::string &model) {
+  char beta[16];
+  snprintf(beta, sizeof(beta), "%.2f", g_freq_beta);
+  std::string id = new_event_id("H", g_user_tick);
+  std::string line = "H\t" + id + "\t" + now_stamp() + "\tsource\t" +
+                     tsv_escape(schema) + "\t" + tsv_escape(path_base(model)) +
+                     "\t" + tsv_escape(g_code_pattern) + "\t" +
+                     std::to_string(g_max_candidates) + "\t" +
+                     std::to_string(g_max_ctx_tokens) + "\t" +
+                     (g_two_code_sentence ? "1" : "0") + "\t" + beta + "\t400";
+  corpus_write_raw(line);
 }
 
 // 诊断数值: 哨兵/非有限 → 短标记, 免 %f 展开 -1e308 撑爆行宽
@@ -1409,6 +1659,36 @@ static std::string dbg_num8(double v) {
   if (s.size() < 8)
     s.insert(0, 8 - s.size(), ' ');
   return s;
+}
+
+// debug 行（只写语料没有的字段；首字段 = 语料事件 ID）
+static void debug_write_p(const std::string &id, double total, bool prep) {
+  char b[160];
+  snprintf(b, sizeof(b), "%s|P|total=%.1f|prep=%d", id.c_str(), total,
+           prep ? 1 : 0);
+  debug_write_raw(b, false);
+}
+
+static void debug_write_d(const std::string &id, int final_rank, double ce,
+                          double ce1, double ce2, double ce3, double eff,
+                          double fb, double u1, int full, double key,
+                          double sdelta, int cerank, int finrank) {
+  char b[512];
+  snprintf(b, sizeof(b),
+           "%s|D|%d|ce=%s|ce1=%s|ce2=%s|ce3=%s|eff=%.3f|fb=%.3f|u1=%.3f"
+           "|full=%d|key=%s|sdelta=%g|cerank=%d|finrank=%d",
+           id.c_str(), final_rank, dbg_num(ce).c_str(), dbg_num(ce1).c_str(),
+           dbg_num(ce2).c_str(), dbg_num(ce3).c_str(), eff, fb, u1, full,
+           dbg_num(key).c_str(), sdelta, cerank, finrank);
+  debug_write_raw(b, false);
+}
+
+static void debug_write_e(const std::string &id, double before, double after,
+                          int dirty) {
+  char b[192];
+  snprintf(b, sizeof(b), "%s|E|eff_before=%.3f|eff_after=%.3f|dirty=%d",
+           id.c_str(), before, after, dirty);
+  debug_write_raw(b, false);
 }
 
 // ============================================================
@@ -1580,7 +1860,7 @@ static void load_model_async() {
 
     g_model = llama_model_load_from_file(g_model_path.c_str(), mparams);
     if (!g_model) {
-      log_msg("ERROR: failed to load model");
+      log_error("failed to load model");
       g_loading.store(false);
       return;
     }
@@ -1594,7 +1874,7 @@ static void load_model_async() {
 
     g_ctx = llama_init_from_model(g_model, cparams);
     if (!g_ctx) {
-      log_msg("ERROR: failed to create context");
+      log_error("failed to create context");
       llama_model_free(g_model);
       g_model = nullptr;
       g_loading.store(false);
@@ -1907,7 +2187,7 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
     }
     llama_batch_free(ctx_batch);
     if (!decoded_ok) {
-      log_msg("ERROR: ctx decode failed");
+      log_error("ctx decode failed");
       return;  // prep 存储只在成功时覆写
     }
     // self-refresh prep: seq0 just decoded (generation bumped), KV and
@@ -2189,13 +2469,13 @@ static void prepare(const std::vector<llama_token> &ctx_ids, int seq) {
   ctx_batch.n_tokens = ctx_len;
   if (llama_decode(g_ctx, ctx_batch) != 0) {
     llama_batch_free(ctx_batch);
-    log_msg("prepare: ERROR ctx decode failed");
+    log_error("prepare: ctx decode failed");
     return;  // score falls back to the full pass
   }
   float *cl = llama_get_logits_ith(g_ctx, ctx_len - 1);
   if (!cl) {
     llama_batch_free(ctx_batch);
-    log_msg("prepare: ERROR no logits");
+    log_error("prepare: no logits");
     return;
   }
   g_prep_logits.assign(cl, cl + vs);
@@ -2263,6 +2543,18 @@ void LlmRerankTranslation::Collect() {
       allc.push_back(cand);
     translation_->Next();
   }
+
+  // 语料 W 事件（2026-11-17）：一次满码尝试一条，含 skip 原因。
+  // 只在 enabled + code_pattern 匹配时进入 Collect（Apply 已筛），
+  // 部分输入码不会到这里，避免每键落一行。
+  std::string wctx = normalize_ctx(ctx_);
+  std::string wid = new_event_id("W", g_user_tick);
+  std::vector<std::string> engine_vec = texts_of(allc, 10);
+  std::vector<std::string> window_vec;
+  bool w_written = false;
+  std::string wstatus = "ok";
+  std::string wskip;
+
   if (allc.size() >= 2 && g_loaded.load()) {
     user_freq_ensure_loaded();
     user_bi_ensure_loaded();
@@ -2342,15 +2634,8 @@ void LlmRerankTranslation::Collect() {
           tail.push_back(allc[c]);
       }
     }
-    // 训练快照（词码对研究用）: 层1 窗内候选 + 窗码（OnCommit 匹配才附）；
-    // 满长准入后窗可能不足 nk，按 candidates_ 实际数界取（2026-11-16）
-    g_train_window_input = input_;
-    g_train_window_cands.clear();
-    for (size_t i = 0; i < candidates_.size() && i < nk; i++) {
-      if (i)
-        g_train_window_cands += ",";
-      g_train_window_cands += candidates_[i]->text();
-    }
+    // 语料 W 的 window 字段 = 层1/TCS 准入后、重排前的评分窗（原序）。
+    window_vec = texts_of(candidates_, 20);
   } else {
     // 未加载/单候选: 引擎原序（行为与两层之前一致）
     live_send(std::string("S|") + now_hms() + "|" +
@@ -2362,14 +2647,22 @@ void LlmRerankTranslation::Collect() {
       else
         tail.push_back(allc[i]);
     }
-    g_train_window_cands.clear();  // 未重排 → 无快照
+    window_vec = texts_of(candidates_, 20);
+    write_w(wid, src_, input_, wctx, engine_vec, window_vec, {}, g_user_tick,
+            "skip", allc.size() < 2 ? "few_candidates" : "model_loading",
+            false, "");
+    w_written = true;
   }
 
   // 满长准入后窗不足 2 个（不足即空着的极端形态）：无重排意义、整窗跳过
   // 评分——显式发 S 事件（此前该路径静默，调试窗口对此窗零输出）
-  if (tcs_elen >= 1 && candidates_.size() < 2 && allc.size() >= 2)
+  if (tcs_elen >= 1 && candidates_.size() < 2 && allc.size() >= 2) {
     live_send(std::string("S|") + now_hms() + "|full_len_lt2|" +
               live_esc(input_) + "|" + src_);
+    write_w(wid, src_, input_, wctx, engine_vec, window_vec, {}, g_user_tick,
+            "skip", "full_len_lt2", false, "");
+    w_written = true;
+  }
 
   if (candidates_.size() >= 2 && g_loaded.load()) {
     // rerank with LLM (ctx_ computed by LlmFilter::Apply: TSF context
@@ -2384,19 +2677,13 @@ void LlmRerankTranslation::Collect() {
       if (api->context_reset_generation)
         gen = api->context_reset_generation();
     if (gen != s_seen_gen) {
-      if (g_debug_fusion && s_seen_gen != -1) {
-        debug_fusion_write({now_hms() + "|reset|代次 " +
-                            std::to_string(s_seen_gen) + "→" +
-                            std::to_string(gen) +
-                            " → 上文重置 (编辑键/切窗)"});
+      if (g_debug_fusion && s_seen_gen != -1)
         live_send(std::string("R|") + now_hms() + "|代次 " +
                   std::to_string(s_seen_gen) + "→" + std::to_string(gen) +
                   " (编辑键/切窗)");
-      }
       s_seen_gen = gen;
     }
 
-    bool did_score = false;
     double ev_ms = 0;
     bool prep_hit = false;  // 上文 KV 预解码命中（调试 L 行"预解"列）
     std::vector<int> order;                     // candidate indices, score desc
@@ -2405,29 +2692,11 @@ void LlmRerankTranslation::Collect() {
     std::vector<std::array<double, 3>> ce3_of(  // CE 三分量原始值（调试展开）
         candidates_.size(), {NAN, NAN, NAN});
 
-    // debug_fusion 块缓冲: 头行先写, 明细在各段补, 末尾统一落盘
-    std::vector<std::string> dbg;
     std::vector<char> dbg_full(candidates_.size(), 0);
-    if (g_debug_fusion) {
-      user_freq_ensure_loaded();  // tick 读数须在懒加载后 (插件版同修)
-      std::string tail =
-          ctx.size() > 16 ? "…" + ctx.substr(ctx.size() - 15) : ctx;
-      char head[512];
-      snprintf(head, sizeof(head),
-               "%s|score|input=%s|ctx=[%s]|src=%s|tick=%lld|ready=1"
-               "|n=%d",
-               now_hms().c_str(), input_.c_str(),
-               tail.c_str(), src_.c_str(), (long long)g_user_tick,
-               (int)candidates_.size());
-      dbg.push_back(head);
-    }
 
     // 推理用上文尾部文本（协议 v4，调试窗口灰显；截尾分支内赋值）
     std::string ctx_used;
     {
-      if (ctx != ctx_)  // newline/whitespace differences worth showing
-        log_msg("ctx raw: [%s]", escape_ctx(ctx_).c_str());
-      log_msg("ctx: [%s]", escape_ctx(ctx).c_str());
       std::vector<llama_token> ctx_ids = tokenize(ctx.c_str());
       if ((int)ctx_ids.size() >= g_min_tokens) {
         // 协议 v4（2026-11-12）：推理用尾部文本（调试窗口灰显）——截尾时 =
@@ -2467,19 +2736,23 @@ void LlmRerankTranslation::Collect() {
           std::sort(ord.begin(), ord.end(),
                     [&](int a, int b) { return scores[a] > scores[b]; });
           order = std::move(ord);
-          did_score = true;
-        } else if (g_debug_fusion) {
-          dbg.push_back("  评分异常: scores 数组长度不符 (推理失败)");
+        } else {
+          wstatus = "skip";
+          wskip = "score_failed";
           live_send(std::string("S|") + now_hms() + "|score_failed|" +
                     live_esc(input_) + "|" + src_);
+          debug_write_raw(wid + "|X|scope=score|msg=scores length mismatch",
+                          false);
         }
-      } else if (g_debug_fusion) {
-        dbg.push_back("  score=nil (ctx tokens " +
-                      std::to_string((int)ctx_ids.size()) +
-                      " < min_tokens " + std::to_string(g_min_tokens) +
-                      " — 上文空/过短跳过)");
+      } else {
+        wstatus = "skip";
+        wskip = "ctx_short";
         live_send(std::string("S|") + now_hms() + "|ctx_short|" +
                   live_esc(input_) + "|" + src_);
+        debug_write_raw(wid + "|X|scope=ctx|msg=ctx_tokens=" +
+                            std::to_string((int)ctx_ids.size()) +
+                            " min=" + std::to_string(g_min_tokens),
+                        false);
       }
     }
 
@@ -2577,47 +2850,42 @@ void LlmRerankTranslation::Collect() {
       }
     }
 
-    // 诊断明细: 逐候选 CE/eff/频+/u1+/满长标记/key 与名次变化 (最终序前 8 个)
+    // debug P + 逐候选 D（2026-11-17）：只写语料没有的特征/耗时；
+    // 词、候选序、上下文都在语料 W 行，靠 W-id 关联，不重复记录。
+    if (g_debug_fusion) {
+      user_freq_ensure_loaded();
+      debug_write_p(wid, ev_ms, prep_hit);
+    }
     if (g_debug_fusion && !order.empty()) {
-      std::vector<int> final_rank(candidates_.size(), 0);
-      for (size_t k = 0; k < order.size(); k++)
-        final_rank[(size_t)order[k]] = (int)k + 1;
-      size_t shown = order.size() < 8 ? order.size() : 8;
-      for (size_t k = 0; k < shown; k++) {
+      user_freq_ensure_loaded();
+      for (size_t k = 0; k < order.size(); k++) {
         int i = order[k];
-        double eff = has_score[i] ? user_freq_eff(candidates_[i]->text(), input_) : 0;
+        double eff = has_score[i]
+                         ? user_freq_eff(candidates_[i]->text(), input_)
+                         : 0;
         double fb = has_score[i] ? g_freq_beta * std::log1p(eff) : 0;
-        double u1 = has_score[i] ? user_unigram_term(candidates_[i]->text(), input_) : 0;
+        double u1 = has_score[i]
+                        ? user_unigram_term(candidates_[i]->text(), input_)
+                        : 0;
         double sdelta = pf_on ? pairfix_delta(pf_tbl,
                                               candidates_[i]->text(), input_)
                               : 0.0;
-        char line[320];
-        snprintf(line, sizeof(line),
-                 "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f u1+%6.3f 满=%d key=%s"
-                 "  原次序%d→%d",
-                 (int)k + 1, candidates_[i]->text().c_str(),
-                 dbg_num8(has_score[i] ? score_of[i] : -1e308).c_str(), eff,
-                 fb, u1, (int)dbg_full[i], dbg_num(fused_of[i]).c_str(),
-                 ce_rank[i], final_rank[i]);
-        if (sdelta != 0.0) {
-          size_t len = strlen(line);
-          snprintf(line + len, sizeof(line) - len, "  修正%+g", sdelta);
+        double ce = has_score[i] ? score_of[i] : -1e308;
+        double ce1 = -1e308, ce2 = -1e308, ce3v = -1e308;
+        if (has_score[i] && i < (int)ce3_of.size()) {
+          ce1 = ce3_of[(size_t)i][0];
+          ce2 = ce3_of[(size_t)i][1];
+          ce3v = ce3_of[(size_t)i][2];
         }
-        dbg.push_back(line);
-      }
-      std::string moved;
-      for (size_t k = 0; k < order.size(); k++) {
-        int i = order[k];
-        if (ce_rank[i] && final_rank[i] && ce_rank[i] != final_rank[i]) {
-          if (!moved.empty())
-            moved += ", ";
-          moved += candidates_[i]->text() + " " +
-                   std::to_string(ce_rank[i]) + "→" +
-                   std::to_string(final_rank[i]);
+        int full = 0;
+        if (g_two_code_sentence) {
+          int elen = (int)(input_.length() / 2);
+          if (elen >= 1 && utf8_len(candidates_[i]->text()) == elen)
+            full = 1;
         }
+        debug_write_d(wid, (int)k + 1, ce, ce1, ce2, ce3v, eff, fb, u1, full,
+                      fused_of[i], sdelta, ce_rank[i], (int)k + 1);
       }
-      dbg.push_back(moved.empty() ? "  名次变化: 无 (CE 序即融合序)"
-                                  : "  名次变化: " + moved);
     }
     // 实时调试 C 行（2026-11-10；2026-11-11 协议 v3：同时发"原始计数"与
     // "得分项"两套——衰减计数(eff)/累计次数(uni) 是证据，词频得分(β·log1p(eff))
@@ -2704,18 +2972,9 @@ void LlmRerankTranslation::Collect() {
           live_c(tail[j], -1, "", "", 0, base + (int)j + 1, 0, 0);
       }
     }
-    if (g_debug_fusion)
-      debug_fusion_write(dbg);
-
+    std::vector<std::string> final_vec;
     if (!order.empty()) {
       // 应用顺序 (缓存命中与真实评分共用): 未匹配候选(新候选)落尾部
-      std::string before;  // 原始候选序 — 必须在重排前捕获 (原先构建于
-      // 重排后, 恒等于 after, 日志失去对比意义, 2026-08-21 修复)
-      for (auto &c : candidates_) {
-        if (!before.empty())
-          before += ",";
-        before += c->text();
-      }
       std::vector<an<Candidate>> reranked;
       std::vector<bool> used(candidates_.size(), false);
       for (int i : order)
@@ -2727,20 +2986,12 @@ void LlmRerankTranslation::Collect() {
         if (!used[i])
           reranked.push_back(candidates_[i]);
       candidates_ = std::move(reranked);
-      // AI 首选徽章已删（2026-11-10 用户定案：实时调试窗口上线——上文来源/
-      // 内容与逐候选分数都在调试窗口看，候选窗保持干净、不再动 comment；
-      // weasel 端 "AI·" 强调渲染保留为无害死代码）
-      // 事件日志仅在真实推理时写 (缓存命中不重复推理, 也省日志 IO)
-      if (did_score) {
-        std::string after;
-        for (auto &c : candidates_) {
-          if (!after.empty())
-            after += ",";
-          after += c->text();
-        }
-        event_log(sanitize_field(input_), sanitize_field(before), ctx,
-                  sanitize_field(after), ev_ms, src_);
-      }
+      final_vec = texts_of(candidates_, 20);
+    }
+    if (!w_written) {
+      write_w(wid, src_, input_, wctx, engine_vec, window_vec, final_vec,
+              g_user_tick, wstatus, wskip, prep_hit, "");
+      w_written = true;
     }
   }
 
@@ -2794,16 +3045,10 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     // bool b 复用上方 enabled/debug_fusion 的声明（同作用域）
     if (config->GetBool("llm_rerank/two_code_sentence", &b)) { p.has_tcs = true; p.two_code_sentence = b; }
     llm_apply_params();
-    log_msg("config: enabled=%d code_pattern='%s' (min_code_len=%d max_code_len=%d 旧键不生效) "
-            "two_code_sentence=%d freq_beta=%.2f(内置) debug_fusion=%d "
-            "min_tokens=%d "
-            "max_tokens=%d max_candidates=%d cpu_cores=%d "
-            "model=%s",
-            g_enabled ? 1 : 0, g_code_pattern.c_str(), g_min_code_len, g_max_code_len,
-            g_two_code_sentence ? 1 : 0, g_freq_beta, g_debug_fusion ? 1 : 0,
-            g_min_tokens,
-            g_max_ctx_tokens, g_max_candidates, g_n_threads,
-            g_model_path.c_str());
+    std::string sid;
+    if (engine_->schema())
+      sid = engine_->schema()->schema_id();
+    write_h(sid.empty() ? "unknown" : sid, g_model_path);
   }
   // hook engine commit sink: pre-decode the upcoming context after commit
   commit_conn_ = engine_->sink().connect(
@@ -2896,62 +3141,27 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
   // 的 commit 不误记旧码)。debug commit 行: eff/tick/脏计数 bump 前后。
   std::string code = g_last_input;
   g_last_input.clear();
-  if (g_debug_fusion) {
-    user_freq_ensure_loaded();  // before 读数须在懒加载后 (插件版同修)
-    bool has_cjk = false;
-    for (unsigned char ch : commit_text)
-      if (ch >= 0x80) {
-        has_cjk = true;
-        break;
-      }
-    double eff_before = 0;
-    long long tick_before = g_user_tick;
-    int dirty_before = g_user_freq_dirty;
-    if (has_cjk)
-      eff_before = user_freq_eff(commit_text, code);
-    user_freq_bump(commit_text, code);
-    if (has_cjk) {
-      char line[256];
-      snprintf(line, sizeof(line),
-               "%s|commit|词=%s|码=%s|eff %.3f→%.3f|tick %lld→%lld|flush脏%d/20",
-               now_hms().c_str(), commit_text.c_str(), code.c_str(),
-               eff_before, user_freq_eff(commit_text, code), tick_before,
-               (long long)g_user_tick, dirty_before);
-      debug_fusion_write({line});
-      // 实时调试 E 行（2026-11-10）：commit 落账（eff/tick 前后值）
-      live_send(std::string("E|") + now_hms() + "|" + live_esc(commit_text) +
-                "|" + live_num(eff_before) + "|" +
-                live_num(user_freq_eff(commit_text, code)) + "|" +
-                std::to_string(tick_before) + "|" +
-                std::to_string((long long)g_user_tick));
+  bool has_cjk = false;
+  for (unsigned char ch : commit_text)
+    if (ch >= 0x80) {
+      has_cjk = true;
+      break;
     }
-  } else {
-    user_freq_bump(commit_text, code);
-  }
-  // 训练语料记录（2026-11-13 源码版原生补齐; 格式与信号近似见
-  // g_train_* 声明处注释——研究 prep_user_sc 消费本文件）
-  {
-    int gen = api && api->context_reset_generation
-                  ? api->context_reset_generation()
-                  : 0;
-    bool gen_changed = (g_train_gen != -1 && gen != g_train_gen);
-    g_train_gen = gen;
-    std::string seg;
-    if (!g_train_line_open) {
-      seg += "\n";          // 会话首词: 开新场景行
-      g_train_line_open = true;
-    } else if (gen_changed) {
-      seg += "|←";          // 编辑键近似（导航/回车不可分, 统一 ←）
-      seg += "|";
-    } else {
-      seg += "|";
-    }
-    seg += commit_text + "\t" + code;
-    if (!g_train_window_cands.empty() && g_train_window_input == code) {
-      seg += "\t" + g_train_window_cands;   // 层1 前 k 候选快照
-      g_train_window_cands.clear();         // 已消费（插件版握手同语义）
-    }
-    train_append(seg);
+  user_freq_ensure_loaded();  // before 读数须在懒加载后 (插件版同修)
+  double eff_before = has_cjk ? user_freq_eff(commit_text, code) : 0;
+  int dirty_before = g_user_freq_dirty;
+  user_freq_bump(commit_text, code);
+  double eff_after = has_cjk ? user_freq_eff(commit_text, code) : 0;
+  long long tick_after = g_user_tick;
+  // 常开语料 C 事件（提交词/码/名次；ref 指向同码 W）
+  std::string cid = write_c(commit_text, code, tick_after, has_cjk);
+  if (g_debug_fusion && has_cjk) {
+    debug_write_e(cid, eff_before, eff_after, dirty_before);
+    // 实时调试 E 行（2026-11-10）：commit 落账（eff/tick 前后值）
+    live_send(std::string("E|") + now_hms() + "|" + live_esc(commit_text) +
+              "|" + live_num(eff_before) + "|" + live_num(eff_after) + "|" +
+              std::to_string(g_user_tick - 1) + "|" +
+              std::to_string((long long)g_user_tick));
   }
   // bound the fallback buffer: LLM context is at most ~20 tokens
   // (1-2 chars/token = 40 chars), keep only the most recent 64 UTF-8
@@ -3203,6 +3413,11 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
   if (!translation)
     return translation;
 
+  // 词码对记账/语料 C 的码快照：必须在本函数**所有**早退路径之前更新。
+  // 此前只在 LlmRerankTranslation 构造时赋值——ctx_empty/model_loading/
+  // pattern 早退会留下上一个词的码，导致下一个提交的 C 行码错配。
+  g_last_input = engine_->context()->input();
+
   // 参数在部署期快照（方案 llm_rerank 节）——改配置需重新部署，无热重载
   if (!g_enabled)
     return translation;  // enabled=false -> pass-through
@@ -3236,19 +3451,23 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
 
   // context source: TSF caret text, or commit history fallback
   auto [ctx, src] = GetContextTextPair();
+  const std::string code = engine_->context()->input();
   if (ctx.empty()) {
-    // diag: ESC-clear then next word no rerank - print ctx state
-    log_msg("Apply: ctx empty (src=%s input=[%s] len=%d) -> no rerank",
-            src.c_str(), engine_->context()->input().c_str(),
-            (int)engine_->context()->input().size());
+    // 常开语料：满码但无上文的 skip 事件（W 行，status=skip）
+    std::string wid = new_event_id("W", g_user_tick);
+    write_w(wid, src, code, "", {}, {}, {}, g_user_tick, "skip", "ctx_empty",
+            false, "");
     live_send(std::string("S|") + now_hms() + "|ctx_empty|" +
-              live_esc(engine_->context()->input()) + "|" + src);
+              live_esc(code) + "|" + src);
     return translation;  // no context, keep original order
   }
 
   if (!g_loaded.load()) {
+    std::string wid = new_event_id("W", g_user_tick);
+    write_w(wid, src, code, ctx, {}, {}, {}, g_user_tick, "skip",
+            "model_loading", false, "");
     live_send(std::string("S|") + now_hms() + "|model_loading|" +
-              live_esc(engine_->context()->input()) + "|" + src);
+              live_esc(code) + "|" + src);
     return translation;  // model still loading, keep original order
   }
 

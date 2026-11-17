@@ -2,10 +2,10 @@
 """test_ctx_auto.py — 真机自动化验证：模拟键击全流程 + 事件日志断言
 
 用 SendInput 合成真实键击（经输入法全流程：编码→候选→LLM 重排→上屏，
-不绕过任何环节），配合插件版 rime_llm_events.txt 每行的
-`时间|计数|码|候选|上文尾15字节|结果|延迟|来源` 做断言，验证
-COM/UIA/历史 上文来源在 commit/退格/Ctrl+Z/点击/粘贴 等信号后的行为
-（2026-09-12 信号层统一的回归工具）。
+不绕过任何环节），读统一语料 rime_llm_corpus.tsv 的 W 行
+（码/上文/引擎原序/评分窗/最终序/来源）做断言，验证 COM/UIA/历史
+上文来源在 commit/退格/Ctrl+Z/点击/粘贴 等信号后的行为
+（2026-09-12 信号层统一的回归工具；2026-11-17 起两版同读 corpus）。
 
 用法（普通权限 python，目标应用由脚本拉起并置前）:
   python scripts\\test_ctx_auto.py                # 记事本全场景 s1-s5，双节奏
@@ -29,7 +29,7 @@ COM/UIA/历史 上文来源在 commit/退格/Ctrl+Z/点击/粘贴 等信号后�
   - 本工具断言插件版日志（lua filter 路线）；当前 weasel 壳是哪版不影响，
     但 rime_llm.dll / lua 须为待验证版本
 
-词表编码取自 llm_training.txt 真实记录。顶屏语义（2026-09-13 真机实测）：
+词表编码取自真实语料（旧 llm_training.txt / 现 rime_llm_corpus.tsv）。顶屏语义（2026-09-13 真机实测）：
 满 4 码**不**自动顶屏（auto_select:false）——上屏由**下一词首键（第 5 键，
 连打自然触发）或空格**触发；本工具连打场景天然满足，编辑前场景（退格/
 撤销/点击）必须先空格顶屏，否则编辑键作用在残留编码上而非文档（虚 PASS）。
@@ -195,9 +195,9 @@ def find_window_by_class(cls, timeout=8.0):
     return None
 
 
-# ── 事件日志观察（插件版 rime_llm_events.txt）───────────────────
+# ── 语料观察（两版统一 rime_llm_corpus.tsv 的 W 行）─────────────
 class EventsLog:
-    """行格式: 时间|计数|码|候选|上文尾(…前缀=截断)|结果|延迟ms|来源"""
+    """W 行 TSV: W id ts src code ctx engine_top window final tick status skip prep flags"""
 
     def __init__(self, path):
         self.path = path
@@ -214,20 +214,23 @@ class EventsLog:
         return len(self._lines())
 
     def wait_new(self, code, timeout=4.0):
-        """等待本观察期之后出现的、码=code 的最新评分行，返回字段 dict。"""
+        """等待本观察期之后出现的、码=code 的最新 ok 评分行。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
             for ln in reversed(self._lines()[self.mark:]):
-                parts = ln.split("|")
-                if len(parts) >= 8 and parts[2] == code:
-                    return {"code": parts[2], "cands": parts[3],
-                            "ctx": parts[4], "result": parts[5],
-                            "ms": parts[6], "src": parts[7]}
+                parts = ln.split("\t")
+                if len(parts) < 14 or parts[0] != "W" or parts[4] != code:
+                    continue
+                if parts[10] != "ok":  # skip 行无 final，不作为评分断言
+                    continue
+                return {"code": parts[4], "cands": parts[7],
+                        "ctx": parts[5], "result": parts[8],
+                        "src": parts[3], "id": parts[1]}
             time.sleep(0.15)
         return None
 
 
-# ── 词表（llm_training.txt 反查：四码 → 首选上屏词）─────────────
+# ── 词表（真实语料反查：四码 → 首选上屏词）─────────────────────
 WORDS = {
     "fsxd": "发现",
     "wkjl": "立即",
@@ -546,14 +549,11 @@ def main():
                          "fast=每键50ms/词间50ms；slow=每键500ms/词间2s；"
                          "classic=旧缺省节奏仅作对照")
     ap.add_argument("--engine", default="plugin", choices=["plugin", "source"],
-                    help="plugin=lua 版 events 日志（rime_llm_events.txt）；"
-                         "source=原生组件（rime_llm_filter_log.txt，event_log"
-                         " 行格式与插件版一致，2026-09-14 核对 llm_filter.cc"
-                         ":1136）")
+                    help="plugin/source 均读统一语料 rime_llm_corpus.tsv 的 W 行"
+                         "（2026-11-17 记录重构）")
     args = ap.parse_args()
 
-    logname = ("rime_llm_filter_log.txt" if args.engine == "source"
-               else "rime_llm_events.txt")
+    logname = "rime_llm_corpus.tsv"
     events = os.path.join(os.environ["APPDATA"], "Rime", logname)
     if not os.path.exists(events):
         print("events log not found: %s" % events)

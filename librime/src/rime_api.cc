@@ -101,6 +101,7 @@ const char* RimeGetVersion() {
   return RIME_VERSION;
 }
 
-void RimeSetContextResetHook(void (*hook)(void* user_data), void* user_data) {
+void RimeSetContextResetHook(void (*hook)(void* user_data, const char* reason),
+                             void* user_data) {
   RimeSetContextResetHookImpl(hook, user_data);
 }
