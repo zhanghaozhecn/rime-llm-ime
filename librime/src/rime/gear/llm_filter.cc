@@ -844,28 +844,37 @@ static long                     g_prep_gen = 0; // generation at which prep was 
 static int                       s_seen_gen = -1;  // 上次见到的 reset 代次
 
 // ============================================================
-// 用户词频 (freq_beta 对数融合, 2026-09-02; 衰减 2026-08-21 起 Rime 时间衰减):
-// OnCommit 累计 (仅含中文的词), RIME 用户目录 user_eff.tsv 持久化
-// (每 20 词落盘, 崩溃最多丢 19 次)。engine thread only, 无锁。
-// 衰减 = librime algo::formula_d (引擎调频同源):
+// 用户词频账本（2026-11-17 用户定案：衰减账 + 累计账合并为单文件单账本）:
+// 两本账原本键相同（词\t码）、计数时机相同（OnCommit）、落盘节奏相同
+// （每 20 词全量重写）——合并后一个 map、一次重写、单一格式，消除双文件
+// 跨文件漂移与"同形异义格式"误读（2026-11-16 累计账读取事故）。
+// engine thread only, 无锁。衰减 = librime algo::formula_d (引擎调频同源):
 //   提交: dee = 1 + dee·exp((t_old - t_now)/τ)
 //   查询: eff = dee·exp((t_word - t_now)/τ)   未提交期间持续衰减
-//   τ=800 tick; tick 每词提交 +1 (同 userdb UpdateTickCount)。
-// 近期常打的词权重高, 久未使用的自动消退 (半衰期 ≈ 554 次提交)。
-// τ=800 (2026-11-02 连续文章语料重标定: τ×β 联合扫描内点最优, β=8 时较
-// 旧值 200 +0.25pp — 词频记忆跨数篇文章; 200 偏短)。
-// 格式: 首行 "#tick=N"; 数据行 "词\t累计\tdee\ttick"; 兼容旧版 "词\t次数"
-// (迁移: dee=次数, tick=当前 — 视为刚提交过)。
+//   τ=400; tick 每词提交 +1 (同 userdb UpdateTickCount)；半衰 ≈277 次上屏
+// （2026-11-06 v3 六维联合标定；旧 800 出自 2026-11-02 连续文章重标定）。
+// 累计计数 cum 不衰减（log(cum+1) 融合项）。
+// 文件: RIME 用户目录 user_ledger.tsv（两版共用）
+//   首行 "#tick=N"; 数据行 "s\t词\t码\tdee\ttick\tcum"（码可空）。
+//   行首 s = 行类型（旧账本 u/b 行天然不匹配, 防同形异义误读）。
+//   修剪: eff<1e-3 且 cum=0 才丢——含中文词条终身保留（旧累计账语义），
+//   全角标点等非中文行随衰减淘汰。
+// 旧两账本读取端一次性迁移（只读, 旧文件保留不删；落盘写新名）:
+//   user_eff.tsv（回退 user_freq.tsv）5 字段 → dee/tick, cum=commits(含中文时)
+//   user_unigram.tsv（回退 user_bigram.tsv）u 行 → cum=max(cum, 次数)
+//   eff 的 commits 列对含中文词条 = 真实累计次数（同一提交两处计数），
+//   取 max 可补回 2026-11-16 读取事故丢失的累计次数。
+// n_seen 不再记录（2026-11-17 用户定案：不参与打分, 无消费方）。
 // ============================================================
-struct UserFreqEntry {
-  long long commits = 0;  // 累计提交次数 (记录/诊断用, 不参与评分)
-  double dee = 0;         // 衰减计数 (formula_d 的 dee)
-  long long tick = 0;     // 最后提交 tick
+struct UserStatEntry {
+  double dee = 0;        // 衰减计数 (formula_d 的 dee)
+  long long tick = 0;    // 最后提交 tick
+  long long cum = 0;     // 累计提交次数 (原始计数不衰减; 含中文词条)
 };
-static std::map<std::string, UserFreqEntry> g_user_freq;
+static std::map<std::string, UserStatEntry> g_user_stats;
 static long long g_user_tick = 0;
-static bool g_user_freq_loaded = false;
-static int  g_user_freq_dirty = 0;
+static bool g_user_stats_loaded = false;
+static int  g_user_stats_dirty = 0;
 static constexpr double kFreqTau = 400.0;  // rime formula_d 时间常数 (v3 2026-11-06 六维联合标定; 旧 800 出自 2026-11-02)
 
 // 日志轮转（2026-09-04）：超过 limit 改名 .old（单文件轮转）防无限增长；
@@ -905,127 +914,23 @@ static FILE *open_log_file(const char *filename) {
 #endif
 }
 
-// user_eff.tsv 路径 (RIME 用户目录; 与日志同目录解析)。
-// 文件名 (2026-11-14 用户定案: 与实际语义对应): user_eff.tsv = 衰减
-// 计数账本 (查询 user_freq_eff); 旧名 user_freq.tsv 历史沿用至本版——
-// 读取端新名缺失时回退旧名 (行格式相同, 无损接管), 落盘一律写新名,
-// 旧文件保留不删 (手动清理)。
-static bool user_freq_file(char *path, size_t n) {
+// user_ledger.tsv 路径 (RIME 用户目录; 与日志同目录解析)。
+// 文件名（2026-11-17 用户定案）：user_ledger.tsv = 合并账本（衰减 dee +
+// 累计 cum 同一行）；旧 user_eff.tsv / user_unigram.tsv 由读取端一次性
+// 迁移（只读, 旧文件保留不删），落盘一律写新名。
+static bool user_ledger_file(char *path, size_t n) {
   const RimeApi *api = rime_get_api();
   if (api && api->get_user_data_dir) {
     const char *ud = api->get_user_data_dir();
     if (ud && *ud) {
-      snprintf(path, n, "%s\\user_eff.tsv", ud);
+      snprintf(path, n, "%s\\user_ledger.tsv", ud);
       return true;
     }
   }
   return false;
 }
 
-static void user_freq_ensure_loaded() {
-  if (g_user_freq_loaded)
-    return;
-  g_user_freq_loaded = true;
-  char path[MAX_PATH];
-  if (!user_freq_file(path, sizeof(path)))
-    return;
-  FILE *f = fopen(path, "r");
-  if (!f) {  // 旧名回退 (改名前数据, 行格式相同)
-    char old_path[MAX_PATH];
-    const RimeApi *api = rime_get_api();
-    if (api && api->get_user_data_dir) {
-      const char *ud = api->get_user_data_dir();
-      if (ud && *ud) {
-        snprintf(old_path, sizeof(old_path), "%s\\user_freq.tsv", ud);
-        f = fopen(old_path, "r");
-      }
-    }
-  }
-  if (!f)
-    return;
-  long long max_tick = 0;
-  char line[512];
-  while (fgets(line, sizeof(line), f)) {
-    size_t len = strlen(line);
-    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
-      line[--len] = 0;
-    if (strncmp(line, "#tick=", 6) == 0) {
-      g_user_tick = atoll(line + 6);
-      continue;
-    }
-    // 词码对格式（2026-11-13, 与插件版同格式）: 词\t码\t累计\tdee\ttick。
-    // 旧词级格式（4/2 字段, 合并口径语义）不再迁移——读取端忽略, 落盘
-    // 自然剥除（分键语义下旧数据无法拆到词码对）。
-    char *t1 = strchr(line, '\t');
-    if (!t1)
-      continue;
-    *t1 = 0;
-    char *t2 = strchr(t1 + 1, '\t');
-    if (!t2)
-      continue;
-    *t2 = 0;
-    char *t3 = strchr(t2 + 1, '\t');
-    if (!t3)
-      continue;
-    *t3 = 0;
-    char *t4 = strchr(t3 + 1, '\t');
-    if (!t4)
-      continue;  // 非 5 字段（旧词级行）→ 忽略
-    UserFreqEntry e;
-    e.commits = atoll(t2 + 1);
-    e.dee = atof(t3 + 1);
-    e.tick = atoll(t4 + 1);
-    if (e.dee > 0) {
-      g_user_freq[std::string(line) + "\t" + std::string(t1 + 1)] = e;
-      if (e.tick > max_tick)
-        max_tick = e.tick;
-    }
-  }
-  fclose(f);
-  if (g_user_tick <= 0)
-    g_user_tick = max_tick;
-}
-
-// 衰减有效计数 (融合用): rime formula_d 查询式（词码对）
-static double user_freq_eff(const std::string &w, const std::string &code) {
-  auto it = g_user_freq.find(w + "\t" + code);
-  if (it == g_user_freq.end() || it->second.dee <= 0)
-    return 0;
-  return it->second.dee *
-         exp((double)(it->second.tick - g_user_tick) / kFreqTau);
-}
-
-// ── 用户累计 Unigram 计数 (v3 2026-11-06; 累计 Bigram 退役 2026-11-08) ──
-// 融合项 = log(0.5·p1);  p1 = (uni[x]+1)/(n_seen+20000)。
-// （曾配套累计 Bigram 项 log(0.5·p2+0.5·p1)——cohort 生产量级评测实证其在
-//   真实用户龄仅 fired ~2%、剔除零损失（研究库 §三十七），2026-11-08 退役：
-//   停记 b 行、查询只剩 p1；旧 user_bigram.tsv 里的 b 行读取时忽略。）
-// 与插件版 llm_processor.lua 同格式同文件 user_unigram.tsv (两版共用,
-// user_eff.tsv 先例)。文件名 (2026-11-14 用户定案: 与实际语义对应):
-// 本文件自 2026-11-08 起只存 unigram 累计计数, "bigram" 名随该项退役
-// 已名不副实 → user_unigram.tsv (查询 user_unigram_term 同名对应);
-// 旧名 user_bigram.tsv 读取端回退 (行格式相同), 落盘一律写新名。
-// 只计含中文字符的词 (字节级 CJK 判定, 比插件 utf8 精确判定略宽, 可忽略);
-// **原始计数不衰减** (标定语义), 冷启动自然回退。
-// 存储: 首行 "#n=N", 行 "u	词	次数"。
-static std::map<std::string, long long> g_user_uni;
-static long long g_user_nseen = 0;
-static bool g_user_bi_loaded = false;
-static int  g_user_bi_dirty = 0;
-static constexpr int kBigramVcap = 20000;
-
-static bool user_bi_file(char *path, size_t n) {
-  const RimeApi *api = rime_get_api();
-  if (api && api->get_user_data_dir) {
-    const char *ud = api->get_user_data_dir();
-    if (ud && *ud) {
-      snprintf(path, n, "%s\\user_unigram.tsv", ud);
-      return true;
-    }
-  }
-  return false;
-}
-
+// 含中文字符判定（U+4E00–U+9FFF；UTF-8 三字节首字节 E4–E9）。
 static bool text_has_cjk_utf8(const std::string &w) {
   size_t i = 0;
   while (i < w.size()) {
@@ -1040,25 +945,77 @@ static bool text_has_cjk_utf8(const std::string &w) {
   return false;
 }
 
-static void user_bi_ensure_loaded() {
-  if (g_user_bi_loaded)
-    return;
-  g_user_bi_loaded = true;
+// 按名字依次回退打开用户目录文件（新名优先、旧名兜底）。
+static FILE *open_user_file(const char *const *names, int count) {
+  const RimeApi *api = rime_get_api();
+  if (!api || !api->get_user_data_dir)
+    return nullptr;
+  const char *ud = api->get_user_data_dir();
+  if (!ud || !*ud)
+    return nullptr;
   char path[MAX_PATH];
-  if (!user_bi_file(path, sizeof(path)))
+  for (int i = 0; i < count; i++) {
+    snprintf(path, sizeof(path), "%s\\%s", ud, names[i]);
+    if (FILE *f = fopen(path, "r"))
+      return f;
+  }
+  return nullptr;
+}
+
+// 旧衰减账（user_eff.tsv / user_freq.tsv）: 5 字段 词\t码\tcommits\tdee\ttick。
+// commits 对含中文词条 = 真实累计提交次数（两处计数同源同一提交），迁移时
+// 直接作为 cum——可补回 2026-11-16 累计账读取事故丢失的次数。旧词级行
+// （4/2 字段）不再迁移：分键语义下无法拆分到词码对。
+static void user_stats_load_legacy_eff() {
+  static const char *names[] = {"user_eff.tsv", "user_freq.tsv"};
+  FILE *f = open_user_file(names, 2);
+  if (!f)
     return;
-  FILE *f = fopen(path, "r");
-  if (!f) {  // 旧名回退 (改名前数据, 行格式相同)
-    char old_path[MAX_PATH];
-    const RimeApi *api = rime_get_api();
-    if (api && api->get_user_data_dir) {
-      const char *ud = api->get_user_data_dir();
-      if (ud && *ud) {
-        snprintf(old_path, sizeof(old_path), "%s\\user_bigram.tsv", ud);
-        f = fopen(old_path, "r");
-      }
+  char line[1024];
+  long long max_tick = 0, tick_hdr = 0;
+  while (fgets(line, sizeof(line), f)) {
+    size_t len = strlen(line);
+    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len] = 0;
+    if (strncmp(line, "#tick=", 6) == 0) {
+      tick_hdr = atoll(line + 6);
+      continue;
+    }
+    char *p[6];
+    int nf = 0;
+    p[nf++] = line;
+    while (nf < 6) {
+      char *t = strchr(p[nf - 1], '\t');
+      if (!t)
+        break;
+      *t = 0;
+      p[nf++] = t + 1;
+    }
+    if (nf < 5)
+      continue;
+    UserStatEntry e;
+    e.dee = atof(p[3]);
+    e.tick = atoll(p[4]);
+    e.cum = text_has_cjk_utf8(p[0]) ? atoll(p[2]) : 0;
+    if (e.dee > 0 || e.cum > 0) {
+      g_user_stats[std::string(p[0]) + "\t" + p[1]] = e;
+      if (e.tick > max_tick)
+        max_tick = e.tick;
     }
   }
+  fclose(f);
+  if (tick_hdr > 0)
+    g_user_tick = tick_hdr;
+  else if (g_user_tick <= 0)
+    g_user_tick = max_tick;
+}
+
+// 旧累计账（user_unigram.tsv / user_bigram.tsv）: u\t词\t码\t次数。
+// 旧行照原值接管（含非中文行, 保持迁移前评分口径）；新提交只对含中文
+// 词条递增 cum。3 字段旧词级 u 行与旧 b 行忽略（合并口径语义已废弃）。
+static void user_stats_load_legacy_uni() {
+  static const char *names[] = {"user_unigram.tsv", "user_bigram.tsv"};
+  FILE *f = open_user_file(names, 2);
   if (!f)
     return;
   char line[1024];
@@ -1066,80 +1023,114 @@ static void user_bi_ensure_loaded() {
     size_t len = strlen(line);
     while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
       line[--len] = 0;
-    if (strncmp(line, "#n=", 3) == 0) {
-      g_user_nseen = atoll(line + 3);
-      continue;
+    if (strncmp(line, "#n=", 3) == 0)
+      continue;  // n_seen 不再记录/消费（2026-11-17 用户定案）
+    char *p[4];
+    int nf = 0;
+    p[nf++] = line;
+    while (nf < 4) {
+      char *t = strchr(p[nf - 1], '\t');
+      if (!t)
+        break;
+      *t = 0;
+      p[nf++] = t + 1;
     }
-    char *t1 = strchr(line, '\t');
-    if (!t1)
+    if (nf < 4 || strcmp(p[0], "u") != 0)
       continue;
-    *t1 = 0;
-    char *t2 = strchr(t1 + 1, '\t');
-    if (!t2)
-      continue;
-    *t2 = 0;
-    char *t3 = strchr(t2 + 1, '\t');
-    if (!t3)
-      continue;
-    *t3 = 0;
-    if (line[0] == 'u') {
-      // 词码对格式（2026-11-13）: u\t词\t码\t次数（码可空 = 捕获失败提交）。
-      // 次数 = 第 4 字段（t3+1）——原按 eff 5 字段格式错写成 t4（第 5 字段）,
-      // 4 字段行全部读不进 → 服务重启后累计词频清零（2026-11-16 真机发现,
-      // 落盘正确、读取端笔误; 衰减账 eff 5 字段格式与其解析器匹配故正常）。
-      // 旧词级 u\t词\t次数（3 字段, t3 无）→ 忽略, 落盘自然剥除
-      g_user_uni[std::string(t1 + 1) + "\t" + std::string(t2 + 1)] =
-          atoll(t3 + 1);
+    long long n = atoll(p[3]);
+    auto key = std::string(p[1]) + "\t" + p[2];
+    auto it = g_user_stats.find(key);
+    if (it != g_user_stats.end()) {
+      if (n > it->second.cum)
+        it->second.cum = n;
+    } else {
+      UserStatEntry e;
+      e.cum = n;
+      g_user_stats[key] = e;
     }
-    // 旧版 b 行: 累计 Bigram 已退役, 忽略
   }
   fclose(f);
 }
 
-static void user_bi_save() {
+static void user_stats_ensure_loaded() {
+  if (g_user_stats_loaded)
+    return;
+  g_user_stats_loaded = true;
   char path[MAX_PATH];
-  if (!user_bi_file(path, sizeof(path)))
+  if (!user_ledger_file(path, sizeof(path)))
     return;
-  FILE *f = fopen(path, "w");
-  if (!f)
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    // 首次升级：旧两账本一次性合并（只读, 旧文件保留；落盘写新账本）
+    user_stats_load_legacy_eff();
+    user_stats_load_legacy_uni();
     return;
-  fprintf(f, "#n=%lld\n", g_user_nseen);
-  for (auto &kv : g_user_uni)
-    fprintf(f, "u\t%s\t%lld\n", kv.first.c_str(), kv.second);
-  fclose(f);
-}
-
-static void user_bi_bump(const std::string &w, const std::string &code) {
-  user_bi_ensure_loaded();
-  if (!text_has_cjk_utf8(w))
-    return;
-  ++g_user_nseen;
-  ++g_user_uni[w + "\t" + code];
-  if (++g_user_bi_dirty >= 20) {
-    user_bi_save();
-    g_user_bi_dirty = 0;
   }
+  char line[1024];
+  long long max_tick = 0, tick_hdr = 0;
+  while (fgets(line, sizeof(line), f)) {
+    size_t len = strlen(line);
+    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len] = 0;
+    if (strncmp(line, "#tick=", 6) == 0) {
+      tick_hdr = atoll(line + 6);
+      continue;
+    }
+    // s\t词\t码\tdee\ttick\tcum；只认 s 行（旧账本行类型不同, 防同形误读）
+    char *p[6];
+    int nf = 0;
+    p[nf++] = line;
+    while (nf < 6) {
+      char *t = strchr(p[nf - 1], '\t');
+      if (!t)
+        break;
+      *t = 0;
+      p[nf++] = t + 1;
+    }
+    if (nf < 6 || strcmp(p[0], "s") != 0)
+      continue;
+    UserStatEntry e;
+    e.dee = atof(p[3]);
+    e.tick = atoll(p[4]);
+    e.cum = atoll(p[5]);
+    g_user_stats[std::string(p[1]) + "\t" + p[2]] = e;
+    if (e.tick > max_tick)
+      max_tick = e.tick;
+  }
+  fclose(f);
+  if (tick_hdr > 0)
+    g_user_tick = tick_hdr;
+  else if (g_user_tick <= 0)
+    g_user_tick = max_tick;
 }
 
-// 融合项查询: 用户累计 Unigram 项（词码对）
-// 2026-11-11 简化：log(uni+1)。原 log p1=(uni+1)/(n_seen+2万) 的分母与 δ
-// 缩放均为窗内常数（同窗所有候选同减同值），对排序零影响——log(a/b)=
-// log a − log b，常数项不改变大小关系，位级等价去除（用户定案）。
-// 概率语义（log p1）与 δ=0.5/1 cohort 终审记录见研究库历史口径；
-// uni 原始计数不衰减，存储 user_unigram.tsv 与 #n=N 头行不变。
-// 2026-11-13 词码对记账: 键 = 词\t码。
+// 衰减有效计数 (融合用): rime formula_d 查询式（词码对）
+static double user_freq_eff(const std::string &w, const std::string &code) {
+  user_stats_ensure_loaded();
+  auto it = g_user_stats.find(w + "\t" + code);
+  if (it == g_user_stats.end() || it->second.dee <= 0)
+    return 0;
+  return it->second.dee *
+         exp((double)(it->second.tick - g_user_tick) / kFreqTau);
+}
+
+// ── 用户累计 Unigram 计数 (v3 2026-11-06; 累计 Bigram 退役 2026-11-08) ──
+// 融合项 = log(uni+1)（2026-11-11 简化：原 log p1 的分母与 δ 缩放均为窗内
+// 常数 = 排序不变量，位级等价去除）。累计 Bigram 项已于 2026-11-08 退役。
+// 累计计数与衰减计数同存 user_ledger.tsv 的 cum 列（2026-11-17 合并）；
+// n_seen 连记录一并取消（不参与打分, 无消费方）。
 static double user_unigram_term(const std::string &x, const std::string &code) {
-  user_bi_ensure_loaded();
-  return log((double)((g_user_uni.count(x + "\t" + code)
-                           ? g_user_uni[x + "\t" + code]
-                           : 0) + 1));
+  user_stats_ensure_loaded();
+  auto it = g_user_stats.find(x + "\t" + code);
+  long long cum = it == g_user_stats.end() ? 0 : it->second.cum;
+  return log((double)(cum + 1));
 }
 
-// 累计 unigram 原始计数（调试窗口"累计频"列用；未平滑未取对数）
+// 累计 unigram 原始计数（调试窗口"累计频"列 / pairfix fade 门用）
 static long long user_uni_count(const std::string &x, const std::string &code) {
-  user_bi_ensure_loaded();
-  auto it = g_user_uni.find(x + "\t" + code);
-  return it == g_user_uni.end() ? 0 : it->second;
+  user_stats_ensure_loaded();
+  auto it = g_user_stats.find(x + "\t" + code);
+  return it == g_user_stats.end() ? 0 : it->second.cum;
 }
 
 // ── 词码对分数修正（2026-11-17 用户定案：固顶与 pairfix 合并为一张有符号表）──
@@ -1220,50 +1211,51 @@ static double pairfix_delta(const std::map<std::string, double> &tbl,
   return it->second;
 }
 
-static void user_freq_save() {
+static void user_stats_save() {
   char path[MAX_PATH];
-  if (!user_freq_file(path, sizeof(path)))
+  if (!user_ledger_file(path, sizeof(path)))
     return;
   FILE *f = fopen(path, "w");
   if (!f)
     return;
   fprintf(f, "#tick=%lld\n", g_user_tick);
-  for (auto &kv : g_user_freq) {
-    // 落盘修剪（2026-09-04）：衰减有效计数 <1e-3 的冷词条不再写（对
-    // 融合分影响 <0.002 nats，远低于任何实际分差）——文件有界，旧冷
-    // 词条自然淘汰（内存 map 会话期保留，下次 save 重新评估）
-    if (kv.second.dee *
-            exp((double)(kv.second.tick - g_user_tick) / kFreqTau) < 1e-3)
+  for (auto &kv : g_user_stats) {
+    // 落盘修剪：衰减有效计数 <1e-3 且无累计提交的冷词条不写（对融合分
+    // 影响 <0.002 nats）——含中文词条 cum>0 终身保留（旧累计账语义），
+    // 非中文行（全角标点等）随衰减淘汰，文件有界于中文词表规模。
+    double eff = kv.second.dee *
+                 exp((double)(kv.second.tick - g_user_tick) / kFreqTau);
+    if (eff < 1e-3 && kv.second.cum <= 0)
       continue;
-    fprintf(f, "%s\t%lld\t%.3f\t%lld\n", kv.first.c_str(), kv.second.commits,
-            kv.second.dee, kv.second.tick);
+    fprintf(f, "s\t%s\t%.3f\t%lld\t%lld\n", kv.first.c_str(), kv.second.dee,
+            kv.second.tick, kv.second.cum);
   }
   fclose(f);
 }
 
-static void user_freq_bump(const std::string &w, const std::string &code) {
+static void user_stats_bump(const std::string &w, const std::string &code) {
   // 仅计非 ASCII 上屏（>=0x80）：与 Rime userdb "任何词条提交推 tick"
-  // 同源口径——全角标点也计，有意为之（2026-09-03 tick 含一字词定案的
-  // 同源原则；严格汉字判定反而偏离引擎口径）
-  bool has_cjk = false;
+  // 同源口径——全角标点也计 dee/tick，有意为之（2026-09-03 一字词定案
+  // 的同源原则）；累计计数 cum 仍只对含中文词条递增（标定语义）。
+  bool has_non_ascii = false;
   for (unsigned char ch : w)
     if (ch >= 0x80) {
-      has_cjk = true;
+      has_non_ascii = true;
       break;
     }
-  if (!has_cjk)
+  if (!has_non_ascii)
     return;
-  user_freq_ensure_loaded();
+  user_stats_ensure_loaded();
   ++g_user_tick;
-  UserFreqEntry &e = g_user_freq[w + "\t" + code];
+  UserStatEntry &e = g_user_stats[w + "\t" + code];
   e.dee = 1 + e.dee * exp((double)(e.tick - g_user_tick) / kFreqTau);
-  e.commits += 1;
   e.tick = g_user_tick;
-  if (++g_user_freq_dirty >= 20) {
-    user_freq_save();
-    g_user_freq_dirty = 0;
+  if (text_has_cjk_utf8(w))
+    ++e.cum;
+  if (++g_user_stats_dirty >= 20) {
+    user_stats_save();
+    g_user_stats_dirty = 0;
   }
-  user_bi_bump(w, code);
 }
 
 // 最近一次候选窗的输入码（词码对记账 OnCommit 用; engine thread 写读）
@@ -2556,8 +2548,6 @@ void LlmRerankTranslation::Collect() {
   std::string wskip;
 
   if (allc.size() >= 2 && g_loaded.load()) {
-    user_freq_ensure_loaded();
-    user_bi_ensure_loaded();
     // 词码对分数表：窗口准入与融合共用一次读取；无文件 = 休眠。
     pf_on = pairfix_table(&pf_tbl);
     std::vector<size_t> idx(allc.size());
@@ -2778,7 +2768,6 @@ void LlmRerankTranslation::Collect() {
     // debug.txt 行尾 修正%+g，C 行尾追加 sdelta（与插件版一致）。
     std::vector<double> fused_of(candidates_.size(), -1e308);
     if (order.size() > 1) {
-      user_freq_ensure_loaded();
       // 无 CE 分候选的融合（2026-11-13 用户定案，取代"回退后两项和"）:
       // CE 取窗内已算 CE 的**最低分**（score = −CE 负值域，最低分 = 最差
       // 证据 → 该候选排到窗底但保留与层1 的正常耦合）。旧语义（融合=层1
@@ -2853,11 +2842,9 @@ void LlmRerankTranslation::Collect() {
     // debug P + 逐候选 D（2026-11-17）：只写语料没有的特征/耗时；
     // 词、候选序、上下文都在语料 W 行，靠 W-id 关联，不重复记录。
     if (g_debug_fusion) {
-      user_freq_ensure_loaded();
       debug_write_p(wid, ev_ms, prep_hit);
     }
     if (g_debug_fusion && !order.empty()) {
-      user_freq_ensure_loaded();
       for (size_t k = 0; k < order.size(); k++) {
         int i = order[k];
         double eff = has_score[i]
@@ -2896,12 +2883,13 @@ void LlmRerankTranslation::Collect() {
     // 分 pf = 词码对预置降分修正的 λ（0 = 未命中）——总分已含 −λ, 查看器
     // 总分格据此补 −λ 标注恢复逐项验算（append-only, 旧查看器忽略）。
     // L 头行也在此发（评分/融合后 ev_ms 才是终值；尾部字段 prep = 上文 KV
-    // 预解码命中、nseen = 累计 unigram 全词数（累计得分的分母，n_seen）、
-    // v4 追加 ctx_used = 推理实际使用的上文尾部文本（调试窗口灰显前缀）。
+    // 预解码命中、v4 追加 ctx_used = 推理实际使用的上文尾部文本（调试窗口
+    // 灰显前缀）。
     // 第 3 字段原为评分缓存 HIT/MISS——缓存已删（2026-11-11），保留字段位置
-    // 发 "-"：旧查看器显示"评缓 -"，新查看器不显示该列，字段数只增不改位。
+    // 发 "-"：旧查看器显示"评缓 -"，新查看器不显示该列。
+    // n_seen 字段已删（2026-11-17：不参与打分, 连记录一并取消）；查看器按
+    // 字段数兼容旧行（>12 取第 13 字段，否则第 12 字段 = ctx_used）。
     if (g_debug_fusion) {
-      user_bi_ensure_loaded();  // n_seen 读数须在懒加载后
       char msb[16];
       snprintf(msb, sizeof(msb), "%.0f", ev_ms);
       live_send(std::string("L|") + now_hms() + "|" + live_esc(input_) + "|-|" +
@@ -2910,9 +2898,7 @@ void LlmRerankTranslation::Collect() {
                 "|" + msb + "|1|" +
                 std::to_string((int)candidates_.size()) + "|" +
                 (prep_hit ? "1" : "0") + "|" +
-                std::to_string((long long)g_user_nseen) + "|" +
                 live_esc(ctx_used));
-      user_freq_ensure_loaded();
       std::map<std::string, int> eng_rank;  // 引擎原序（首现位置）
       for (size_t i = 0; i < allc.size(); i++)
         if (!eng_rank.count(allc[i]->text()))
@@ -3147,10 +3133,10 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
       has_cjk = true;
       break;
     }
-  user_freq_ensure_loaded();  // before 读数须在懒加载后 (插件版同修)
+  // 账本查询自带懒加载（2026-11-17 合并单账本），无需显式 ensure
   double eff_before = has_cjk ? user_freq_eff(commit_text, code) : 0;
-  int dirty_before = g_user_freq_dirty;
-  user_freq_bump(commit_text, code);
+  int dirty_before = g_user_stats_dirty;
+  user_stats_bump(commit_text, code);
   double eff_after = has_cjk ? user_freq_eff(commit_text, code) : 0;
   long long tick_after = g_user_tick;
   // 常开语料 C 事件（提交词/码/名次；ref 指向同码 W）

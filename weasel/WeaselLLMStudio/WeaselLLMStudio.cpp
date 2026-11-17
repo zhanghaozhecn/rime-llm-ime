@@ -2619,12 +2619,12 @@ static void handle_line(const std::string &line) {
     inv.ms = u8w(f[7]);
     inv.ready = u8w(f[8]);
     inv.prep = f.size() > 10 ? u8w(f[10]) : L"";
-    // 协议 v4（2026-11-12）：第 13 字段 = 推理用尾部文本（灰显）；
-    // 旧 DLL 无该字段 → 空 = 全文正常色不灰显
-    inv.ctxused = f.size() > 12 ? u8w(f[12]) : L"";
-    // 协议 L 行第 10 字段 n（候选数，信息行 2026-11-16 起不再显示）与
-    // 第 12 字段 n_seen（全词数，2026-11-12 起不再解析/显示——公式简化
-    // 后无消费方）均协议保留，字段被忽略
+    // 协议 v4（2026-11-12）：推理用尾部文本（灰显）。2026-11-17 起服务端
+    // 删掉 n_seen 字段、ctx_used 前移一位——按字段数兼容：13 字段（旧 DLL）
+    // 取第 13 字段，12 字段（新行）取第 12 字段；都没有 = 空（不灰显）。
+    inv.ctxused = f.size() > 12 ? u8w(f[12])
+                  : f.size() > 11 ? u8w(f[11]) : L"";
+    // 协议 L 行第 10 字段 n（候选数，信息行 2026-11-16 起不再显示）保留忽略
     g_invs.push_back(std::move(inv));
     while (g_invs.size() > 50) {
       g_invs.pop_front();
