@@ -18,7 +18,7 @@
 ;               （写组件行 + 方案 llm_rerank 节）决定。
 
 #define MyAppName "小狼毫 LLM 版"
-#define MyAppVer "2026.11.16-5"  ; 同日重打安装包在日期后加 -2…-N 序号（2026-09-11 用户定案，避免同号不同内容）
+#define MyAppVer "2026.11.16-6"  ; 同日重打安装包在日期后加 -2…-N 序号（2026-09-11 用户定案，避免同号不同内容）
 #define MyAppId "{{3F8A2D5C-6B1E-4F9A-8D73-9C2E5B7A1F40}"
 
 [Setup]
@@ -254,7 +254,7 @@ begin
         if not WizardSilent() then
           MsgBox('检测到系统位输入法组件（System32 / SysWOW64 的 weasel.dll）' +
                  '仍是旧版，本次安装对输入法菜单可能没有生效。' + #13#10 + #13#10 +
-                 '请先重启电脑；重启后若托盘右键菜单仍没有「LLM 调试窗口」，' +
+                 '请先重启电脑；重启后若托盘右键菜单仍没有「LLM 设置+调试」，' +
                  '再次运行本安装器即可补上。',
                  mbInformation, MB_OK);
       end;
