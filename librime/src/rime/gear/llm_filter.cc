@@ -1140,21 +1140,19 @@ static long long user_uni_count(const std::string &x, const std::string &code) {
   return it == g_user_uni.end() ? 0 : it->second;
 }
 
-// ── 多音词码对预置降分修正（2026-11-13 用户定案：机制部署、表作参考）──
-// LLM 只见词不见码义——高频字在低频读音的码上被 CE 系统性抬分（如
-// 与@vkh：无法区分 yǔ/yù，按字频给分）。该类错误跨用户普适（结构性，
-// 不随用户词频积累消失——污染对恰恰是用户不爱打的码对），但**词码表
-// 是方案特异的**（码表结构与候选集随方案不同）→ 表不内置、放用户目
-// 录 llm_pairfix.tsv（行 `词\t码[\tλ]`，λ 缺省 kPairFixLambdaDefault，
-// `#` 注释；**无文件 = 机制休眠**，其他方案零影响）。每次融合触发轻量
-// 重读（每窗一次，相对推理成本可忽略）——编辑文件即时生效。软降分
-// 非禁用：只破 CE 险胜的近平局。fade 门：用户自身该词码对累计
-// ≥kPairFixFadeUni 次 = 正向使用证据 → 预置让位（与 clamp 的"计数值
-// 小"横截面判据方向相反——clamp 在用户域 +13 错证伪）。推导与用户域
-// 验证（wiki 无泄漏拆半 +0.0630pp; 用户域双域回放净增益 +5 窗无损失;
-// 拼读双拼参考表 = 研究资料库 eval/pairfix_pool_ratio.tsv 193 对,
-// 复制为用户目录 llm_pairfix.tsv 启用）见研究库"词码对预置降分修正"节。
-static const double kPairFixLambdaDefault = 5.0;
+// ── 词码对分数修正（2026-11-17 用户定案：固顶与 pairfix 合并为一张有符号表）──
+// 表放用户目录 llm_pairfix.tsv，行 `词<TAB>码<TAB>[+|-]分数`：
+//   +200 / 200 = 加分（固定首选，09876 上屏时写入）
+//   +100 / 100 = 加分（固定次选，手动编辑）
+//   -5         = 扣分（pairfix 预置降噪；无第三列 = 旧默认扣 5）
+// `#` 注释；无文件 = 机制休眠；窗口准入/融合各读一次（每窗一次，
+// 相对推理成本可忽略）——编辑文件即时生效。正分不受 fade 限制
+// （09876 上屏会累计 user_uni，固定首选必须持久）；负分保留 fade：
+// 用户该词码对累计 >= kPairFixFadeUni 次 -> 预置让位。正分候选即使不在
+// 层1 前 k，也优先占用评分窗名额（见 Collect 窗口准入段）。
+// 旧 2026-11-13 pairfix 推导（wiki 拆半/用户域回放）保留在文件头历史注释：
+// 与@vkh 等污染对按字频抬分；负分只破 CE 险胜的近平局。
+static const double kPairFixPenaltyDefault = 5.0;
 static const long long kPairFixFadeUni = 3;
 
 static bool pairfix_file(char *path, size_t n) {
@@ -1169,7 +1167,7 @@ static bool pairfix_file(char *path, size_t n) {
   return false;
 }
 
-// 读参考表 → out[key 词\t码] = λ；返回 false = 文件缺失（机制休眠）
+// 读参考表 → out[key 词\t码] = 有符号分数；返回 false = 文件缺失（休眠）
 static bool pairfix_table(std::map<std::string, double> *out) {
   char path[MAX_PATH];
   if (!pairfix_file(path, sizeof(path)))
@@ -1189,27 +1187,32 @@ static bool pairfix_table(std::map<std::string, double> *out) {
       continue;
     *t1 = '\0';
     char *t2 = strchr(t1 + 1, '\t');
-    double lam = kPairFixLambdaDefault;
+    // 无第三列 = 旧默认扣 5；第三列 +200/200 = 加分，-5 = 扣分。
+    double delta = -kPairFixPenaltyDefault;
     if (t2) {
       *t2 = '\0';
-      lam = atof(t2 + 1);
-      if (lam <= 0.0)
-        lam = kPairFixLambdaDefault;
+      char *end = nullptr;
+      double v = strtod(t2 + 1, &end);
+      if (end == t2 + 1)
+        continue;  // 第三列非法：与插件版一致，跳过
+      delta = v;
     }
     if (*line && *(t1 + 1))
-      (*out)[std::string(line) + "\t" + (t1 + 1)] = lam;
+      (*out)[std::string(line) + "\t" + (t1 + 1)] = delta;
   }
   fclose(f);
   return true;
 }
 
-// 命中且未 fade 返回修正分（融合分 −λ）；否则 0
-static double pairfix_penalty(const std::map<std::string, double> &tbl,
-                              const std::string &w,
-                              const std::string &code) {
+// 命中返回有符号分数修正；正分（固定首选/次选）不受 fade 限制
+static double pairfix_delta(const std::map<std::string, double> &tbl,
+                            const std::string &w,
+                            const std::string &code) {
   auto it = tbl.find(w + "\t" + code);
   if (it == tbl.end())
     return 0.0;
+  if (it->second > 0.0)
+    return it->second;
   if (user_uni_count(w, code) >= kPairFixFadeUni)
     return 0.0;
   return it->second;
@@ -2247,6 +2250,9 @@ void LlmRerankTranslation::Collect() {
   const size_t kMaxRerank = (size_t)(g_max_candidates > 0 ? g_max_candidates : 5);
   std::vector<an<Candidate>> tail;
   std::vector<double> s1_head;   // 层1 分（对齐 candidates_; 无 CE 分回退用）
+  // 词码对表：窗口准入前读一次；正分候选优先占位，融合段复用。
+  std::map<std::string, double> pf_tbl;
+  bool pf_on = false;
   // two_code_sentence 满长准入（2026-11-16）：⌊码长/2⌋（码 <2 字时 0 = 不启用）
   int tcs_elen = g_two_code_sentence ? (int)(input_.length() / 2) : 0;
 
@@ -2260,41 +2266,80 @@ void LlmRerankTranslation::Collect() {
   if (allc.size() >= 2 && g_loaded.load()) {
     user_freq_ensure_loaded();
     user_bi_ensure_loaded();
+    // 词码对分数表：窗口准入与融合共用一次读取；无文件 = 休眠。
+    pf_on = pairfix_table(&pf_tbl);
     std::vector<size_t> idx(allc.size());
     std::vector<double> s1(allc.size());
+    std::vector<double> delta(allc.size(), 0.0);
     for (size_t i = 0; i < allc.size(); i++) {
       idx[i] = i;
       // 词码对记账（2026-11-13）: eff/uni 查询键 = (候选, 当前窗码 input_)
       s1[i] = g_freq_beta * std::log(1.0 + user_freq_eff(allc[i]->text(), input_)) +
               user_unigram_term(allc[i]->text(), input_);
+      if (pf_on)
+        delta[i] = pairfix_delta(pf_tbl, allc[i]->text(), input_);
     }
     std::stable_sort(idx.begin(), idx.end(),
                      [&s1](size_t a, size_t b) { return s1[a] > s1[b]; });
     size_t nk = (std::min)(kMaxRerank, allc.size());
-    // two_code_sentence 准入优先（2026-11-16 用户定案，取代 2026-11-07 的
-    // "词频前 k 全参评 + 最终排序满长组置顶"）：层1 序里词长==⌊码长/2⌋ 的
-    // 候选优先占满评分窗，前 k 个才算 CE；不足 k 个就空着——不匹配词长的
-    // 候选不进窗、不算 CE（调试窗口"有没有 CE 分"即满长组成员的可观察
-    // 标志，「匹配词长」专用列随之删除）。层1 排序本身不变，只改窗口准入。
+    // 两层准入（2026-11-17 有符号词码表）：
+    // ① 正分候选（+200 固定首选 / +100 固定次选）优先占 nk 个名额，
+    //    按分数降序、同分按层1 分/引擎序；不在层1 前 k 也照样进窗。
+    // ② 剩余名额沿用原规则：层1 序 + two_code_sentence 满长优先。
+    // 窗口大小仍 <= nk（不扩窗，decode 行数不变）。
     {
-      std::vector<bool> in_win(idx.size(), false);
-      if (tcs_elen >= 1) {
-        size_t taken = 0;
-        for (size_t i = 0; i < idx.size() && taken < nk; i++)
-          if (utf8_len(allc[idx[i]]->text()) == tcs_elen) {
-            in_win[i] = true;
-            taken++;
-          }
-      } else {
-        for (size_t i = 0; i < nk; i++) in_win[i] = true;
-      }
-      for (size_t i = 0; i < idx.size(); i++) {
-        if (in_win[i]) {
-          candidates_.push_back(allc[idx[i]]);
-          s1_head.push_back(s1[idx[i]]);
-        } else {
-          tail.push_back(allc[idx[i]]);
+      std::vector<bool> in_win(allc.size(), false);
+      size_t taken = 0;
+      std::vector<size_t> pos;
+      if (pf_on)
+        for (size_t i = 0; i < allc.size(); i++)
+          if (delta[i] > 0.0)
+            pos.push_back(i);
+      std::stable_sort(pos.begin(), pos.end(),
+                       [&delta, &s1](size_t a, size_t b) {
+                         if (delta[a] != delta[b])
+                           return delta[a] > delta[b];
+                         if (s1[a] != s1[b])
+                           return s1[a] > s1[b];
+                         return a < b;
+                       });
+      for (size_t c : pos) {
+        if (taken >= nk)
+          break;
+        if (!in_win[c]) {
+          in_win[c] = true;
+          ++taken;
         }
+      }
+      for (size_t k = 0; k < idx.size() && taken < nk; k++) {
+        size_t c = idx[k];
+        if (in_win[c])
+          continue;
+        if (tcs_elen >= 1 && utf8_len(allc[c]->text()) != tcs_elen)
+          continue;
+        in_win[c] = true;
+        ++taken;
+      }
+      std::vector<char> pushed(allc.size(), 0);
+      for (size_t c : pos) {
+        if (in_win[c] && !pushed[c]) {
+          candidates_.push_back(allc[c]);
+          s1_head.push_back(s1[c]);
+          pushed[c] = 1;
+        }
+      }
+      for (size_t k = 0; k < idx.size(); k++) {
+        size_t c = idx[k];
+        if (in_win[c] && !pushed[c]) {
+          candidates_.push_back(allc[c]);
+          s1_head.push_back(s1[c]);
+          pushed[c] = 1;
+        }
+      }
+      for (size_t k = 0; k < idx.size(); k++) {
+        size_t c = idx[k];
+        if (!in_win[c])
+          tail.push_back(allc[c]);
       }
     }
     // 训练快照（词码对研究用）: 层1 窗内候选 + 窗码（OnCommit 匹配才附）；
@@ -2454,13 +2499,11 @@ void LlmRerankTranslation::Collect() {
     // (高频首选获自保护)。失败哨兵/缺分不参与融合, 保序排尾。
     // 应用于评分/缓存顺序之上、两码整句段之前 (与插件版一致);
     // 缓存只存分数序, 融合每次按当前衰减重放。稳定排序保同分原序 (CE 序)。
-    // 融合分另叠加多音词码对预置降分修正（2026-11-13, pairfix_penalty:
-    // 预置表 + fade 让位, debug.txt 行尾 修正-λ 标注; 与插件版一致）。
+    // 融合分叠加词码对分数修正（2026-11-17 有符号表：正分=固定首选/
+    // 次选，+200/+100 不受 fade；负分=pairfix 降噪，保留 fade）。
+    // 正分窗口准入已在上方层1 块完成；这里按同一张表加 delta。
+    // debug.txt 行尾 修正%+g，C 行尾追加 sdelta（与插件版一致）。
     std::vector<double> fused_of(candidates_.size(), -1e308);
-    // 多音词码对预置修正参考表（每窗轻量重读, 无文件 = 机制休眠; 见
-    // pairfix_table 注）。调试明细段共用本表。
-    std::map<std::string, double> pf_tbl;
-    const bool pf_on = pairfix_table(&pf_tbl);
     if (order.size() > 1) {
       user_freq_ensure_loaded();
       // 无 CE 分候选的融合（2026-11-13 用户定案，取代"回退后两项和"）:
@@ -2486,11 +2529,11 @@ void LlmRerankTranslation::Collect() {
           double s1v = i < s1_head.size() ? s1_head[i] : -1e308;
           t = s1v + (min_valid < 1e308 ? min_valid : 0.0);
         }
-        // 多音词码对预置降分修正（2026-11-13; 见 pairfix_penalty 注）
+        // 词码对分数修正（有符号；正分不受 fade，负分保留 fade）
         if (pf_on) {
-          double pf = pairfix_penalty(pf_tbl, candidates_[i]->text(), input_);
-          if (pf > 0.0)
-            t -= pf;
+          double d = pairfix_delta(pf_tbl, candidates_[i]->text(), input_);
+          if (d != 0.0)
+            t += d;
         }
         fused_of[i] = t;
         fused.emplace_back(t, i);
@@ -2545,9 +2588,9 @@ void LlmRerankTranslation::Collect() {
         double eff = has_score[i] ? user_freq_eff(candidates_[i]->text(), input_) : 0;
         double fb = has_score[i] ? g_freq_beta * std::log1p(eff) : 0;
         double u1 = has_score[i] ? user_unigram_term(candidates_[i]->text(), input_) : 0;
-        double pf = pf_on ? pairfix_penalty(pf_tbl, candidates_[i]->text(),
-                                            input_)
-                          : 0.0;
+        double sdelta = pf_on ? pairfix_delta(pf_tbl,
+                                              candidates_[i]->text(), input_)
+                              : 0.0;
         char line[320];
         snprintf(line, sizeof(line),
                  "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f u1+%6.3f 满=%d key=%s"
@@ -2556,9 +2599,9 @@ void LlmRerankTranslation::Collect() {
                  dbg_num8(has_score[i] ? score_of[i] : -1e308).c_str(), eff,
                  fb, u1, (int)dbg_full[i], dbg_num(fused_of[i]).c_str(),
                  ce_rank[i], final_rank[i]);
-        if (pf > 0.0) {
+        if (sdelta != 0.0) {
           size_t len = strlen(line);
-          snprintf(line + len, sizeof(line) - len, "  修正-λ%.0f", pf);
+          snprintf(line + len, sizeof(line) - len, "  修正%+g", sdelta);
         }
         dbg.push_back(line);
       }
@@ -2617,9 +2660,10 @@ void LlmRerankTranslation::Collect() {
         double eff = user_freq_eff(c->text(), input_);
         double fb = g_freq_beta * std::log1p(eff);
         double u1 = user_unigram_term(c->text(), input_);
-        // v5: 词码对预置修正分（λ, 0=未命中）——总分已含 −λ, 查看器总分格
-        // 据此补 −λ 标注恢复逐项验算（debug_fusion 门控内, 零生产影响）
-        double pf = pf_on ? pairfix_penalty(pf_tbl, c->text(), input_) : 0.0;
+        // v5: 旧 pf = 负分幅度（仅扣分，0=未命中），保留给旧查看器；
+        // v6 (2026-11-17): 行尾追加有符号 sdelta（+200/+100/-5/0）。
+        double sdelta = pf_on ? pairfix_delta(pf_tbl, c->text(), input_) : 0.0;
+        double pf = sdelta < 0.0 ? -sdelta : 0.0;
         std::string ce1, ce2, ce3s;
         if (src_idx >= 0 &&
             src_idx < (int)ce3_of.size()) {
@@ -2637,7 +2681,8 @@ void LlmRerankTranslation::Collect() {
                   "|" + std::to_string(fin) + "|" + std::to_string(win) +
                   "|" + ce1 + "|" + ce2 + "|" + ce3s + "|" +
                   live_num(fb) + "|" + live_num(u1) + "|" +
-                  live_num(pf));  // v3: 词频得分/累计得分; v5: 修正分 pf
+                  live_num(pf) + "|" + live_num(sdelta));
+                  // v3: 词频得分/累计得分; v5: 修正分 pf; v6: 有符号 sdelta
       };
       if (!order.empty()) {
         std::vector<int> fin_rank(candidates_.size(), 0);

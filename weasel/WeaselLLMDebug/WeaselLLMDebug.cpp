@@ -14,7 +14,10 @@
 //                                                    ——协议保留，查看器不显示；
 //                                                    v4 尾字段 ctx_used=推理用尾部
 //                                                    ——查看器灰显其余前缀）
-//   C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1|pf
+//   C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1|pf|sdelta
+//                                                    pf=旧修正分 λ（仅扣分, v5）
+//                                                    sdelta=有符号词码对分数
+//                                                    （v6, +200/+100/-5/0）
 //                                                    逐候选按最终序（上限 20）：
 //                                                    s1=层1分(=fb+u1)
 //                                                    ce=加权 CE（空=无分）
@@ -116,7 +119,8 @@ struct Row {
   std::wstring eng, word, s1, ce, eff, uni, fused, full, cerank, fin, win;
   std::wstring ce1, ce2, ce3;  // CE 三分量（未乘权重）
   std::wstring fb, u1;         // 衰减词频分 β·log1p(eff) / 累计词频分 log p1
-  std::wstring pf;             // v5: 修正分 λ（词码对预置降分, 0=未命中）
+  std::wstring pf;             // v5: 旧修正分 λ（负分幅度, 0=未命中）
+  std::wstring sdelta;         // v6: 有符号词码对分数（+200/+100/-5/0）
   bool win0 = false;  // 尾窗透传（灰字）
 };
 struct Inv {
@@ -256,11 +260,16 @@ static std::wstring padl(const std::wstring &s, int w) {
   return std::wstring((size_t)(w - (int)s.size()), L' ') + s;
 }
 
-// 修正分格（2026-11-16 用户定案：专属列取代 v5 的总分格尾追 −λ 标注——
-// pf=0 时总分格尾什么都不显示，命中与否完全不可见）：λ=词码对预置降分，
-// 命中显示 -λ（负值，验算 总分 = CE + 衰减词频分 + 累计词频分 + 修正分），
-// 未命中 0.0；协议缺 pf 字段（旧发送端）→ —
+// 修正分格（2026-11-17 v6：有符号词码对分数）：+200/+100 = 固定首选/
+// 次选加分，-5 = pairfix 扣分，0.0 = 未命中；验算
+// 总分 = CE + 衰减词频分 + 累计词频分 + 修正分。旧发送端无 sdelta 时
+// 回退 v5 的 `-λ`/0.0 显示。
 static std::wstring pf_proc(const Row &r, int wl) {
+  double sd;
+  if (num_of(r.sdelta, sd)) {
+    if (sd > 0) return padl(L"+" + f1(sd), wl);
+    return padl(f1(sd), wl);
+  }
   double pf;
   if (!num_of(r.pf, pf)) return L"—";
   return padl(pf > 0 ? (L"-") + f1(pf) : f1(0.0), wl);
@@ -273,7 +282,7 @@ struct ColW {
   int fb_l, fb_e;  // 衰减词频分列：分数 / eff（2 位小数）
   int u1_l, uni;   // 累计词频列：分数 / 累计次数（整数）
   int fu_l;        // 总分列：纯分值（修正分已单列，2026-11-16）
-  int pf_l;        // 修正分列：-λ / 0.0
+  int pf_l;        // 修正分列：有符号 +200/-5/0.0
 };
 static void measure_widths(const Inv &inv, ColW &w) {
   w = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -293,7 +302,10 @@ static void measure_widths(const Inv &inv, ColW &w) {
       w.uni = mx(w.uni, (int)wcslen(b));
     }
     if (num_of(r.fused, v)) w.fu_l = mx(w.fu_l, (int)f1(v).size());
-    if (num_of(r.pf, v)) {
+    if (num_of(r.sdelta, v)) {
+      int n = (int)f1(v).size() + (v > 0 ? 1 : 0);
+      w.pf_l = mx(w.pf_l, n);
+    } else if (num_of(r.pf, v)) {
       int n = v > 0 ? (int)(f1(v).size() + 1) : 3;  // -λ 带 ASCII 负号 / "0.0"
       w.pf_l = mx(w.pf_l, n);
     }
@@ -599,8 +611,10 @@ static void handle_line(const std::string &line) {
       r.fb = u8w(f[15]);
       r.u1 = u8w(f[16]);
     }
-    if (f.size() > 17)  // 协议 v5：修正分 λ（词码对预置降分, 0=未命中）
+    if (f.size() > 17)  // 协议 v5：旧修正分 λ（负分幅度, 0=未命中）
       r.pf = u8w(f[17]);
+    if (f.size() > 18)  // 协议 v6：有符号修正分（+200/+100/-5/0）
+      r.sdelta = u8w(f[18]);
     g_invs.back().rows.push_back(std::move(r));
     if (!g_paused) {
       if (g_view == (int)g_invs.size() - 1) update_current();
