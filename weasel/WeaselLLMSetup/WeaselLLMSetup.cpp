@@ -1633,6 +1633,10 @@ static const wchar_t* const kModelUrl =
     L"https://www.modelscope.cn/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/master/qwen2.5-0.5b-instruct-q4_k_m.gguf";
 static HANDLE g_dl_proc = NULL;
 static std::wstring g_dl_tmp, g_dl_target;
+// 点下载时路径框为空 = 落默认路径——完成后把实际落点回填到框里（2026-11-17
+// 用户反馈：下载完成后路径框仍是空的，不知道模型下到了哪；状态行说"下载完成"
+// 而模型状态区却因空框显示"文件不存在"，自相矛盾）
+static bool g_dl_fill = false;
 #define DL_TIMER_ID 1
 
 static unsigned long long file_size_ull(const std::wstring& path) {
@@ -1689,6 +1693,10 @@ static void download_finish(bool ok, DWORD code) {
     unsigned long long sz = file_size_ull(g_dl_tmp);
     if (sz > 100ULL * 1024 * 1024 && MoveFileExW(g_dl_tmp.c_str(), g_dl_target.c_str(),
                                                 MOVEFILE_REPLACE_EXISTING)) {
+      if (g_dl_fill) {   // 空框点的下载：把实际落点（默认路径）填回框里再刷状态
+        SetDlgItemTextW(g_hwnd, IDC_MODEL, g_dl_target.c_str());
+        g_dl_fill = false;
+      }
       set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"模型下载完成（%llu MB）→ %s",
                  sz >> 20, g_dl_target.c_str());
       log_error(L"[下载] 完成：%s（%llu MB）", g_dl_target.c_str(), sz >> 20);
@@ -1714,6 +1722,7 @@ static void on_download_model() {
   }
   wchar_t buf[512];
   GetDlgItemTextW(g_hwnd, IDC_MODEL, buf, 512);
+  g_dl_fill = (buf[0] == 0);   // 记下"点下载时框是否为空"（完成后回填，见 g_dl_fill 注）
   std::wstring target = buf;
   if (target.empty()) {   // 留空 = 用户文件夹里的默认名（与 llm_filter 兜底一致）
     std::wstring dir = rime_user_dir();
@@ -1729,6 +1738,11 @@ static void on_download_model() {
   unsigned long long exist = 0;
   if (file_size(target, &exist)) {
     if (exist >= kModelMinBytes) {
+      if (g_dl_fill) {   // 空框点下载 + 默认位已有完整模型 = 同样把路径填回框
+        SetDlgItemTextW(g_hwnd, IDC_MODEL, target.c_str());
+        refresh_model_status();   // 模型状态区跟着从"不存在"翻到"已就绪"
+        g_dl_fill = false;
+      }
       set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"模型已存在（%llu MB），无需下载：%s",
                  exist >> 20, target.c_str());
       return;

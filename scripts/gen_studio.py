@@ -61,8 +61,9 @@ HEADER = r'''// WeaselLLMStudio.cpp — LLM 设置+调试 二合一窗口（2026
 //              统一注入，页内相对几何零变化）；
 //   右列【调试】= WeaselLLMDebug.cpp 原协议栈/数据模型逐行保留，坐标重排
 //              为纵向堆叠（网格 7 列宽度不动）：状态行+暂停/置顶/清空 →
-//              信息行 → 上文行 → 候选网格(268 高) → 历史(108) → 事件(88)
-//              → 打字测试框 → 页脚。符号改名避开设置页同名：
+//              信息行 → 上文行 → 候选网格(250 高) → 合并流(188：推理项 ◆
+//              可点开详情 + 灰字日志行，两块合一 2026-11-17) → 打字测试框
+//              → 页脚。符号改名避开设置页同名：
 //              IDC_STATUS→IDC_DSTATUS、set_status→dbg_status、g_font*→
 //              d_font*、TIMER_DRAIN→DBG_TIMER_ID=5（原 1 与下载定时器
 //              DL_TIMER_ID 冲突）；
@@ -180,21 +181,8 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           g_paused = !g_paused;
           SetWindowTextW(GetDlgItem(h, IDC_PAUSE), g_paused ? L"继续" : L"暂停");
           if (!g_paused) {
-            // 恢复：重建事件与历史列表（暂停期间两者都在变）+ 当前视图
-            SendMessageW(h_evt, LB_RESETCONTENT, 0, 0);
-            for (auto &e : g_evts)
-              SendMessageW(h_evt, LB_ADDSTRING, 0, (LPARAM)e.c_str());
-            SendMessageW(h_hist, LB_RESETCONTENT, 0, 0);
-            for (auto &inv : g_invs) {
-              std::wstring words;
-              for (size_t i = 0; i < inv.rows.size() && i < 3; i++) {
-                if (i) words += L",";
-                words += inv.rows[i].word;
-              }
-              SendMessageW(h_hist, LB_ADDSTRING, 0,
-                           (LPARAM)(inv.t + L" " + inv.input + L" " + words)
-                               .c_str());
-            }
+            // 恢复：整列重建合并流（暂停期间 g_stream 照常入队、ListBox 已陈旧）
+            stream_rebuild();
             update_current();
           }
           return 0;
@@ -206,25 +194,33 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           return 0;
         case IDC_CLEAR:
           g_invs.clear();
-          g_evts.clear();
+          g_stream.clear();
           g_view = -1;
-          SendMessageW(h_hist, LB_RESETCONTENT, 0, 0);
-          SendMessageW(h_evt, LB_RESETCONTENT, 0, 0);
+          SendMessageW(h_stream, LB_RESETCONTENT, 0, 0);
           update_current();
           return 0;
         case IDCANCEL:            // IsDialogMessage 把 ESC 映射为 IDCANCEL
           DestroyWindow(h);
           return 0;
       }
-      if (LOWORD(wp) == IDC_HIST && HIWORD(wp) == LBN_SELCHANGE) {
-        int sel = (int)SendMessageW(h_hist, LB_GETCURSEL, 0, 0);
-        if (sel >= 0) {
-          int cnt = (int)SendMessageW(h_hist, LB_GETCOUNT, 0, 0);
-          g_view = (int)g_invs.size() - cnt + sel;
-          if (g_view < 0) g_view = 0;
-          if (g_view >= (int)g_invs.size()) g_view = (int)g_invs.size() - 1;
-          update_current();
+      // 合并流点击（2026-11-17）：推理行（◆）→ 详情切到该条；日志行不可点开——
+      // 高亮弹回详情区当前那条（行为同合并前的历史列表，只是混进了日志行）
+      if (LOWORD(wp) == IDC_STREAM && HIWORD(wp) == LBN_SELCHANGE) {
+        if (g_suppress_sel) return 0;
+        int sel = (int)SendMessageW(h_stream, LB_GETCURSEL, 0, 0);
+        if (sel < 0 || sel >= (int)g_stream.size()) return 0;
+        if (!g_stream[sel].inv) {   // 纯日志行：弹回
+          stream_select_current();
+          return 0;
         }
+        for (int j = (int)g_invs.size() - 1; j >= 0; j--) {
+          if (g_invs[j].seq == g_stream[sel].seq) {
+            g_view = j;
+            update_current();
+            return 0;
+          }
+        }
+        stream_select_current();   // 该推理已滚出 50 条窗口 → 保持当前视图
         return 0;
       }
       break;
@@ -238,6 +234,27 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DRAWITEM: {
       const DRAWITEMSTRUCT* d = (const DRAWITEMSTRUCT*)lp;
+      // 合并流 owner-draw（2026-11-17）：只为分色——推理行 ◆ 黑字、日志行
+      // 灰字；选中 = 系统高亮（同 WeaselLLMDebug 独立窗口同款绘制）
+      if (d && d->CtlType == ODT_LISTBOX && d->CtlID == IDC_STREAM &&
+          d->itemID != (UINT)-1) {
+        std::wstring txt;
+        if (d->itemID < g_stream.size()) txt = g_stream[d->itemID].text;
+        bool sel = (d->itemState & ODS_SELECTED) != 0;
+        bool inv = (d->itemID < g_stream.size()) && g_stream[d->itemID].inv;
+        HBRUSH bg = sel ? GetSysColorBrush(COLOR_HIGHLIGHT)
+                        : (HBRUSH)GetStockObject(WHITE_BRUSH);
+        FillRect(d->hDC, &d->rcItem, bg);
+        SetBkMode(d->hDC, TRANSPARENT);
+        SetTextColor(d->hDC, sel ? GetSysColor(COLOR_HIGHLIGHTTEXT)
+                                 : (inv ? RGB(0, 0, 0) : RGB(150, 150, 150)));
+        RECT r = d->rcItem;
+        r.left += ts(2);
+        DrawTextW(d->hDC, txt.c_str(), (int)txt.size(), &r,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        if (d->itemState & ODS_FOCUS) DrawFocusRect(d->hDC, &d->rcItem);
+        return TRUE;
+      }
       if (d && d->CtlType == ODT_STATIC) {  // 只有「?」徽标是 owner-draw static
         draw_help(d);
         return TRUE;
@@ -441,23 +458,21 @@ def transform_debug(txt: str) -> str:
          "BS_AUTOCHECKBOX, 1428, 8, 52, 22, IDC_TOP,", 1),
         ("BS_PUSHBUTTON, 878, 6, 52, 24, IDC_CLEAR,",
          "BS_PUSHBUTTON, 1488, 6, 52, 24, IDC_CLEAR,", 1),
-        # 网格（7 列合计 780 < 888；高 268 ≈ 原 314 的 85%，13 行）
-        ("8, 104, 862, 314, IDC_GRID,", "652, 104, 888, 268, IDC_GRID,", 1),
-        # 历史列表：网格下方（原在网格右侧 204 宽——右列放不下，纵排）
-        ("878, 104, 204, 314, IDC_HIST,", "652, 378, 888, 108, IDC_HIST,", 1),
-        # 事件列表
-        ("8, 514, 1078, 96, IDC_EVT,", "652, 492, 888, 88, IDC_EVT,", 1),
+        # 网格（7 列合计 780 < 888；高 250，2026-11-17 合并流腾出高度）
+        ("8, 104, 1078, 250, IDC_GRID,", "652, 104, 888, 250, IDC_GRID,", 1),
+        # 合并流（2026-11-17：原历史列 + 事件栏合一，网格下方通栏）
+        ("8, 360, 1078, 188, IDC_STREAM,", "652, 360, 888, 188, IDC_STREAM,", 1),
         # 打字测试标签 + 输入框
-        ("SS_LEFT, 8, 424, 460, 16, IDC_TYPELBL,",
-         "SS_LEFT, 652, 586, 460, 16, IDC_TYPELBL,", 1),
-        ("8, 442, 1078, 64, IDC_TYPE,", "652, 602, 888, 62, IDC_TYPE,", 1),
+        ("SS_LEFT, 8, 552, 460, 16, IDC_TYPELBL,",
+         "SS_LEFT, 652, 552, 460, 16, IDC_TYPELBL,", 1),
+        ("8, 572, 1078, 64, IDC_TYPE,", "652, 572, 888, 64, IDC_TYPE,", 1),
         # 页脚（数据源灰注）
-        ("SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 616, 1078, 16, IDC_FOOT,",
-         "SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 652, 672, 888, 16, IDC_FOOT,", 1),
+        ("SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 644, 1078, 16, IDC_FOOT,",
+         "SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 652, 644, 888, 16, IDC_FOOT,", 1),
     ]
     for old, new, n in coords:
         txt = must_sub(txt, old, new, n)
-    print(f"  debug: 12 处坐标重排完成")
+    print(f"  debug: {len(coords)} 处坐标重排完成")
     return txt
 
 

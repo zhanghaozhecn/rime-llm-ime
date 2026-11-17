@@ -560,6 +560,22 @@ model_path: d:/gguf_models/legacy.gguf
     Remove-Item ($dlTarget + "*") -Force -ErrorAction SilentlyContinue
   }
 
+  # phase12b: 下载完成自动回填默认路径（2026-11-17 用户反馈：下载后路径框是空的）。
+  # 点下载时框为空 = 落默认路径——"已存在"快速分支（预置 105MB 假体在默认落点，
+  # 瞬时 SetLength 不占盘）完成后框里应填回默认路径，模型状态区跟着翻到"已就绪"
+  # （修复前：框保持空、状态区还显示"文件不存在"，与"下载完成"状态行自相矛盾）。
+  # download_finish 真转正分支另行一次性手验（预置 .download 分片让 curl 秒收尾）。
+  Write-Host "== phase12b: 下载完成自动回填默认路径 =="
+  $fakeFull = Join-Path (Join-Path $sandbox "Rime") "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  $fs12b = [IO.File]::Create($fakeFull); [void]$fs12b.SetLength(105MB); $fs12b.Close()
+  [void][W]::SendMessageStr($modelCtl, 0x000C, [IntPtr]::Zero, "")   # 清空框 = 用户场景
+  Start-Sleep -Milliseconds 300
+  [void][W]::PostMessage([W]::GetDlgItem($hw, 1007), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+  Start-Sleep -Milliseconds 800
+  Assert ("空框点下载（已存在）：默认路径已回填（实测 '$(Read-Ctl $hw 1002)'）") ((Read-Ctl $hw 1002) -eq $expectDefault)
+  Assert ("模型状态已就绪（实测 '$(Read-Ctl $hw 1005)'）") ((Read-Ctl $hw 1005) -match '已就绪')
+  Remove-Item $fakeFull -Force
+
   # ══ phase13：线程数实测（2026-10-01 用户定案：起点 4 / 终点 8；不足 5 线程不实测）══
   # GUI 全程伪装 3 逻辑核（见顶部 RIME_LLM_FAKE_CORES）→ 走"不实测、直接取最大"分支。
   # 真机路径（≥5 核 + 真模型，约 30 秒）单列冒烟脚本手跑，不进本套件。

@@ -85,6 +85,7 @@ installer/source/bench_threads.exe
 bin/rime_llm_filter_log.txt
 bin/user.yaml
 bin/WeaselLLMSetup_error.log
+bin/WeaselLLMStudio_error.log
 test_new.txt
 test_old.txt
 server_out.log

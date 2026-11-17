@@ -9,8 +9,9 @@
 //              统一注入，页内相对几何零变化）；
 //   右列【调试】= WeaselLLMDebug.cpp 原协议栈/数据模型逐行保留，坐标重排
 //              为纵向堆叠（网格 7 列宽度不动）：状态行+暂停/置顶/清空 →
-//              信息行 → 上文行 → 候选网格(268 高) → 历史(108) → 事件(88)
-//              → 打字测试框 → 页脚。符号改名避开设置页同名：
+//              信息行 → 上文行 → 候选网格(250 高) → 合并流(188：推理项 ◆
+//              可点开详情 + 灰字日志行，两块合一 2026-11-17) → 打字测试框
+//              → 页脚。符号改名避开设置页同名：
 //              IDC_STATUS→IDC_DSTATUS、set_status→dbg_status、g_font*→
 //              d_font*、TIMER_DRAIN→DBG_TIMER_ID=5（原 1 与下载定时器
 //              DL_TIMER_ID 冲突）；
@@ -1662,6 +1663,10 @@ static const wchar_t* const kModelUrl =
     L"https://www.modelscope.cn/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/master/qwen2.5-0.5b-instruct-q4_k_m.gguf";
 static HANDLE g_dl_proc = NULL;
 static std::wstring g_dl_tmp, g_dl_target;
+// 点下载时路径框为空 = 落默认路径——完成后把实际落点回填到框里（2026-11-17
+// 用户反馈：下载完成后路径框仍是空的，不知道模型下到了哪；状态行说"下载完成"
+// 而模型状态区却因空框显示"文件不存在"，自相矛盾）
+static bool g_dl_fill = false;
 #define DL_TIMER_ID 1
 
 static unsigned long long file_size_ull(const std::wstring& path) {
@@ -1718,6 +1723,10 @@ static void download_finish(bool ok, DWORD code) {
     unsigned long long sz = file_size_ull(g_dl_tmp);
     if (sz > 100ULL * 1024 * 1024 && MoveFileExW(g_dl_tmp.c_str(), g_dl_target.c_str(),
                                                 MOVEFILE_REPLACE_EXISTING)) {
+      if (g_dl_fill) {   // 空框点的下载：把实际落点（默认路径）填回框里再刷状态
+        SetDlgItemTextW(g_hwnd, IDC_MODEL, g_dl_target.c_str());
+        g_dl_fill = false;
+      }
       set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"模型下载完成（%llu MB）→ %s",
                  sz >> 20, g_dl_target.c_str());
       log_error(L"[下载] 完成：%s（%llu MB）", g_dl_target.c_str(), sz >> 20);
@@ -1743,6 +1752,7 @@ static void on_download_model() {
   }
   wchar_t buf[512];
   GetDlgItemTextW(g_hwnd, IDC_MODEL, buf, 512);
+  g_dl_fill = (buf[0] == 0);   // 记下"点下载时框是否为空"（完成后回填，见 g_dl_fill 注）
   std::wstring target = buf;
   if (target.empty()) {   // 留空 = 用户文件夹里的默认名（与 llm_filter 兜底一致）
     std::wstring dir = rime_user_dir();
@@ -1758,6 +1768,11 @@ static void on_download_model() {
   unsigned long long exist = 0;
   if (file_size(target, &exist)) {
     if (exist >= kModelMinBytes) {
+      if (g_dl_fill) {   // 空框点下载 + 默认位已有完整模型 = 同样把路径填回框
+        SetDlgItemTextW(g_hwnd, IDC_MODEL, target.c_str());
+        refresh_model_status();   // 模型状态区跟着从"不存在"翻到"已就绪"
+        g_dl_fill = false;
+      }
       set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"模型已存在（%llu MB），无需下载：%s",
                  exist >> 20, target.c_str());
       return;
@@ -2117,8 +2132,8 @@ static void on_browse() {
 #define IDC_TOP    2005
 #define IDC_CLEAR  2006
 #define IDC_GRID   2007
-#define IDC_HIST   2008
-#define IDC_EVT    2009
+#define IDC_STREAM 2008  // 合并流：推理项 + 日志（2026-11-17 定案——原 IDC_HIST/
+                         // IDC_EVT 两块合一；◆ 行可点开详情、灰字日志行不可点开）
 #define IDC_FOOT   2010
 #define IDC_TYPE   2011  // 打字测试框（在此输入即走本机 IME，2026-11-16）
 #define IDC_TYPELBL 2012
@@ -2161,9 +2176,19 @@ struct Row {
 struct Inv {
   std::wstring t, input, cache, src, ctx, tick, ms, ready, prep, ctxused;
   std::vector<Row> rows;
+  int seq = 0;   // 推理序号：合并流行经它关联回本调用（2026-11-17）
 };
 static std::deque<Inv> g_invs;          // 最近 50 次调用（新的在尾）
-static std::deque<std::wstring> g_evts; // 最近 200 条事件（新的在头）
+// 合并流（2026-11-17 用户定案：原「历史」〔推理项列表，可点开详情〕与「事件」
+// 〔纯日志〕两块合一）：按到达顺序排（新的在尾、跟随滚动到底），推理行 ◆
+// 黑字可点开、日志行灰字不可点开——行为同前只是合到一起
+struct StreamEnt {
+  bool inv;            // true = 推理项行（可点开详情）
+  int seq;             // inv 行 = 所属调用序号；日志行 = 0
+  std::wstring text;
+};
+static std::deque<StreamEnt> g_stream;  // 最近 200 行
+static int g_inv_seq = 0;
 static int g_view = -1;                 // 当前展示下标（相对 g_invs 头）
 static bool g_paused = false;
 
@@ -2254,7 +2279,8 @@ static void reader_thread() {
 // ---- UI 状态 ----
 static HFONT d_font = NULL, d_font_bold = NULL, d_font_hint = NULL,
               d_font_mono = NULL;
-static HWND h_status, h_info, h_ctx, h_grid, h_hist, h_evt, h_foot;
+static HWND h_status, h_info, h_ctx, h_grid, h_stream, h_foot;
+static bool g_suppress_sel = false;  // 程序化拨高亮时抑制 LBN_SELCHANGE 逻辑
 static bool g_ctx_is_rich = false;  // 上文行 = RichEdit（false = 退回 STATIC，不灰显）
 
 static void dbg_status(const wchar_t *text, bool ok) {
@@ -2468,30 +2494,85 @@ static void update_current() {
   fill_grid(inv);
 }
 
-static void evt_add(const std::wstring &text) {
-  g_evts.push_front(text);
-  while (g_evts.size() > 200) g_evts.pop_back();
-  if (!g_paused) {
-    SendMessageW(h_evt, LB_INSERTSTRING, 0, (LPARAM)text.c_str());
-    int cnt = (int)SendMessageW(h_evt, LB_GETCOUNT, 0, 0);
-    if (cnt > 200) SendMessageW(h_evt, LB_DELETESTRING, cnt - 1, 0);
-  }
-}
-
-static void hist_refresh_item() {
-  // 最新历史条目补前 3 个词（首行 C 到达时）
-  if (g_invs.empty()) return;
-  Inv &inv = g_invs.back();
-  if (inv.rows.size() > 3) return;
+// ── 合并流（2026-11-17：历史+事件两块合一）────────────────────────────
+// 推理行文本：◆ 时间 输入 词1,词2,词3（前 3 词；C 行到达时补齐）
+static std::wstring inv_row_text(const Inv &inv) {
   std::wstring words;
   for (size_t i = 0; i < inv.rows.size() && i < 3; i++) {
     if (i) words += L",";
     words += inv.rows[i].word;
   }
-  std::wstring txt = inv.t + L" " + inv.input + L" " + words;
-  int cnt = (int)SendMessageW(h_hist, LB_GETCOUNT, 0, 0);
-  if (cnt > 0) SendMessageW(h_hist, LB_DELETESTRING, cnt - 1, 0);
-  SendMessageW(h_hist, LB_ADDSTRING, 0, (LPARAM)txt.c_str());
+  std::wstring t = L"◆ " + inv.t + L" " + inv.input;
+  if (!words.empty()) t += L" " + words;
+  return t;
+}
+
+// 追加一行（g_stream 是唯一事实源；未暂停时同步 ListBox 并跟随最新）
+static void stream_add(bool inv, const std::wstring &text, int seq) {
+  g_stream.push_back({inv, inv ? seq : 0, text});
+  while (g_stream.size() > 200) g_stream.pop_front();
+  if (g_paused) return;
+  SendMessageW(h_stream, LB_ADDSTRING, 0, (LPARAM)text.c_str());
+  int cnt = (int)SendMessageW(h_stream, LB_GETCOUNT, 0, 0);
+  while (cnt > 200) {
+    SendMessageW(h_stream, LB_DELETESTRING, 0, 0);
+    cnt--;
+  }
+  // 高亮只管推理行（= 详情区所示那条）；日志行只把视图滚到尾部
+  if (inv) {
+    g_suppress_sel = true;
+    SendMessageW(h_stream, LB_SETCURSEL, cnt - 1, 0);
+    g_suppress_sel = false;
+  } else {
+    SendMessageW(h_stream, LB_SETTOPINDEX, cnt - 1, 0);
+  }
+}
+
+// 把高亮拨回详情区正在展示的那条推理（程序化设置不触发点击逻辑）
+static void stream_select_current() {
+  if (g_view < 0 || g_view >= (int)g_invs.size()) return;
+  int seq = g_invs[g_view].seq;
+  for (int i = (int)g_stream.size() - 1; i >= 0; i--) {
+    if (g_stream[i].inv && g_stream[i].seq == seq) {
+      g_suppress_sel = true;
+      SendMessageW(h_stream, LB_SETCURSEL, i, 0);
+      g_suppress_sel = false;
+      return;
+    }
+  }
+}
+
+// 推理行的前 3 词补齐（C 行到达时；按 seq 找流行）
+static void stream_update_inv(const Inv &inv) {
+  if (inv.rows.size() > 3) return;
+  std::wstring txt = inv_row_text(inv);
+  for (int i = (int)g_stream.size() - 1; i >= 0; i--) {
+    if (g_stream[i].inv && g_stream[i].seq == inv.seq) {
+      g_stream[i].text = txt;
+      if (!g_paused) {
+        // 原地改行的唯一可靠做法：删了重插（LB_SETITEMDATA 不能改文本）。
+        // DELETESTRING 会把选中清掉（cursel → -1）→ 重插后把选中补回该行。
+        int cnt = (int)SendMessageW(h_stream, LB_GETCOUNT, 0, 0);
+        if (i < cnt) {
+          int cur = (int)SendMessageW(h_stream, LB_GETCURSEL, 0, 0);
+          SendMessageW(h_stream, LB_DELETESTRING, i, 0);
+          SendMessageW(h_stream, LB_INSERTSTRING, i, (LPARAM)txt.c_str());
+          g_suppress_sel = true;
+          SendMessageW(h_stream, LB_SETCURSEL, (WPARAM)cur, 0);  // 重插后行号不变
+          g_suppress_sel = false;
+        }
+      }
+      break;
+    }
+  }
+}
+
+// 整列重建（暂停恢复 / 清空后；g_stream 是唯一事实源）
+static void stream_rebuild() {
+  SendMessageW(h_stream, LB_RESETCONTENT, 0, 0);
+  for (auto &e : g_stream)
+    SendMessageW(h_stream, LB_ADDSTRING, 0, (LPARAM)e.text.c_str());
+  stream_select_current();   // 高亮回到详情区当前那条推理
 }
 
 // ---- 协议行处理（UI 线程）----
@@ -2519,6 +2600,7 @@ static void handle_line(const std::string &line) {
   }
   if (f[0] == "L" && f.size() >= 10) {
     Inv inv;
+    inv.seq = ++g_inv_seq;
     inv.t = u8w(f[1]);
     inv.input = u8w(f[2]);
     inv.cache = u8w(f[3]);
@@ -2542,13 +2624,7 @@ static void handle_line(const std::string &line) {
     g_view = (int)g_invs.size() - 1;
     if (!g_paused) {
       Inv &back = g_invs.back();
-      SendMessageW(h_hist, LB_ADDSTRING, 0,
-                   (LPARAM)(back.t + L" " + back.input).c_str());
-      int cnt = (int)SendMessageW(h_hist, LB_GETCOUNT, 0, 0);
-      while (cnt > 50) {
-        SendMessageW(h_hist, LB_DELETESTRING, 0, 0);
-        cnt--;
-      }
+      stream_add(true, inv_row_text(back), back.seq);
       update_current();
     }
     return;
@@ -2581,7 +2657,7 @@ static void handle_line(const std::string &line) {
     g_invs.back().rows.push_back(std::move(r));
     if (!g_paused) {
       if (g_view == (int)g_invs.size() - 1) update_current();
-      hist_refresh_item();
+      stream_update_inv(g_invs.back());   // 合并流推理行补前 3 词
     }
     return;
   }
@@ -2590,19 +2666,19 @@ static void handle_line(const std::string &line) {
     swprintf(tmp, 512, L"%s 跳过 %s（输入 %s 来源 %s）", u8w(f[1]).c_str(),
              u8w(f[2]).c_str(), f.size() > 3 ? u8w(f[3]).c_str() : L"",
              f.size() > 4 ? u8w(f[4]).c_str() : L"-");
-    evt_add(tmp);
+    stream_add(false, tmp, 0);
     return;
   }
   if (f[0] == "E" && f.size() >= 7) {
     swprintf(tmp, 512, L"%s 上屏 %s  eff %s→%s  tick %s→%s", u8w(f[1]).c_str(),
              u8w(f[2]).c_str(), u8w(f[3]).c_str(), u8w(f[4]).c_str(),
              u8w(f[5]).c_str(), u8w(f[6]).c_str());
-    evt_add(tmp);
+    stream_add(false, tmp, 0);
     return;
   }
   if (f[0] == "R" && f.size() >= 3) {
     swprintf(tmp, 512, L"%s 重置 %s", u8w(f[1]).c_str(), u8w(f[2]).c_str());
-    evt_add(tmp);
+    stream_add(false, tmp, 0);
     return;
   }
 }
@@ -2671,7 +2747,7 @@ static void dbg_make_ui() {
 
   h_grid = mk_ctl(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT |
                                       LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
-                  652, 104, 888, 268, IDC_GRID, d_font_mono);
+                  652, 104, 888, 250, IDC_GRID, d_font_mono);
   ListView_SetExtendedListViewStyle(
       h_grid, LVS_EX_FULLROWSELECT | LVS_EX_LABELTIP | LVS_EX_DOUBLEBUFFER);
   // 分数部分五列（2026-11-11 用户定案"分数=计算过程"）：CE / 衰减词频分 /
@@ -2697,30 +2773,31 @@ static void dbg_make_ui() {
     ListView_InsertColumn(h_grid, i, &col);
   }
 
-  h_hist = mk_ctl(L"LISTBOX", L"",
-                  WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL |
-                      LBS_NOINTEGRALHEIGHT,
-                  652, 378, 888, 108, IDC_HIST, d_font);
-  h_evt = mk_ctl(L"LISTBOX", L"",
-                 WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL |
-                     LBS_NOINTEGRALHEIGHT,
-                 652, 492, 888, 88, IDC_EVT, d_font);
+  // 合并流（2026-11-17 用户定案）：原「历史」（推理项列表，右侧 204 宽）与
+  // 「事件」（纯日志）两块合一，网格下方通栏。owner-draw 只为分色：推理行
+  // ◆ 黑字、日志行灰字；选中高亮 = 详情区所示那条推理。
+  h_stream = mk_ctl(L"LISTBOX", L"",
+                    WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL |
+                        LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED |
+                        LBS_HASSTRINGS,
+                    652, 360, 888, 188, IDC_STREAM, d_font);
+  SendMessageW(h_stream, LB_SETITEMHEIGHT, 0, (LPARAM)ts(18));
   // 打字测试框（2026-11-16 用户定案）：在此输入即走本机 IME——组词/候选/
   // 上屏全程在本窗口内完成，逐候选数据实时刷新，免切窗口测试。
-  // 标准多行 EDIT，TSF 对其自动生效（同记事本）；事件栏下移腾位。
+  // 标准多行 EDIT，TSF 对其自动生效（同记事本）；合并流下方。
   mk_ctl(L"STATIC", L"打字测试（在此输入即走本机 IME，逐候选数据实时刷新）",
-         SS_LEFT, 652, 586, 460, 16, IDC_TYPELBL, d_font_hint);
+         SS_LEFT, 652, 552, 460, 16, IDC_TYPELBL, d_font_hint);
   mk_ctl(L"EDIT", L"",
          WS_BORDER | WS_VSCROLL | WS_TABSTOP | ES_LEFT | ES_MULTILINE |
              ES_AUTOVSCROLL | ES_WANTRETURN,
-         652, 602, 888, 62, IDC_TYPE, d_font);
+         652, 572, 888, 64, IDC_TYPE, d_font);
   // 公式行/列义行已删（2026-11-11 用户定案：计算过程直接写在分数格里，
   // 无需再对照底部公式）；只剩数据源一行灰注
   h_foot = mk_ctl(L"STATIC",
                   L"数据源 \\\\.\\pipe\\rime_llm_live · 开关 = 方案 "
                   L"llm_rerank/debug_fusion（改后重新部署）· 预解 = 上文 KV 预解码"
                   L"命中",
-                  SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 652, 672, 888, 16, IDC_FOOT,
+                  SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 652, 644, 888, 16, IDC_FOOT,
                   d_font_hint);
 }
 
@@ -2810,21 +2887,8 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           g_paused = !g_paused;
           SetWindowTextW(GetDlgItem(h, IDC_PAUSE), g_paused ? L"继续" : L"暂停");
           if (!g_paused) {
-            // 恢复：重建事件与历史列表（暂停期间两者都在变）+ 当前视图
-            SendMessageW(h_evt, LB_RESETCONTENT, 0, 0);
-            for (auto &e : g_evts)
-              SendMessageW(h_evt, LB_ADDSTRING, 0, (LPARAM)e.c_str());
-            SendMessageW(h_hist, LB_RESETCONTENT, 0, 0);
-            for (auto &inv : g_invs) {
-              std::wstring words;
-              for (size_t i = 0; i < inv.rows.size() && i < 3; i++) {
-                if (i) words += L",";
-                words += inv.rows[i].word;
-              }
-              SendMessageW(h_hist, LB_ADDSTRING, 0,
-                           (LPARAM)(inv.t + L" " + inv.input + L" " + words)
-                               .c_str());
-            }
+            // 恢复：整列重建合并流（暂停期间 g_stream 照常入队、ListBox 已陈旧）
+            stream_rebuild();
             update_current();
           }
           return 0;
@@ -2836,25 +2900,33 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           return 0;
         case IDC_CLEAR:
           g_invs.clear();
-          g_evts.clear();
+          g_stream.clear();
           g_view = -1;
-          SendMessageW(h_hist, LB_RESETCONTENT, 0, 0);
-          SendMessageW(h_evt, LB_RESETCONTENT, 0, 0);
+          SendMessageW(h_stream, LB_RESETCONTENT, 0, 0);
           update_current();
           return 0;
         case IDCANCEL:            // IsDialogMessage 把 ESC 映射为 IDCANCEL
           DestroyWindow(h);
           return 0;
       }
-      if (LOWORD(wp) == IDC_HIST && HIWORD(wp) == LBN_SELCHANGE) {
-        int sel = (int)SendMessageW(h_hist, LB_GETCURSEL, 0, 0);
-        if (sel >= 0) {
-          int cnt = (int)SendMessageW(h_hist, LB_GETCOUNT, 0, 0);
-          g_view = (int)g_invs.size() - cnt + sel;
-          if (g_view < 0) g_view = 0;
-          if (g_view >= (int)g_invs.size()) g_view = (int)g_invs.size() - 1;
-          update_current();
+      // 合并流点击（2026-11-17）：推理行（◆）→ 详情切到该条；日志行不可点开——
+      // 高亮弹回详情区当前那条（行为同合并前的历史列表，只是混进了日志行）
+      if (LOWORD(wp) == IDC_STREAM && HIWORD(wp) == LBN_SELCHANGE) {
+        if (g_suppress_sel) return 0;
+        int sel = (int)SendMessageW(h_stream, LB_GETCURSEL, 0, 0);
+        if (sel < 0 || sel >= (int)g_stream.size()) return 0;
+        if (!g_stream[sel].inv) {   // 纯日志行：弹回
+          stream_select_current();
+          return 0;
         }
+        for (int j = (int)g_invs.size() - 1; j >= 0; j--) {
+          if (g_invs[j].seq == g_stream[sel].seq) {
+            g_view = j;
+            update_current();
+            return 0;
+          }
+        }
+        stream_select_current();   // 该推理已滚出 50 条窗口 → 保持当前视图
         return 0;
       }
       break;
@@ -2868,6 +2940,27 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DRAWITEM: {
       const DRAWITEMSTRUCT* d = (const DRAWITEMSTRUCT*)lp;
+      // 合并流 owner-draw（2026-11-17）：只为分色——推理行 ◆ 黑字、日志行
+      // 灰字；选中 = 系统高亮（同 WeaselLLMDebug 独立窗口同款绘制）
+      if (d && d->CtlType == ODT_LISTBOX && d->CtlID == IDC_STREAM &&
+          d->itemID != (UINT)-1) {
+        std::wstring txt;
+        if (d->itemID < g_stream.size()) txt = g_stream[d->itemID].text;
+        bool sel = (d->itemState & ODS_SELECTED) != 0;
+        bool inv = (d->itemID < g_stream.size()) && g_stream[d->itemID].inv;
+        HBRUSH bg = sel ? GetSysColorBrush(COLOR_HIGHLIGHT)
+                        : (HBRUSH)GetStockObject(WHITE_BRUSH);
+        FillRect(d->hDC, &d->rcItem, bg);
+        SetBkMode(d->hDC, TRANSPARENT);
+        SetTextColor(d->hDC, sel ? GetSysColor(COLOR_HIGHLIGHTTEXT)
+                                 : (inv ? RGB(0, 0, 0) : RGB(150, 150, 150)));
+        RECT r = d->rcItem;
+        r.left += ts(2);
+        DrawTextW(d->hDC, txt.c_str(), (int)txt.size(), &r,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        if (d->itemState & ODS_FOCUS) DrawFocusRect(d->hDC, &d->rcItem);
+        return TRUE;
+      }
       if (d && d->CtlType == ODT_STATIC) {  // 只有「?」徽标是 owner-draw static
         draw_help(d);
         return TRUE;
