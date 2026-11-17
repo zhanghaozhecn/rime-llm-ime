@@ -64,17 +64,14 @@ void WeaselServerApp::SetupMenuHandlers() {
   m_server.AddMenuHandler(
       ID_WEASELTRAY_SYNC,
       std::bind(execute, dir / L"WeaselDeployer.exe", std::wstring(L"/sync")));
-  // LLM 重排设置（直接安装版）: 配置 GUI——写选中方案的 llm_rerank 节并
-  // 触发重新部署（2026-09-30 起配置在方案里，全局 llm_rerank.yaml 已取消）
+  // LLM 设置+调试 二合一窗口（2026-11-16 v2026.11.16-5：合并旧「LLM 重排设置」
+  // 「LLM 调试窗口」两条菜单入口）：左列配置 GUI——写选中方案的 llm_rerank 节
+  // 并触发重新部署；右列实时调试——连接 \\.\pipe\rime_llm_live（数据流由方案
+  // debug_fusion 开关驱动）。TSF 语言栏的同名菜单项在 LanguageBar.cpp
+  // 本地 ShellExecute 启动（不经 TrayCommand 转发）
   m_server.AddMenuHandler(
-      ID_WEASELTRAY_LLM_SETUP,
-      std::bind(execute, dir / L"WeaselLLMSetup.exe", std::wstring()));
-  // LLM 实时调试窗口（2026-11-10）：连接 \\.\pipe\rime_llm_live 显示上文
-  // 来源/内容与逐候选分数（数据流由方案 debug_fusion 开关驱动）。
-  // TSF 语言栏的同名菜单项经 default TrayCommand IPC 转发到这里（同一处理）
-  m_server.AddMenuHandler(
-      ID_WEASELTRAY_LLM_DEBUG,
-      std::bind(execute, dir / L"WeaselLLMDebug.exe", std::wstring()));
+      ID_WEASELTRAY_LLM_STUDIO,
+      std::bind(execute, dir / L"WeaselLLMStudio.exe", std::wstring()));
   m_server.AddMenuHandler(ID_WEASELTRAY_WIKI,
                           std::bind(open, L"https://rime.im/docs/"));
   m_server.AddMenuHandler(ID_WEASELTRAY_HOMEPAGE,

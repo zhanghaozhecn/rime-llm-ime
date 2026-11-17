@@ -309,14 +309,14 @@ void WeaselTSF::_HandleLangBarMenuSelect(UINT wID) {
           open(dir);
       }
       break;
-    case ID_WEASELTRAY_LLM_SETUP:
-      // LLM 重排设置 GUI：从安装目录启动 WeaselLLMSetup.exe——读写的
-      // 是所选方案的 llm_rerank 配置节（2026-09-30 起配置在方案里，
-      // 保存后由 GUI 触发重新部署生效）
+    case ID_WEASELTRAY_LLM_STUDIO:
+      // LLM 设置+调试 二合一窗口：从安装目录启动 WeaselLLMStudio.exe
+      // （左列配置 + 右列调试单界面并排；配置侧读写的仍是所选方案的
+      // llm_rerank 配置节，保存后由 GUI 触发重新部署生效）
       if (RegGetStringValue(HKEY_LOCAL_MACHINE, GetWeaselRegName(),
                             L"WeaselRoot", dir) == ERROR_SUCCESS) {
         std::thread th([dir]() {
-          ShellExecuteW(NULL, L"open", (dir + L"\\WeaselLLMSetup.exe").c_str(),
+          ShellExecuteW(NULL, L"open", (dir + L"\\WeaselLLMStudio.exe").c_str(),
                         NULL, dir.c_str(), SW_SHOWNORMAL);
         });
         th.detach();

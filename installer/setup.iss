@@ -18,7 +18,7 @@
 ;               （写组件行 + 方案 llm_rerank 节）决定。
 
 #define MyAppName "小狼毫 LLM 版"
-#define MyAppVer "2026.11.16-4"  ; 同日重打安装包在日期后加 -2…-N 序号（2026-09-11 用户定案，避免同号不同内容）
+#define MyAppVer "2026.11.16-5"  ; 同日重打安装包在日期后加 -2…-N 序号（2026-09-11 用户定案，避免同号不同内容）
 #define MyAppId "{{3F8A2D5C-6B1E-4F9A-8D73-9C2E5B7A1F40}"
 
 [Setup]
@@ -85,7 +85,7 @@ Filename: "{app}\WeaselSetup.exe"; Parameters: "/s"; Flags: runhidden; Check: Is
 ; 出被掩盖；全新/清场安装必现（插件版 install_plugin.ps1 的 explorer
 ; 代启是同坑同解法）。右键"以管理员身份运行"安装器时此标志无效。
 Filename: "{app}\WeaselServer.exe"; Flags: nowait runhidden runasoriginaluser
-Filename: "{app}\WeaselLLMSetup.exe"; Flags: nowait postinstall skipifsilent unchecked; Description: "打开 LLM 重排设置（选择/检查模型与参数）"
+Filename: "{app}\WeaselLLMStudio.exe"; Flags: nowait postinstall skipifsilent unchecked; Description: "打开 LLM 设置+调试（配置与实时调试单界面并排）"
 
 [UninstallRun]
 ; 官方卸载注册路径（停止 TSF 注册 + 移除系统文件）
