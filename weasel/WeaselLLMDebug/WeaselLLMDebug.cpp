@@ -345,18 +345,18 @@ static std::wstring ce_proc(const Row &r, int wl, int wc) {
   return t + L")";
 }
 
-// 衰减词频分格：β·ln(1+eff)，β=14 内置常数（log/ln = 自然对数；
-// 2026-11-14 随默认模型 0.5B 重标定，旧 β=12 为 0.8B v3 值）
+// 衰减词频分格：β·log1p(eff)，β=14 内置常数
+// （2026-11-14 随默认模型 0.5B 重标定，旧 β=12 为 0.8B v3 值）
 static std::wstring fb_proc(const Row &r, int wl, int we) {
   double fb, eff;
   if (!num_of(r.fb, fb)) return L"—";
   std::wstring lead = padl(f1(fb), wl);
   if (!num_of(r.eff, eff)) return lead;
-  return lead + L"=14·ln(1+" + padl(f1(eff), we) + L")";
+  return lead + L"=14·log1p(" + padl(f1(eff), we) + L")";
 }
 
-// 累计词频格：ln(1+uni)（2026-11-11 公式简化，分母为窗内常数已去除；
-// 1 在前与衰减词频分格统一——v2026.11.11-13 定案，本格曾漏改显示 ln(uni+1)）
+// 累计词频格：log1p(uni)（2026-11-11 公式简化，分母为窗内常数已去除；
+// 2026-11-18 显示统一 log1p(n)）
 static std::wstring u1_proc(const Row &r, int wl, int wu) {
   double u1, uni;
   if (!num_of(r.u1, u1)) return L"—";
@@ -364,7 +364,7 @@ static std::wstring u1_proc(const Row &r, int wl, int wu) {
   if (!num_of(r.uni, uni)) return lead;
   wchar_t ub[16], b[48];
   swprintf(ub, 16, L"%d", (int)uni);
-  swprintf(b, 48, L"=ln(1+%s)", padl(ub, wu).c_str());
+  swprintf(b, 48, L"=log1p(%s)", padl(ub, wu).c_str());
   return lead + b;
 }
 

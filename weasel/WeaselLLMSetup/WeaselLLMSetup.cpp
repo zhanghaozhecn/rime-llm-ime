@@ -67,12 +67,13 @@ struct Params {
   std::string code_pattern = ".{4}";
   // min_tokens 不再暴露给用户（2026-09-30 定案：最少上文 token 恒为 1，
   // 代码内默认值保留，yaml/schema 里的旧行读取时忽略、写入时不再产出）
-  int max_tokens = 10, cpu_cores = 4;
+  // 2026-11-19 随生产模型切 Qwen3-0.6B base 同步定案（研究 ctx*=20、0.6B k*=6）：
+  int max_tokens = 20, cpu_cores = 4;
   bool two_code_sentence = false;  // 两码整句：满长组优先（2026-11-07 取代 elw）
   // freq_beta 已删（2026-11-05 标定产物退出用户配置面 → β=12 内置常数，两版统一；
 // v3 2026-11-06 六维联合标定：β12/τ400；用户 bigram 项 2026-11-08 退役，
 // 融合项只剩累计 Unigram log(0.5·p1)）
-  int max_candidates = 5;
+  int max_candidates = 6;
   bool debug_fusion = false;
   std::wstring model_path;  // 显示值（空 = 默认路径）
 };
@@ -131,8 +132,8 @@ static std::wstring default_model_path() {
   // 2026-10-01：改用 rime_user_dir()（注册表 RimeUserDir 优先），与运行期
   // 默认（deployer().user_data_dir）在便携部署下保持一致
   std::wstring dir = rime_user_dir();
-  if (!dir.empty()) return dir + L"\\qwen2.5-0.5b-instruct-q4_k_m.gguf";
-  return L"qwen2.5-0.5b-instruct-q4_k_m.gguf";
+  if (!dir.empty()) return dir + L"\\Qwen3-0.6B-Base-Q4_K_M.gguf";
+  return L"Qwen3-0.6B-Base-Q4_K_M.gguf";
 }
 
 static std::wstring shown_model() {
@@ -303,7 +304,7 @@ static std::vector<std::string> build_llm_section() {
   } else {
     sec.push_back("  # model_path: <绝对路径；默认 = " +
                   wide_to_utf8(rime_user_dir()) +
-                  "\\qwen2.5-0.5b-instruct-q4_k_m.gguf>");
+                  "\\Qwen3-0.6B-Base-Q4_K_M.gguf>");
   }
   return sec;
 }
@@ -1167,7 +1168,7 @@ static const wchar_t* const TIP_MODEL =
 static const wchar_t* const TIP_BROWSE = L"浏览…：选择 .gguf 模型文件。";
 static const wchar_t* const TIP_DOWNLOAD =
     L"下载模型：ModelScope 直连断点续传（curl -C -），落点 = 左边的模型路径框\n"
-    L"（留空 = 用户文件夹里的默认名 qwen2.5-0.5b-instruct-q4_k_m.gguf）。\n"
+    L"（留空 = 用户文件夹里的默认名 Qwen3-0.6B-Base-Q4_K_M.gguf）。\n"
     L"失败会保留 .download 分片，再点一次即续传。";
 static const wchar_t* const TIP_SCHEMA =
     L"配置就写在选中的方案文件里。下拉列出**用户文件夹** %APPDATA%\\Rime 与\n"
@@ -1186,10 +1187,10 @@ static const wchar_t* const TIP_CODE_PAT =
     L"　[abcde]{4} 指定首码　　空 = 不限制\n"
     L"含 \\ 的写法要用单引号，如 '\\d{4}'。";
 static const wchar_t* const TIP_MAX_TOK =
-    L"上文长度上限：取光标前多少个 token 作为重排依据（默认 10）。\n"
+    L"上文长度上限：取光标前多少个 token 作为重排依据（默认 20）。\n"
     L"越大越准，但每次都更慢。";
 static const wchar_t* const TIP_MAX_CAND =
-    L"每次按键参与 LLM 打分的候选数上限（默认 5）。\n"
+    L"每次按键参与 LLM 打分的候选数上限（默认 6）。\n"
     L"一般不用改——调大更准但更慢。";
 static const wchar_t* const TIP_CORES =
     L"推理用的 CPU 线程数（默认 4）。不要超过本机物理核；\n"
@@ -1630,7 +1631,7 @@ static void draw_button(const DRAWITEMSTRUCT* d) {
 // 与插件版逐字同源：curl.exe（Win10 1803+ 自带）断点续传 -L -C - -o <目标>.download，
 // 轮询分片大小打进度；完成后剥掉 .download 后缀转正；失败保留分片可重试续传。
 static const wchar_t* const kModelUrl =
-    L"https://www.modelscope.cn/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/master/qwen2.5-0.5b-instruct-q4_k_m.gguf";
+    L"https://www.modelscope.cn/models/zhanghaozhecn/Qwen3-0.6B-Base-GGUF/resolve/master/Qwen3-0.6B-Base-Q4_K_M.gguf";
 static HANDLE g_dl_proc = NULL;
 static std::wstring g_dl_tmp, g_dl_target;
 // 点下载时路径框为空 = 落默认路径——完成后把实际落点回填到框里（2026-11-17
@@ -1731,7 +1732,7 @@ static void on_download_model() {
       log_error(L"[下载] APPDATA 缺失，无法定默认落点");
       return;
     }
-    target = dir + L"\\qwen2.5-0.5b-instruct-q4_k_m.gguf";
+    target = dir + L"\\Qwen3-0.6B-Base-Q4_K_M.gguf";
   }
   for (wchar_t* c = &target[0]; *c; ++c)
     if (*c == L'/') *c = L'\\';

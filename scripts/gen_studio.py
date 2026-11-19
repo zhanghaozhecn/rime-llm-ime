@@ -29,6 +29,10 @@ SETUP = ROOT / "weasel" / "WeaselLLMSetup" / "WeaselLLMSetup.cpp"
 DEBUG = ROOT / "weasel" / "WeaselLLMDebug" / "WeaselLLMDebug.cpp"
 OUT = ROOT / "weasel" / "WeaselLLMStudio" / "WeaselLLMStudio.cpp"
 
+# Windows 控制台默认 GBK；生成器的进度行含 ✓ 等非 GBK 字符，
+# 不处理会在**文件已写出后**抛 UnicodeEncodeError（exit 1 → bat 误判 GEN FAILED）
+sys.stdout.reconfigure(errors="replace")
+
 
 def must_sub(text, old, new, n):
     got = text.count(old)

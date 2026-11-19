@@ -146,7 +146,7 @@ static bool g_debug_fusion = false;
 // com_context 配置项（两版同步）：旁路无常关配置，排障直接改此值重编。
 static bool g_com_ctx_enabled = true;
 static int g_min_tokens = 1;
-static int g_max_ctx_tokens = 10;  // tok=10: 93.4% acc, 10->17 gains only +1.1pp
+static int g_max_ctx_tokens = 20;  // 2026-11-19: 0.6B ctx*=20（旧 10 为 0.5B 时代值）
 static int g_n_threads = 4;        // default = GGML_DEFAULT_N_THREADS; override via cpu_cores
 
 static void log_msg(const char *fmt, ...);    // defined below (fwd decl)
@@ -157,7 +157,8 @@ static double cross_entropy(const float *logits, int vs, int target_id);  // fwd
 
 static int g_n_ctx = 128;          // KV: 11 seqs x (ctx 10 + cand 2) = 132, 64 overflows
 static int g_n_seq_max = 12;       // template seq 0 + up to 11 worker seqs
-static int g_max_candidates = 5;   // candidates participating in scoring
+static int g_max_candidates = 6;   // candidates participating in scoring
+                                   // (2026-11-19 随生产模型切 Qwen3-0.6B base 定案 k*=6)
 
 // ==== 参数来源（2026-09-30 用户定案：两版统一回归 Rime 原生做法）====
 // **只读方案 schema.yaml 的 llm_rerank: 配置节**（部署期快照 Apply/Initialize）。
@@ -173,8 +174,8 @@ struct LlmParamSet {
   bool has_tcs = false;          bool two_code_sentence = false;
   // freq_beta 字段已删（2026-11-05 退出用户配置面）→ g_freq_beta 内置常数
   bool has_min_tokens = false;   int min_tokens = 1;
-  bool has_max_tokens = false;   int max_tokens = 10;
-  bool has_max_cand = false;     int max_cand = 5;
+  bool has_max_tokens = false;   int max_tokens = 20;  // 2026-11-19: 0.6B ctx*=20
+  bool has_max_cand = false;     int max_cand = 6;     // 2026-11-19: 0.6B k*=6
   bool has_cpu_cores = false;    int cpu_cores = 4;
   bool has_debug_fusion = false; bool debug_fusion = false;
   bool has_model_path = false;   std::string model_path;
@@ -213,8 +214,8 @@ static void llm_apply_params() {
   // g_com_ctx_enabled 不再读配置（2026-09-29 删 com_context 配置项）——
   // 保持定义处 true，排障改代码重编
   g_min_tokens = s.has_min_tokens ? s.min_tokens : 1;
-  g_max_ctx_tokens = s.has_max_tokens ? s.max_tokens : 10;
-  g_max_candidates = s.has_max_cand ? s.max_cand : 5;
+  g_max_ctx_tokens = s.has_max_tokens ? s.max_tokens : 20;
+  g_max_candidates = s.has_max_cand ? s.max_cand : 6;
   g_n_threads = s.has_cpu_cores ? s.cpu_cores : 4;
   // cap threads at hardware cores: 低核机器不应超订（变慢 + 每线程额外内存）
   unsigned hw = std::thread::hardware_concurrency();
@@ -828,6 +829,30 @@ static bool                     g_prep_ready = false;
 static std::atomic<int>         g_prep_seq{0};  // request seq, stale requests skip
 static long                     g_seq0_gen = 0; // seq0 KV generation: bumped by any decode covering seq0
 static long                     g_prep_gen = 0; // generation at which prep was produced
+
+// 2026-11-18: prepare() used to silently drop its request when the inference
+// lock was held (try_to_lock). Nothing retried it, so the next full-code score
+// paid the whole S1 (measured 58-136ms on real logs). Remember the dropped
+// request and re-run it right after score_batch releases the lock.
+static std::mutex                g_prep_pending_mu;
+static std::vector<llama_token>  g_prep_pending_ctx;
+static int                       g_prep_pending_seq = -1;
+static void request_prepare_retry(const std::vector<llama_token> &ids,
+                                  int seq) {
+  std::lock_guard<std::mutex> lk(g_prep_pending_mu);
+  g_prep_pending_ctx = ids;
+  g_prep_pending_seq = seq;
+}
+static bool take_prepare_retry(std::vector<llama_token> &out, int &seq) {
+  std::lock_guard<std::mutex> lk(g_prep_pending_mu);
+  if (g_prep_pending_seq < 0)
+    return false;
+  out = std::move(g_prep_pending_ctx);
+  seq = g_prep_pending_seq;
+  g_prep_pending_ctx.clear();
+  g_prep_pending_seq = -1;
+  return true;
+}
 
 // ============================================================
 // score result cache: same (ctx, input) reuses the previous rerank
@@ -2423,8 +2448,14 @@ static void prepare(const std::vector<llama_token> &ctx_ids, int seq) {
   // 下次 score 的全流程 (self-refresh) 兜底, 不排队等待 —— 避免
   // prepare 风暴占用 g_mutex 阻塞 IPC 消息线程 (QQ 音乐等应用打不开)
   std::unique_lock<std::mutex> lock(g_mutex, std::try_to_lock);
-  if (!lock.owns_lock())
+  if (!lock.owns_lock()) {
+    // 2026-11-18: do not drop silently - remember it and retry after the
+    // in-flight score releases the lock (see retry_pending_prepare()).
+    request_prepare_retry(ctx_ids, seq);
+    log_msg("prepare: DEFER score in progress (seq=%d ctx_tok=%d)", seq,
+            (int)ctx_ids.size());
     return;
+  }
 
   int ctx_len = (int)ctx_ids.size();
   if (ctx_len == 0)
@@ -2485,6 +2516,21 @@ static void prepare(const std::vector<llama_token> &ctx_ids, int seq) {
   log_msg("prepare: seq=%d ctx_tok=%d %.0fms", seq, ctx_len, ms);
 }
 
+// 2026-11-18: run a prepare() that was deferred because the inference lock
+// was busy. Called right after score_batch() returns (lock released).
+static void retry_pending_prepare() {
+  std::vector<llama_token> ids;
+  int seq = -1;
+  if (!take_prepare_retry(ids, seq))
+    return;
+  if (!g_loaded.load() || ids.empty())
+    return;
+  if (seq != g_prep_seq.load())
+    return;  // a newer request superseded it
+  std::thread([ids, seq]() { prepare(ids, seq); }).detach();
+  log_msg("prepare: retry deferred ctx_tok=%d seq=%d", (int)ids.size(), seq);
+}
+
 // ============================================================
 // LlmRerankTranslation
 // ============================================================
@@ -2519,7 +2565,7 @@ void LlmRerankTranslation::Collect() {
   // 在下方融合块）, 其余按层1 序透传。目标在层1 前 k 外 → 必然不在首位
   // （评测 sweep_2layer 同语义, 全窗参评）。文件序无关性: 引擎调频与否仅
   // 影响冷词同分打破（目标卷入 ≤0.05pp 窗, 研究库 §三十三·附 6）。
-  const size_t kMaxRerank = (size_t)(g_max_candidates > 0 ? g_max_candidates : 5);
+  const size_t kMaxRerank = (size_t)(g_max_candidates > 0 ? g_max_candidates : 6);
   std::vector<an<Candidate>> tail;
   std::vector<double> s1_head;   // 层1 分（对齐 candidates_; 无 CE 分回退用）
   // 词码对表：窗口准入前读一次；正分候选优先占位，融合段复用。
@@ -2711,6 +2757,9 @@ void LlmRerankTranslation::Collect() {
         auto ev_t0 = std::chrono::high_resolution_clock::now();
         score_batch(ctx_ids, cand_ids, scores, &ce3, &prep_hit);
         auto ev_t1 = std::chrono::high_resolution_clock::now();
+        // 2026-11-18: the inference lock is free again - run any prepare that
+        // was deferred while this score was holding it.
+        retry_pending_prepare();
         ev_ms =
             std::chrono::duration<double, std::milli>(ev_t1 - ev_t0).count();
 
