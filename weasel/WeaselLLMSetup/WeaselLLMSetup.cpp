@@ -1199,7 +1199,8 @@ static const wchar_t* const TIP_CORES =
 // 文案与插件版 $tipBench **逐字一致**
 static const wchar_t* const TIP_BENCH =
     L"线程数实测：加载本机模型实测 4~8 线程的推理延迟，给出推荐值\n"
-    L"（取最优 × 1.05 以内最快的线程数，且不超过物理核）。\n"
+    L"（t_cand = 当前「候选数」个 3-token 候选的候选段延迟，预填充不计；\n"
+    L"取最优 × 1.05 以内最快的线程数，且不超过物理核）。\n"
     L"本机不足 5 线程时不做实测，直接取最大线程数。\n"
     L"约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。";
 // TIP_BETA 已删（2026-11-05：用户词频权重 β 退出用户配置面 → FREQ_BETA=12 内置
@@ -1806,11 +1807,13 @@ static void on_download_tick() {
              file_size_ull(g_dl_tmp) >> 20, g_dl_target.c_str());
 }
 
-// ── 线程数实测（2026-10-01 用户定案：起点 4 / 终点 8）────────────────────
+// ── 线程数实测（2026-10-01 用户定案：起点 4 / 终点 8；2026-11-19 口径改 t_cand）
 // 与插件版逐字同源：起 bench_threads.exe（与本程序同目录）子进程，读它逐行
 // flush 的结果文件做进度，结束时弹框给表 + 推荐值，选"是"回填 CPU 线程数输入框
-// （不落盘——仍要点『保存并生效』）。推荐规则本体在 bench_threads.exe 的
-// `[RESULT]` 行内，两版 GUI 都只做「起进程 → 读结果 → 回填」，规则不会两处漂移。
+// （不落盘——仍要点『保存并生效』）。**t_cand = 当前「参与打分的候选数」
+// 个 3-token 候选的候选段延迟**（`--cands`，预填充不计），与生产口径一致。
+// 推荐规则本体在 bench_threads.exe 的 `[RESULT]` 行内，两版 GUI 都只做
+// 「起进程 → 读结果 → 回填」，规则不会两处漂移。
 // 关窗时结束子进程；异常退出留下的进程由 pid 文件接管（同 curl 的 ④ 规则）。
 static const int kBenchMinCores = 5;   // 逻辑核 < 5 → 不实测，直接取最大线程数
 static const int kBenchTrials = 41;    // 每档计时次数（41 × 5 档 ≈ 30 秒）
@@ -1946,13 +1949,15 @@ static void bench_finish(DWORD code) {
                kBenchMinCores, nrec);
     return;
   }
-  std::string best, bestms, recms, phys;
+  std::string best, bestms, recms, phys, cands;
   result_field(text, "best", &best);
   result_field(text, "best_ms", &bestms);
   result_field(text, "rec_ms", &recms);
   result_field(text, "phys_cores", &phys);
-  std::wstring msg = L"本机实测（ms/pass，越小越快）：\r\n\r\n" + bench_table(text) +
-      L"\r\n推荐 CPU 线程数 = " + utf8_to_wide(rec) + L"（" + utf8_to_wide(recms) +
+  result_field(text, "cands", &cands);
+  std::wstring msg = L"本机实测（t_cand = " + utf8_to_wide(cands) +
+      L" 个 3-token 候选的候选段毫秒数，越小越快）：\r\n\r\n" + bench_table(text) +
+      L"\r\n推荐 CPU 线程数 = " + utf8_to_wide(rec) + L"（t_cand " + utf8_to_wide(recms) +
       L" ms；最优 " + utf8_to_wide(bestms) + L" ms @ " + utf8_to_wide(best) +
       L" 线程，物理核 " + utf8_to_wide(phys) + L"）。\r\n\r\n" +
       L"采用该值吗？（采用后点『保存并生效』应用）";
@@ -2019,8 +2024,16 @@ static void on_bench_threads() {
   if (kill_stale_bench())
     set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已结束上次遗留的实测进程，由本次接管…");
   DeleteFileW(g_bench_out.c_str());
+  // 候选数 = 界面上「参与打分的候选数」当前值（= max_candidates）：
+  // 实测的 t_cand 与用户即将保存的推理规模一致（非法/空回退默认 6，上限同工具）
+  wchar_t cbuf[32] = L"";
+  GetDlgItemTextW(g_hwnd, IDC_MAX_CAND, cbuf, 32);
+  int ncands = _wtoi(cbuf);
+  if (ncands < 1) ncands = 6;
+  if (ncands > 32) ncands = 32;
   std::wstring cmd = L"\"" + exe + L"\" --out \"" + g_bench_out + L"\" --trials " +
-                     std::to_wstring(kBenchTrials) + L" --no-wait \"" + model + L"\"";
+                     std::to_wstring(kBenchTrials) + L" --cands " +
+                     std::to_wstring(ncands) + L" --no-wait \"" + model + L"\"";
   std::vector<wchar_t> cl(cmd.begin(), cmd.end());
   cl.push_back(0);
   STARTUPINFOW si = {sizeof(si)};
@@ -2040,8 +2053,8 @@ static void on_bench_threads() {
   SetTimer(g_hwnd, BENCH_TIMER_ID, 700, NULL);
   EnableWindow(GetDlgItem(g_hwnd, IDC_BENCH), FALSE);
   set_status(GetDlgItem(g_hwnd, IDC_STATUS),
-             L"实测中…（4~%d 线程 × %d 次，约 30 秒，期间请勿打字）",
-             cores < 8 ? cores : 8, kBenchTrials);
+             L"实测中…（4~%d 线程 × %d 次，t_cand = %d 个候选，约 30 秒，期间请勿打字）",
+             cores < 8 ? cores : 8, kBenchTrials, ncands);
 }
 
 static void on_bench_tick() {

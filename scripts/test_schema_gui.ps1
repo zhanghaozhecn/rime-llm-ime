@@ -308,8 +308,8 @@ engine:
   $y = Get-Content $test -Encoding UTF8
   Assert "code_pattern 单引号写出 [abcde]{4}" (($y | Where-Object { $_ -match "^  code_pattern: '\[abcde\]\{4\}'$" }).Count -eq 1)
   Assert "enabled: true" (($y | Where-Object { $_ -match '^  enabled: true$' }).Count -eq 1)
-  Assert "max_tokens: 10" (($y | Where-Object { $_ -match '^  max_tokens: 10$' }).Count -eq 1)
-  Assert "max_candidates: 5" (($y | Where-Object { $_ -match '^  max_candidates: 5$' }).Count -eq 1)
+  Assert "max_tokens: 20" (($y | Where-Object { $_ -match '^  max_tokens: 20$' }).Count -eq 1)
+  Assert "max_candidates: 6" (($y | Where-Object { $_ -match '^  max_candidates: 6$' }).Count -eq 1)
   Assert "cpu_cores: 4" (($y | Where-Object { $_ -match '^  cpu_cores: 4$' }).Count -eq 1)
   Assert "无 freq_beta（标定产物退出配置面 2026-11-05）" (($y | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
   Assert "two_code_sentence: false（默认关闭）" (($y | Where-Object { $_ -match '^  two_code_sentence: false$' }).Count -eq 1)
@@ -322,8 +322,8 @@ engine:
   Assert "旧键 com_context 不再产出" (($y | Where-Object { $_ -match 'com_context' }).Count -eq 0)
   Assert "llm_filter 组件仍恰 1 行" ((($y | Select-String 'llm_filter').Count) -eq 1)
   # 键序与插件版 Get-LlmCfgLines 逐字一致（两版配置节相同，仅组件行不同）
-  $expect = @('  enabled: true', "  code_pattern: '[abcde]{4}'", '  max_tokens: 10',
-              '  max_candidates: 5', '  cpu_cores: 4',
+  $expect = @('  enabled: true', "  code_pattern: '[abcde]{4}'", '  max_tokens: 20',
+              '  max_candidates: 6', '  cpu_cores: 4',
               '  two_code_sentence: false', '  debug_fusion: false')
   $i0 = 0; for ($i = 0; $i -lt $y.Count; $i++) { if ($y[$i] -match '^llm_rerank:') { $i0 = $i } }
   $got = @($y[($i0 + 1)..($i0 + 7)])
@@ -483,7 +483,7 @@ model_path: d:/gguf_models/legacy.gguf
   Reload-Params $hw
   $modelCtl = [W]::GetDlgItem($hw, 1002)
   $cur = Read-Ctl $hw 1002
-  $expectDefault = Join-Path (Join-Path $sandbox "Rime") "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  $expectDefault = Join-Path (Join-Path $sandbox "Rime") "Qwen3-0.6B-Base-Q4_K_M.gguf"
   Write-Host ("  模型路径框 = " + $cur + "（方案节已无 model_path + 无旧全局 yaml）")
   Assert ("默认模型路径 = 用户目录下的默认名（实测 '$cur'）") ($cur -eq $expectDefault)
   # ① 指向一个明显偏小的 .gguf → 状态行报"可疑"（不再谎报已就绪）
@@ -566,7 +566,7 @@ model_path: d:/gguf_models/legacy.gguf
   # （修复前：框保持空、状态区还显示"文件不存在"，与"下载完成"状态行自相矛盾）。
   # download_finish 真转正分支另行一次性手验（预置 .download 分片让 curl 秒收尾）。
   Write-Host "== phase12b: 下载完成自动回填默认路径 =="
-  $fakeFull = Join-Path (Join-Path $sandbox "Rime") "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  $fakeFull = Join-Path (Join-Path $sandbox "Rime") "Qwen3-0.6B-Base-Q4_K_M.gguf"
   $fs12b = [IO.File]::Create($fakeFull); [void]$fs12b.SetLength(105MB); $fs12b.Close()
   [void][W]::SendMessageStr($modelCtl, 0x000C, [IntPtr]::Zero, "")   # 清空框 = 用户场景
   Start-Sleep -Milliseconds 300
