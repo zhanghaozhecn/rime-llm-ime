@@ -8,7 +8,7 @@
 （2026-09-12 信号层统一的回归工具；2026-11-17 起两版同读 corpus）。
 
 用法（普通权限 python，目标应用由脚本拉起并置前）:
-  python scripts\\test_ctx_auto.py                # 记事本全场景 s1-s5，双节奏
+  python scripts\\test_ctx_auto.py                # 记事本全场景 s1-s6，双节奏
                                                   # （先 fast 后 slow 各一遍）
   python scripts\\test_ctx_auto.py -s s2,s4       # 指定场景
   python scripts\\test_ctx_auto.py --rhythm slow  # 只跑慢档（每键500ms/词间2s）
@@ -229,6 +229,29 @@ class EventsLog:
             time.sleep(0.15)
         return None
 
+    def wait_commit(self, code=None, word=None, timeout=4.0):
+        """等待本观察期之后的 C 提交行（按码或按词匹配，取最新一条）。
+        C id ts ref word code rank_engine rank_window rank_final tick flags
+        —— 拆分提交断言用：词 C 行 code 应干净且 ref 回挂评分 W；
+        拆分前的病态形态 = word 带标点（"家庭，"）code="jstg," rank 全 -1。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for ln in reversed(self._lines()[self.mark:]):
+                parts = ln.split("\t")
+                if len(parts) < 11 or parts[0] != "C":
+                    continue
+                if code is not None and parts[5] != code:
+                    continue
+                if word is not None and parts[4] != word:
+                    continue
+                return {"word": parts[4], "code": parts[5], "ref": parts[3],
+                        "rank_engine": int(parts[6]),
+                        "rank_window": int(parts[7]),
+                        "rank_final": int(parts[8]), "tick": parts[9],
+                        "id": parts[1]}
+            time.sleep(0.15)
+        return None
+
 
 # ── 词表（真实语料反查：四码 → 首选上屏词）─────────────────────
 WORDS = {
@@ -424,6 +447,51 @@ def s5_paste(log):
           "ctx=…%s" % row["ctx"][-24:])
 
 
+def s6_punct_split(log):
+    """S6 拆分提交（2026-11-20 punctuator patch 回归）：4 码词 + 标点键 →
+    词与标点分两次提交。断言四件：
+    1) 词 C 行码干净（"jstg" 非 "jstg,"——拆分前病态形态是 word 带标点
+       的复合提交）；
+    2) 词 C 行 ref 回挂评分 W 且 rank 三字段非 -1（ref 断链=拆分前病灶）；
+    3) 标点独立一条 C 行（word="，"），ref 空（评分窗已被词提交消费）；
+    4) 端到端文本与并提交时代一致：后续词的上文含「词+标点」。
+    先导词 fsxd 建立上文——clear_doc 后首词是冷启动（空上文不重排，W 为
+    skip=ctx_empty 空表，rank 全 -1 属正确行为，S1 同理）；jstg 带上文
+    真正进评分窗才有 rank 可断言。上屏词跟随 C 行实际提交（LLM 重排可
+    合法改选，同 S1 定案）。"""
+    print("[S6] punct split: jstg + comma -> two commits")
+    type_word_and_wait("fsxd", log)     # 先导词：建立上文（冷启动豁免）
+    type_code("jstg")
+    time.sleep(max(0.3, RHY["word"]))
+    key_tap(0xBC)                       # VK_OEM_COMMA：词确认 + 标点独立提交
+    c_word = log.wait_commit(code="jstg", timeout=4.0)
+    if c_word is None:
+        check(False, "S6 word commit row", "no C row (code=jstg)")
+        return
+    check(c_word["code"] == "jstg" and "，" not in c_word["word"],
+          "S6 word commit clean", "word=%s code=%s"
+          % (c_word["word"], c_word["code"]))
+    check(c_word["ref"] != "", "S6 word ref linked to scoring W",
+          "ref=%s" % c_word["ref"][-14:])
+    check(c_word["rank_engine"] >= 1 and c_word["rank_window"] >= 1
+          and c_word["rank_final"] >= 1, "S6 word ranks populated",
+          "rE=%d rW=%d rF=%d" % (c_word["rank_engine"],
+                                 c_word["rank_window"],
+                                 c_word["rank_final"]))
+    c_punct = log.wait_commit(word="，", timeout=3.0)
+    if c_punct is None:
+        check(False, "S6 punct commit row", "no C row (word=，)")
+        return
+    check(c_punct["ref"] == "", "S6 punct commit standalone",
+          "ref=%s code=%s" % (c_punct["ref"], c_punct["code"]))
+    row = type_word_and_wait("fsxd", log)   # 后续词：上文应含「词+标点」
+    if row is None:
+        check(False, "S6 follow-up row", "no event line")
+        return
+    check(ctx_has(row, c_word["word"] + "，"), "S6 doc text has word+punct",
+          "ctx=…%s" % row["ctx"][-15:])
+
+
 def find_office_window(timeout=3.0):
     """按类名找 Office 系前台候选窗口（WPS 文字/演示/表格）。"""
     deadline = time.time() + timeout
@@ -534,13 +602,13 @@ def ime_heal(hwnd, ev_path):
 
 # ── 主流程 ─────────────────────────────────────────────────────
 SCENARIOS = {"s1": s1_base, "s2": s2_backspace, "s3": s3_ctrlz,
-             "s4": s4_click, "s5": s5_paste}
+             "s4": s4_click, "s5": s5_paste, "s6": s6_punct_split}
 
 
 def main():
     global RHY, TAG
     ap = argparse.ArgumentParser()
-    ap.add_argument("-s", "--scenarios", default="s1,s2,s3,s4,s5")
+    ap.add_argument("-s", "--scenarios", default="s1,s2,s3,s4,s5,s6")
     ap.add_argument("--app", default="notepad", choices=["notepad", "wps"])
     ap.add_argument("--rhythm", default="both",
                     choices=["classic", "fast", "slow", "both"],

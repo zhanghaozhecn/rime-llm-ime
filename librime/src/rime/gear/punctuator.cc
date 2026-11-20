@@ -127,6 +127,18 @@ ProcessResult Punctuator::ProcessKeyEvent(const KeyEvent& key_event) {
   if (AlternatePunct(key, punct_definition)) {
     return kAccepted;
   }
+  // [拆分提交]（2026-11-20）: 词 composition + 标点键 → 词先单独提交、
+  // 标点独立成段提交。原路径把标点 PushInput 进同一 composition 一并
+  // Commit，提交码变 "muak,"（词频键脏、llm_filter 的 C 行 ref 断链、
+  // 回撤整提交粒度）。屏幕文本不变：confirm 的是当前高亮候选，标点键
+  // 继续往下在空 composition 上独立成段、独立提交。
+  if (ctx->IsComposing() && !punctuation_is_translated(ctx, "punct")) {
+    auto cand = ctx->composition().back().GetSelectedCandidate();
+    if (cand && cand->type() != "raw") {
+      ctx->ConfirmCurrentSelection();
+      // 落到下方 PushInput：空 composition 上标点独立提交
+    }
+  }
   if (ReconvertDigitSeparatorAsPunct(key) || ctx->PushInput(ch)) {
     if (punctuation_is_translated(ctx, "punct")) {
       ConfirmUniquePunct(punct_definition) ||
