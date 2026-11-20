@@ -883,8 +883,10 @@ static int                       s_seen_gen = -1;  // 上次见到的 reset 代�
 // （2026-11-06 v3 六维联合标定；旧 800 出自 2026-11-02 连续文章重标定）。
 // 累计计数 cum 不衰减（log(cum+1) 融合项）。
 // 文件: RIME 用户目录 user_ledger.tsv（两版共用）
-//   首行 "#tick=N"; 数据行 "s\t词\t码\tdee\ttick\tcum"（码可空）。
-//   行首 s = 行类型（旧账本 u/b 行天然不匹配, 防同形异义误读）。
+//   首行 "#tick=N"; 随后 # 注释行（列含义, 落盘自带）; 数据行
+//   "词\t码\tdee\ttick\tcum"（2026-11-20 去掉行类型列 s——每行省 2 字节,
+//   词必非 ASCII 不会与注释/旧格式混淆; 码可空）。
+//   读取端兼容旧 6 列 s 行（s\t词\t码\tdee\ttick\tcum, 2026-11-20 前）。
 //   修剪: eff<1e-3 且 cum=0 才丢——含中文词条终身保留（旧累计账语义），
 //   全角标点等非中文行随衰减淘汰。
 // 旧两账本读取端一次性迁移（只读, 旧文件保留不删；落盘写新名）:
@@ -1114,11 +1116,13 @@ static void user_stats_ensure_loaded() {
     size_t len = strlen(line);
     while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
       line[--len] = 0;
-    if (strncmp(line, "#tick=", 6) == 0) {
-      tick_hdr = atoll(line + 6);
+    if (line[0] == '#') {
+      // 首行 #tick=N; 其余 # 行 = 列含义注释（2026-11-20 起落盘自带）
+      if (strncmp(line, "#tick=", 6) == 0)
+        tick_hdr = atoll(line + 6);
       continue;
     }
-    // s\t词\t码\tdee\ttick\tcum；只认 s 行（旧账本行类型不同, 防同形误读）
+    // 新: 词\t码\tdee\ttick\tcum; 旧(2026-11-20 前): s\t词\t码\tdee\ttick\tcum
     char *p[6];
     int nf = 0;
     p[nf++] = line;
@@ -1129,13 +1133,19 @@ static void user_stats_ensure_loaded() {
       *t = 0;
       p[nf++] = t + 1;
     }
-    if (nf < 6 || strcmp(p[0], "s") != 0)
+    const char *word, *code, *dee, *tk, *cu;
+    if (nf == 6 && strcmp(p[0], "s") == 0) {  // 旧 s 行
+      word = p[1]; code = p[2]; dee = p[3]; tk = p[4]; cu = p[5];
+    } else if (nf == 5) {  // 2026-11-20 起新格式（词必非 ASCII, 不会撞 s 行）
+      word = p[0]; code = p[1]; dee = p[2]; tk = p[3]; cu = p[4];
+    } else {
       continue;
+    }
     UserStatEntry e;
-    e.dee = atof(p[3]);
-    e.tick = atoll(p[4]);
-    e.cum = atoll(p[5]);
-    g_user_stats[std::string(p[1]) + "\t" + p[2]] = e;
+    e.dee = atof(dee);
+    e.tick = atoll(tk);
+    e.cum = atoll(cu);
+    g_user_stats[std::string(word) + "\t" + code] = e;
     if (e.tick > max_tick)
       max_tick = e.tick;
   }
@@ -1265,6 +1275,11 @@ static void user_stats_save() {
   if (!f)
     return;
   fprintf(f, "#tick=%lld\n", g_user_tick);
+  // 列含义注释（2026-11-20 起每帧自带；读取端跳过一切 # 行）
+  fprintf(f, "#词\t码\t衰减计数dee\t最近提交tick\t累计次数cum\n");
+  fprintf(f, "#码可空（2026-11-21 起简码/顶屏提交也记录完整输入码，空码仅剩"
+             "无 composition 的边缘提交）；dee 每词提交 = 1 + dee·exp(-Δ/400)；"
+             "tick 每词提交 +1；cum 仅中文词递增\n");
   for (auto &kv : g_user_stats) {
     // 落盘修剪：衰减有效计数 <1e-3 且无累计提交的冷词条不写（对融合分
     // 影响 <0.002 nats）——含中文词条 cum>0 终身保留（旧累计账语义），
@@ -1273,16 +1288,18 @@ static void user_stats_save() {
                  exp((double)(kv.second.tick - g_user_tick) / kFreqTau);
     if (eff < 1e-3 && kv.second.cum <= 0)
       continue;
-    fprintf(f, "s\t%s\t%.3f\t%lld\t%lld\n", kv.first.c_str(), kv.second.dee,
+    fprintf(f, "%s\t%.3f\t%lld\t%lld\n", kv.first.c_str(), kv.second.dee,
             kv.second.tick, kv.second.cum);
   }
   fclose(f);
 }
 
 static void user_stats_bump(const std::string &w, const std::string &code) {
-  // 仅计非 ASCII 上屏（>=0x80）：与 Rime userdb "任何词条提交推 tick"
-  // 同源口径——全角标点也计 dee/tick，有意为之（2026-09-03 一字词定案
-  // 的同源原则）；累计计数 cum 仍只对含中文词条递增（标定语义）。
+  // 仅计含中文的上屏（2026-11-20 用户定案：纯标点不入账——标点永不进
+  // 重排窗口，dee 纯浪费且常用标点（，。）持续 bump 永不达修剪线）；连
+  // tick 也不推，更同源 rime userdb "词条提交才推 tick"（旧口径 = 非
+  // ASCII 全入账，2026-09-03 一字词定案）。退款弹栈照常，无账目 →
+  // RF refund=0。cum 只对含中文词条递增（标定语义）。
   bool has_non_ascii = false;
   for (unsigned char ch : w)
     if (ch >= 0x80) {
@@ -1290,6 +1307,8 @@ static void user_stats_bump(const std::string &w, const std::string &code) {
       break;
     }
   if (!has_non_ascii)
+    return;
+  if (!text_has_cjk_utf8(w))
     return;
   std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
   user_stats_ensure_loaded();
@@ -3288,6 +3307,17 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
       has_cjk = true;
       break;
     }
+  // [简码/顶屏码补录]（2026-11-21）: 这类提交不触发重排、无 Collect 快照
+  // （g_last_input 空）。本 sink 从 ConcreteEngine::OnCommit 发出、仍在
+  // Context::Commit 的 Clear() 之前——此刻 context()->input() 即本次提交
+  // 的完整输入码（简码 1-2 码也完整）。纯小写字母才采（标点/ASCII 不采）。
+  if (code.empty() && has_cjk) {
+    const std::string &live = engine_->context()->input();
+    if (!live.empty() && live.size() <= 64 &&
+        live.find_first_not_of("abcdefghijklmnopqrstuvwxyz") ==
+            std::string::npos)
+      code = live;
+  }
   // 账本查询自带懒加载（2026-11-17 合并单账本），无需显式 ensure
   double eff_before = has_cjk ? user_freq_eff(commit_text, code) : 0;
   int dirty_before = g_user_stats_dirty;
