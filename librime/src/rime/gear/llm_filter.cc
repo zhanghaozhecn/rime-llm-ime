@@ -152,6 +152,8 @@ static int g_n_threads = 4;        // default = GGML_DEFAULT_N_THREADS; override
 static void log_msg(const char *fmt, ...);    // defined below (fwd decl)
 static void log_error(const char *fmt, ...);  // defined below (fwd decl)
 static void write_m(const char *reason);      // defined below (fwd decl)
+static void commit_stack_refund_or_clear(const char *reason);  // fwd decl
+                                                              // (回撤退款)
 static std::vector<llama_token> tokenize(const char *text);  // fwd decl
 static double cross_entropy(const float *logits, int vs, int target_id);  // fwd decl
 
@@ -794,6 +796,7 @@ static void llm_context_reset_hook(void*, const char* reason) {
   comctx::invalidate();
   comctx::kick();
   write_m(reason);  // 常开语料 M 事件 + 按需 debug R 行
+  commit_stack_refund_or_clear(reason);  // 回撤退款/边界清栈
 }
 #endif
 
@@ -895,11 +898,24 @@ struct UserStatEntry {
   double dee = 0;        // 衰减计数 (formula_d 的 dee)
   long long tick = 0;    // 最后提交 tick
   long long cum = 0;     // 累计提交次数 (原始计数不衰减; 含中文词条)
+  // [回撤退款]（2026-11-20）bump 前快照浅栈（cap 4）——formula_d 递推
+  // 确定性，恢复前像即精确退款；栈只在内存，跨重启为空则不退（回退现
+  // 行为）。
+  struct Snap {
+    long long tick = 0;  // 该次 bump 的 tick（与 C 行 tick 对账）
+    double dee = 0;      // bump 前 dee
+    long long t = 0;     // bump 前 tick
+    long long cum = 0;   // bump 前 cum
+  };
+  std::vector<Snap> hist;
 };
 static std::map<std::string, UserStatEntry> g_user_stats;
 static long long g_user_tick = 0;
 static bool g_user_stats_loaded = false;
 static int  g_user_stats_dirty = 0;
+// [回撤退款] 引擎线程 bump/查询 × server IPC 线程退款（reset hook）→
+// 账本统一互斥（recursive：bump→ensure_loaded/save 嵌套加锁）。
+static std::recursive_mutex g_ledger_mu;
 static constexpr double kFreqTau = 400.0;  // rime formula_d 时间常数 (v3 2026-11-06 六维联合标定; 旧 800 出自 2026-11-02)
 
 // 日志轮转（2026-09-04）：超过 limit 改名 .old（单文件轮转）防无限增长；
@@ -1078,6 +1094,7 @@ static void user_stats_load_legacy_uni() {
 }
 
 static void user_stats_ensure_loaded() {
+  std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
   if (g_user_stats_loaded)
     return;
   g_user_stats_loaded = true;
@@ -1131,6 +1148,7 @@ static void user_stats_ensure_loaded() {
 
 // 衰减有效计数 (融合用): rime formula_d 查询式（词码对）
 static double user_freq_eff(const std::string &w, const std::string &code) {
+  std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
   user_stats_ensure_loaded();
   auto it = g_user_stats.find(w + "\t" + code);
   if (it == g_user_stats.end() || it->second.dee <= 0)
@@ -1145,6 +1163,7 @@ static double user_freq_eff(const std::string &w, const std::string &code) {
 // 累计计数与衰减计数同存 user_ledger.tsv 的 cum 列（2026-11-17 合并）；
 // n_seen 连记录一并取消（不参与打分, 无消费方）。
 static double user_unigram_term(const std::string &x, const std::string &code) {
+  std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
   user_stats_ensure_loaded();
   auto it = g_user_stats.find(x + "\t" + code);
   long long cum = it == g_user_stats.end() ? 0 : it->second.cum;
@@ -1153,6 +1172,7 @@ static double user_unigram_term(const std::string &x, const std::string &code) {
 
 // 累计 unigram 原始计数（调试窗口"累计频"列 / pairfix fade 门用）
 static long long user_uni_count(const std::string &x, const std::string &code) {
+  std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
   user_stats_ensure_loaded();
   auto it = g_user_stats.find(x + "\t" + code);
   return it == g_user_stats.end() ? 0 : it->second.cum;
@@ -1237,6 +1257,7 @@ static double pairfix_delta(const std::map<std::string, double> &tbl,
 }
 
 static void user_stats_save() {
+  std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
   char path[MAX_PATH];
   if (!user_ledger_file(path, sizeof(path)))
     return;
@@ -1270,9 +1291,14 @@ static void user_stats_bump(const std::string &w, const std::string &code) {
     }
   if (!has_non_ascii)
     return;
+  std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
   user_stats_ensure_loaded();
   ++g_user_tick;
   UserStatEntry &e = g_user_stats[w + "\t" + code];
+  // [回撤退款] bump 前快照进浅撤销栈（cap 4，回撤环总在近处）
+  e.hist.push_back({g_user_tick, e.dee, e.tick, e.cum});
+  if (e.hist.size() > 4)
+    e.hist.erase(e.hist.begin());
   e.dee = 1 + e.dee * exp((double)(e.tick - g_user_tick) / kFreqTau);
   e.tick = g_user_tick;
   if (text_has_cjk_utf8(w))
@@ -1281,6 +1307,30 @@ static void user_stats_bump(const std::string &w, const std::string &code) {
     user_stats_save();
     g_user_stats_dirty = 0;
   }
+}
+
+// [回撤退款]（2026-11-20）: 提交被回撤（M backspace/delete/undo）→ 撤销
+// 该次 bump。按条目撤销栈顶 tick 匹配提交 tick → 恢复 bump 前像（d/t/c
+// 精确还原）；栈空（跨重启）/tick 不配 → 不退（回退现行为）。退款立即
+// 落盘（悬在内存被杀进程吞掉就白退）；cum=0 的错词由既有修剪规则自然
+// 淘汰。server IPC 线程调用（reset hook），与引擎线程 bump/查询互斥。
+static bool user_stats_refund(const std::string &w, const std::string &code,
+                              long long tick) {
+  std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);
+  user_stats_ensure_loaded();
+  auto it = g_user_stats.find(w + "\t" + code);
+  if (it == g_user_stats.end() || it->second.hist.empty())
+    return false;
+  UserStatEntry::Snap s = it->second.hist.back();
+  if (s.tick != tick)
+    return false;
+  it->second.hist.pop_back();
+  it->second.dee = s.dee;
+  it->second.tick = s.t;
+  it->second.cum = s.cum;
+  user_stats_save();
+  g_user_stats_dirty = 0;
+  return true;
 }
 
 // 最近一次候选窗的输入码（词码对记账 OnCommit 用; engine thread 写读）
@@ -1316,6 +1366,35 @@ struct LastWindow {
   long long tick = 0;
 };
 static LastWindow g_last_window;  // engine thread only (Apply/Collect/OnCommit)
+
+// [回撤退款]（2026-11-20）提交栈（cap 8）: OnCommit（引擎线程）压入，
+// reset hook（server IPC 线程）在 backspace/delete/undo 时弹出退款；
+// navigation/enter/focus 边界清栈——与语料 strict 弹栈口径逐字对齐。
+struct CommitRec {
+  std::string word;
+  std::string code;
+  long long tick = 0;
+  std::string cid;
+};
+static std::mutex g_commit_mu;
+static std::vector<CommitRec> g_commit_stack;
+static void commit_stack_push(const std::string &word,
+                              const std::string &code, long long tick,
+                              const std::string &cid) {
+  std::lock_guard<std::mutex> lk(g_commit_mu);
+  CommitRec rec;
+  rec.word = word;
+  rec.code = code;
+  rec.tick = tick;
+  rec.cid = cid;
+  g_commit_stack.push_back(rec);
+  if (g_commit_stack.size() > 8)
+    g_commit_stack.erase(g_commit_stack.begin());
+}
+static void commit_stack_clear() {
+  std::lock_guard<std::mutex> lk(g_commit_mu);
+  g_commit_stack.clear();
+}
 
 static bool log_file_path(const char *filename, char *path, size_t n) {
   const RimeApi *api = rime_get_api();
@@ -1646,6 +1725,33 @@ static void write_m(const char *reason) {
   if (api && api->context_reset_generation)
     gen = api->context_reset_generation();
   debug_write_raw(id + "|R|gen=" + std::to_string(gen), false);
+}
+
+// [回撤退款] reset hook 调用（server IPC 线程）: backspace/delete/undo 弹
+// 最近提交退款（RF debug 行只记 id+tick，词/码在 cid 关联的 C 行里）；
+// navigation/enter/focus 边界清栈；未映射原因保守不动栈。
+static void commit_stack_refund_or_clear(const char *reason) {
+  const char *kind = reset_kind(reason);
+  bool retract = !strcmp(kind, "backspace") || !strcmp(kind, "delete") ||
+                 !strcmp(kind, "undo-clipboard");
+  if (!retract) {
+    if (!strcmp(kind, "unknown"))
+      return;
+    commit_stack_clear();
+    return;
+  }
+  CommitRec rec;
+  {
+    std::lock_guard<std::mutex> lk(g_commit_mu);
+    if (g_commit_stack.empty())
+      return;
+    rec = g_commit_stack.back();
+    g_commit_stack.pop_back();
+  }
+  bool ok = user_stats_refund(rec.word, rec.code, rec.tick);
+  debug_write_raw(rec.cid + "|RF|refund=" + (ok ? "1" : "0") +
+                      "|tick=" + std::to_string(rec.tick),
+                  false);
 }
 
 static void write_h(const std::string &schema, const std::string &model) {
@@ -3190,6 +3296,7 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
   long long tick_after = g_user_tick;
   // 常开语料 C 事件（提交词/码/名次；ref 指向同码 W）
   std::string cid = write_c(commit_text, code, tick_after, has_cjk);
+  commit_stack_push(commit_text, code, tick_after, cid);  // 回撤退款
   if (g_debug_fusion && has_cjk) {
     debug_write_e(cid, eff_before, eff_after, dirty_before);
     // 实时调试 E 行（2026-11-10）：commit 落账（eff/tick 前后值）
