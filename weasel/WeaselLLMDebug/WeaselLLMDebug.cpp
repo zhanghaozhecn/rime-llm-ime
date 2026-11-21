@@ -290,7 +290,7 @@ static std::wstring corr_suffix(double sd) {
 // 每列分两组——分数（等号左）与计算过程里的量，分别量宽。
 struct ColW {
   int ce_l, ce_c;  // CE 列：分数（含折叠的修正，2026-11-21 v7）/ 三分量
-  int fb_l, fb_e;  // 衰减词频分列：分数 / eff（2 位小数）
+  int fb_l, fb_e;  // 衰减词频分列：分数 / eff（均 1 位小数）
   int u1_l, uni;   // 累计词频列：分数 / 累计次数（整数）
   int fu_l;        // 总分列：纯分值（修正分无专属列，2026-11-21 v7）
 };
@@ -321,14 +321,16 @@ static void measure_widths(const Inv &inv, ColW &w) {
 // CE 格：加权 CE 与三分量 + 词码对修正折叠（2026-11-21 用户定案 v7：
 // 修正分专属列删除——对几乎所有候选恒为 0 的独立列无观察价值；命中时
 // 把修正值折进 CE 数值本身并在公式右侧追修正项，如
-//   -34.7=-(14.0+1.10·10.1+0.60·7.6)-5.0
+//   -34.7 = -(14.0 + 1.1·10.1 + 0.6·7.6) - 5.0
 // 修正为 0 不追加任何显示。发送端 CE 与修正仍分离（sdelta 照发），仅
 // 显示端折叠。验算式 = 总分 = CE格(含修正) + 衰减词频分 + 累计词频分。
 // 无 CE 分（尾窗/无法表示）→ 格保持 "—"（修正项只随融合分隐含）。
+// 公式排版（2026-11-21 用户定案）：'=' 与 '+' 两边各留一个空格。
 // 生产语义 = ce = -(Σ kCeW·分量)（分量是原始交叉熵、正值；分值取负号
 // 进融合），故等号右为带负号的括号和。ce2/ce3 带 kCeW 权重前缀
-// （1.10/0.60 = librime 标定内置常数，原样显示；2026-11-14 随默认模型
-// 0.5B 重标定，旧 1.05/0.45 为 0.8B v3 值）；ce1 权重恒 1 → 前缀不显示
+// （系数 = librime 标定内置常数 1.10/0.60，显示 1.1/0.6——第二位小数
+// 不显示，与数据 1 位小数一致；2026-11-14 随默认模型 0.5B 重标定，
+// 旧 1.05/0.45 为 0.8B v3 值）；ce1 权重恒 1 → 前缀不显示
 // （2026-11-12 用户定案）；分量缺（无分/未参与）的项整项省略。
 static std::wstring ce_proc(const Row &r, int wl, int wc) {
   double ce, sd = 0.0;
@@ -336,17 +338,18 @@ static std::wstring ce_proc(const Row &r, int wl, int wc) {
   if (!num_of(r.ce, ce)) return L"—";
   if (has_sd && sd != 0.0) ce += sd;
   std::wstring tail = has_sd ? corr_suffix(sd) : L"";
+  std::wstring stail = tail.empty() ? L"" : L" " + tail;  // 修正项前空一格
   std::wstring lead = padl(f1(ce), wl);
-  std::wstring t = lead + L"=-(";
+  std::wstring t = lead + L" = -(";
   bool any = false;
   const struct {
     const wchar_t *w;  // nullptr = 权重恒 1，不显前缀
     const std::wstring *raw;
-  } t3[3] = {{nullptr, &r.ce1}, {L"1.10", &r.ce2}, {L"0.60", &r.ce3}};
+  } t3[3] = {{nullptr, &r.ce1}, {L"1.1", &r.ce2}, {L"0.6", &r.ce3}};
   for (auto &x : t3) {
     double v;
     if (!num_of(*x.raw, v)) continue;
-    if (any) t += L"+";
+    if (any) t += L" + ";
     if (x.w) {
       wchar_t b[48];
       swprintf(b, 48, L"%s·", x.w);
@@ -355,8 +358,8 @@ static std::wstring ce_proc(const Row &r, int wl, int wc) {
     t += padl(f1(v), wc);
     any = true;
   }
-  if (!any) return lead + tail;  // 旧协议无分量 → 只显分数(+修正)
-  return t + L")" + tail;
+  if (!any) return lead + stail;  // 旧协议无分量 → 只显分数(+修正)
+  return t + L")" + stail;
 }
 
 // 衰减词频分格：β·log1p(eff)，β=14 内置常数
@@ -366,7 +369,7 @@ static std::wstring fb_proc(const Row &r, int wl, int we) {
   if (!num_of(r.fb, fb)) return L"—";
   std::wstring lead = padl(f1(fb), wl);
   if (!num_of(r.eff, eff)) return lead;
-  return lead + L"=14·log1p(" + padl(f1(eff), we) + L")";
+  return lead + L" = 14·log1p(" + padl(f1(eff), we) + L")";
 }
 
 // 累计词频格：log1p(uni)（2026-11-11 公式简化，分母为窗内常数已去除；
@@ -378,7 +381,7 @@ static std::wstring u1_proc(const Row &r, int wl, int wu) {
   if (!num_of(r.uni, uni)) return lead;
   wchar_t ub[16], b[48];
   swprintf(ub, 16, L"%d", (int)uni);
-  swprintf(b, 48, L"=log1p(%s)", padl(ub, wu).c_str());
+  swprintf(b, 48, L" = log1p(%s)", padl(ub, wu).c_str());
   return lead + b;
 }
 
@@ -734,7 +737,7 @@ static void make_ui() {
   ListView_SetExtendedListViewStyle(
       h_grid, LVS_EX_FULLROWSELECT | LVS_EX_LABELTIP | LVS_EX_DOUBLEBUFFER);
   // 分数部分四列（2026-11-11 用户定案"分数=计算过程"）：CE / 衰减词频分 /
-  // 累计词频 / 总分，格内 = 得分 + '=' + 具体计算（成分统一 3 位小数，
+  // 累计词频 / 总分，格内 = 得分 + '=' + 具体计算（成分统一 1 位小数，
   // 等宽字体逐位对齐），底部公式行随之删除；身份列 = #/词。
   // 「窗」「匹配词长」列均已删（2026-11-16 用户定案：窗内/尾窗灰字区分、
   // 满长准入优先下"有无 CE 分"即满长标志——列冗余）；
@@ -743,12 +746,15 @@ static void make_ui() {
   // 列宽按 GDI 实测取（TextRenderer：数字 ~7px/字符，'·' 字体链接后
   // 14px 全角——比 WinForms 宽一倍），含 3 位整数的最坏情况余量。
   // 词 100 = token 段显带 '/'（4 token 词 4×12+3×7+边距 ≈ 77，容 5 段）；
-  // CE 352 = 原 310 + 公式尾修正项（-5.0 ≈ 4 字符）余量。
+  // 2026-11-21 公式空格（'='、'+' 两边各一空格）列宽重分配（合计 878 < 888
+  // Studio 右列网格宽）：CE 380 = 352 + 空格余量 − 挪给分式列的 12；
+  // 衰减词频分 168 = 140 + 空格 2 字符（真机实测 "=14·log1p(…)" 被截成 …）；
+  // 累计词频分 140 = 112 + 容 5 位数累计次数（"1.1 = log1p(12345)"）。
   // 插入循环上界按数组长度推导——曾把循环写死 i<10 而 11 列，第 11 列
   // 从未创建（表现为"最后一列消失"，2026-11-11 踩过）
   struct { const wchar_t *t; int w; } cols[] = {
-      {L"#", 26}, {L"词", 100}, {L"总分", 64}, {L"CE", 352},
-      {L"衰减词频分", 140}, {L"累计词频分", 112}};  // 总分 64 = 纯分值
+      {L"#", 26}, {L"词", 100}, {L"总分", 64}, {L"CE", 380},
+      {L"衰减词频分", 168}, {L"累计词频分", 140}};  // 总分 64 = 纯分值
   LVCOLUMNW col = {};
   col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
   for (int i = 0; i < (int)(sizeof(cols) / sizeof(cols[0])); i++) {
