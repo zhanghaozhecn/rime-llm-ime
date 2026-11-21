@@ -2517,7 +2517,9 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
         ce_sum[ci] = -1e10;
       if (ce3_out)
         for (int ci : idx2) (*ce3_out)[ci] = {NAN, NAN, NAN};
-      log_msg("WARN: step2 decode failed");
+      // B7（2026-11-21）：改 log_error（force 写 X 行）——原 log_msg 被
+      // debug_fusion 门控，debug 关时推理失败零痕迹，用户无从排查
+      log_error("step2 decode failed");
       // 失败自愈：prep 命中路径无 memory_clear，decode 失败多为 KV 耗尽
       // （见下方 worker 清理说明）——置无效强制下次 score 走全流程重建
       g_prep_ready = false;
@@ -2581,7 +2583,8 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
       if (ce3_out)
         for (auto &r : rows3)
           for (int ci : r.cands) (*ce3_out)[ci] = {NAN, NAN, NAN};
-      log_msg("WARN: step3 decode failed");
+      // B7（2026-11-21）：同 step2——失败日志改 force（X|scope=error）
+      log_error("step3 decode failed");
       g_prep_ready = false;  // 同 Step2：失败自愈
     }
     llama_batch_free(b3);

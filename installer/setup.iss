@@ -149,6 +149,16 @@ begin
   Result := not FreshInstall;
 end;
 
+// B3（2026-11-21）：全新安装默认勾选完成页的「打开 LLM 设置+调试」——装完直接
+// 看到界面（模型缺失态的状态行自带"① 下载模型 → ② 选方案 → ③ 保存并生效"指引，
+// 新用户不再卡在"找不到入口"）。升级安装保持默认不勾：已有配置，不必每次升级弹界面
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpFinished) and FreshInstall and
+     (WizardForm.RunList <> nil) and (WizardForm.RunList.Items.Count > 0) then
+    WizardForm.RunList.Checked[0] := True;
+end;
+
 procedure KillServer();
 var
   ec: Integer;

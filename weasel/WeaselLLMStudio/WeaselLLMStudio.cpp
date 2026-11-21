@@ -444,27 +444,54 @@ static void scan_models(HWND combo) {
 // （2026-10-01：小于完整体量的文件不再显示成"已就绪"——半截模型会让重排
 //   静默失效且用户找不到原因）
 static const unsigned long long kModelMinBytes = 100ULL * 1024 * 1024;
+// A4（2026-11-21）：默认模型**精确体量** 396,704,640 B（实测）——下载转正与
+// "已存在跳过"判据从 ≥100MB 收紧为精确值，100~396MB 的半截下载不再溜进生产；
+// 精确判据只约束默认模型名（自定义模型仍走 100MB 下限）
+static const unsigned long long kModelExpectedBytes = 396704640ULL;
+// MB 显示口径统一为十进制（与插件版 [Math]::Round(len/1e6) 同值；README"约 397 MB"
+// 也是十进制——旧的 sz>>20 是 MiB，同一文件两版会显示 378/397 两个数）
+static unsigned long long mb_of(unsigned long long bytes) {
+  return (bytes + 500000) / 1000000;
+}
+static bool is_default_model_name(const std::wstring& path) {
+  size_t p = path.find_last_of(L"\\/");
+  std::wstring name = (p == std::wstring::npos) ? path : path.substr(p + 1);
+  return _wcsicmp(name.c_str(), L"Qwen3-0.6B-Base-Q4_K_M.gguf") == 0;
+}
+// 模型完整性判定：0=missing / 1=suspect / 2=ok（GUI 状态行 / 保存拦截 / 下载确认
+// / 下载动作共用这一个口径；与插件版 Get-ModelState 同语义）
+static int model_state(const std::wstring& path) {
+  unsigned long long sz = 0;
+  if (!file_size(path, &sz)) return 0;
+  if (is_default_model_name(path) && sz < kModelExpectedBytes) return 1;
+  if (sz < kModelMinBytes) return 1;
+  return 2;
+}
 static void refresh_model_status() {
   wchar_t buf[512];
   GetDlgItemTextW(g_hwnd, IDC_MODEL, buf, 512);
+  std::wstring p = buf;
   unsigned long long sz = 0;
-  if (buf[0] && file_size(buf, &sz)) {
-    if (sz >= kModelMinBytes) {
-      set_status(GetDlgItem(g_hwnd, IDC_MSTATUS), L"模型已就绪：%llu MB", sz >> 20);
-      set_status(GetDlgItem(g_hwnd, IDC_MSTATUS_HINT), L"");
-    } else {
+  if (!p.empty() && file_size(p, &sz)) {
+    if (model_state(p) == 1) {
       // 文案长度受 ts(140) 主状态 + ts(404) 提示的**可见宽度**约束（2026-10-09 实测：
       // 长文案会被静态控件直接截断，末尾看不见）——改文案请先量宽：
-      // 「模型可疑：仅 99 MB」130px@14px ✓（可疑分支体积 <100MB，最多两位数）
-      set_status(GetDlgItem(g_hwnd, IDC_MSTATUS), L"模型可疑：仅 %llu MB", sz >> 20);
+      // 「模型可疑：仅 99 MB」130px@14px ✓
+      set_status(GetDlgItem(g_hwnd, IDC_MSTATUS), L"模型可疑：仅 %llu MB", mb_of(sz));
       set_status(GetDlgItem(g_hwnd, IDC_MSTATUS_HINT),
-                 L"疑似未下完或损坏——点“下载模型”重下，或点“浏览…”换一个");
+                 is_default_model_name(p)
+                     ? L"应为 397 MB（疑似未下完）——点“下载模型”续传/重下"
+                     : L"疑似未下完或损坏——点“下载模型”重下，或点“浏览…”换一个");
+    } else {
+      set_status(GetDlgItem(g_hwnd, IDC_MSTATUS), L"模型已就绪：%llu MB", mb_of(sz));
+      set_status(GetDlgItem(g_hwnd, IDC_MSTATUS_HINT), L"");
     }
   } else {
-    // 拆两行：主状态（正文）+ 后续操作（灰色小字）——一行放不下会被截断
+    // 拆两行：主状态（正文）+ 后续操作（灰色小字）——一行放不下会被截断。
+    // B3（2026-11-21）：缺失态提示补"下一步"链（与插件版同款指引）
     set_status(GetDlgItem(g_hwnd, IDC_MSTATUS), L"模型文件不存在");
     set_status(GetDlgItem(g_hwnd, IDC_MSTATUS_HINT),
-               L"点“下载模型”下载（可续传），或点“浏览…”选已有的 .gguf");
+               L"点“下载模型”或“浏览…”选模型，再点“保存并生效”启用重排");
   }
 }
 
@@ -643,10 +670,13 @@ static bool schema_needs_rebuild(const std::vector<std::string>& lines, wchar_t*
 
 // 触发重新部署：WeaselRoot 注册表定位 WeaselDeployer，15s 有界等待
 //（deployer 曾在 EndMaintenance 管道应答中挂死——超时留后台不杀）；
-// /deploy 静默部署不弹任何窗口（同插件版 Invoke-Redeploy 口径）
-static void trigger_redeploy() {
+// /deploy 静默部署不弹任何窗口（同插件版 Invoke-Redeploy 口径）。
+// A2（2026-11-21）：返回部署状态——0=ok（15s 内退出）/ 1=background（超时仍在
+// 后台）/ 2=manual（未定位到 Deployer）/ 3=failed（CreateProcess 失败）/ -1=测试
+// 跳过。此前部署成功零信号，保存流程无从给"部署完成"反馈
+static int trigger_redeploy() {
   // 测试开关：静默跳过（结果状态行不被覆盖）
-  if (GetEnvironmentVariableW(L"WEASEL_LLM_SETUP_NO_REDEPLOY", NULL, 0)) return;
+  if (GetEnvironmentVariableW(L"WEASEL_LLM_SETUP_NO_REDEPLOY", NULL, 0)) return -1;
   wchar_t root[MAX_PATH] = L"";
   DWORD sz = sizeof(root);
   if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Rime\\Weasel", L"WeaselRoot",
@@ -660,7 +690,7 @@ static void trigger_redeploy() {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
                L"[提示] 未定位到 WeaselDeployer，请手动：托盘小狼毫 → 重新部署");
     log_error(L"[部署] 未定位到 WeaselDeployer（WeaselRoot=%s）", root);
-    return;
+    return 2;
   }
   STARTUPINFOW si = {sizeof(si)};
   PROCESS_INFORMATION pi;
@@ -669,19 +699,22 @@ static void trigger_redeploy() {
   // 两个弹窗）；/deploy = 静默 UpdateWorkspace。路径加引号防空格逐词试探。
   wchar_t cmd[MAX_PATH + 32] = L"";
   wcscpy_s(cmd, (L"\"" + deployer + L"\" /deploy").c_str());
-  if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-    CloseHandle(pi.hThread);
-    if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_TIMEOUT) {
-      set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
-                 L"重新部署仍在后台进行；若候选异常请托盘手动重新部署");
-      log_error(L"[部署] WeaselDeployer 15s 未退出（仍在后台）");
-    }
-    CloseHandle(pi.hProcess);
-  } else {
+  if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
     set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
                L"[提示] 自动重新部署失败，请手动：托盘小狼毫 → 重新部署");
     log_error(L"[部署] CreateProcess 失败：%s", deployer.c_str());
+    return 3;
   }
+  CloseHandle(pi.hThread);
+  if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_TIMEOUT) {
+    set_status(GetDlgItem(g_hwnd, IDC_SCHEMSTAT),
+               L"重新部署仍在后台进行；若候选异常请托盘手动重新部署");
+    log_error(L"[部署] WeaselDeployer 15s 未退出（仍在后台）");
+    CloseHandle(pi.hProcess);
+    return 1;
+  }
+  CloseHandle(pi.hProcess);
+  return 0;
 }
 
 // ── 程序文件夹（预装数据）里的方案 ──────────────────────────────
@@ -950,6 +983,32 @@ static void save_schema_params() {
   // 保存 = 自适应（2026-10-01 用户定案，替代原「接入 LLM」+「保存」两按钮）：
   //   缺节 / 缺本版组件行 / 残留另一版组件行 → 重建接入（剥净 + 插组件 + 按界面值写节）
   //   否则                                    → 只重写节
+  // ④ A1（2026-11-21）：启用重排但模型文件缺失/可疑 → 保存前先确认。此前照样
+  //    显示成功、重排静默不生效，是"装了没效果"的头号来源（插件版同款拦截，
+  //    与插件版 Get-ModelState 同一口径）
+  if (g_p.enabled) {
+    std::wstring mp = g_p.model_path.empty() ? default_model_path() : g_p.model_path;
+    wchar_t why2[640] = L"";
+    unsigned long long msz = 0;
+    bool bad = false;
+    if (!file_size(mp, &msz)) {
+      bad = true;
+      swprintf_s(why2, L"模型文件不存在：%s", mp.c_str());
+    } else if (model_state(mp) == 1) {
+      bad = true;
+      swprintf_s(why2, L"模型文件可疑（%llu MB，完整应为 397 MB）：%s", mb_of(msz),
+                 mp.c_str());
+    }
+    if (bad) {
+      wchar_t q[768];
+      swprintf_s(q, L"%s\n\n启用重排将不会生效（打字保持引擎原序）。仍要保存吗？", why2);
+      if (MessageBoxW(g_hwnd, q, L"模型未就绪", MB_YESNO | MB_ICONWARNING) != IDYES) {
+        set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+                   L"已取消保存——先点“下载模型”或“浏览…”就位模型，再保存");
+        return;
+      }
+    }
+  }
   wchar_t why[128] = L"";
   bool need_rebuild = schema_needs_rebuild(lines, why);
   if (need_rebuild) {
@@ -979,7 +1038,11 @@ static void save_schema_params() {
   load_schema_params();   // 回读：方案接入组状态行从"未接入"变"已加载"，界面与磁盘一致
   set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"正在重新部署…");
   refresh_model_status();  // 模型路径可能刚改
-  trigger_redeploy();
+  // A2（2026-11-21）：部署结果按结构化状态反馈——此前部署成功零信号（只有超时/
+  // 失败有提示），用户不知道何时可以打字验证
+  DWORD rd_t0 = GetTickCount();
+  int rd = trigger_redeploy();
+  DWORD rd_secs = (GetTickCount() - rd_t0) / 1000;
   const wchar_t* act = need_rebuild ? L"已接入并保存" : L"已保存";
   wchar_t note[256] = L"";
   if (copied && need_rebuild)
@@ -988,8 +1051,19 @@ static void save_schema_params() {
     swprintf_s(note, L"（原为程序文件夹预装方案，已复制到用户文件夹）");
   else if (need_rebuild)
     swprintf_s(note, L"（补齐了组件行：%s）", why);
-  set_status(GetDlgItem(g_hwnd, IDC_STATUS),
-             L"%s %s%s 并触发重新部署——部署完成后参数生效", act, base_name(path), note);
+  wchar_t fin[640];
+  if (rd == 0)
+    swprintf_s(fin, L"%s %s%s，部署完成（%lu 秒）——可以打字验证了", act,
+               base_name(path), note, (unsigned long)rd_secs);
+  else if (rd == 1)
+    swprintf_s(fin, L"%s %s%s；部署仍在后台进行（通常 1 分钟内生效）——若长时间无效请托盘手动重新部署",
+               act, base_name(path), note);
+  else if (rd == 2 || rd == 3)
+    swprintf_s(fin, L"%s%s；自动重新部署未完成——请手动重新部署：托盘小狼毫 → 重新部署",
+               act, note);
+  else
+    swprintf_s(fin, L"%s %s%s（测试模式：未重新部署）", act, base_name(path), note);
+  set_status(GetDlgItem(g_hwnd, IDC_STATUS), fin);
 }
 
 // on_schema_add 已删除（2026-10-01 用户定案：并入『保存并生效』的自适应重建，
@@ -1239,7 +1313,9 @@ static const wchar_t* const TIP_TCS =
     L"一般字词方案保持关闭。取代原预期词长权重 elw（2026-11-07）。";
 static const wchar_t* const TIP_DEBUG =
     L"诊断日志：开启后每次重排都往用户文件夹的 llm_rerank 子目录写\n"
-    L"rime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。";
+    L"rime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。\n"
+    L"实时调试窗口：插件版随『复制文件』装到 Rime 用户文件夹\n"
+    L"llm_rerank\\viewer\\open_debug_window.bat；源码版走托盘「LLM 设置+调试」。";
 static const wchar_t* const TIP_SAVE =
     L"把上面的参数写进选中方案文件的 llm_rerank 配置节（键名与该节里相同），\n"
     L"随后自动触发重新部署——部署完成即生效（配置在方案里，不再有全局文件）。\n"
@@ -1725,22 +1801,30 @@ static void download_finish(bool ok, DWORD code) {
   KillTimer(g_hwnd, DL_TIMER_ID);
   if (!g_dl_tmp.empty()) DeleteFileW((g_dl_tmp + L".pid").c_str());
   if (ok) {
-    // >100MB 才认（与插件版同一判据）：避免把错误页面/半截文件当模型转正
+    // A4（2026-11-21）：转正判据 = 精确字节 kModelExpectedBytes。curl 成功但体量
+    // 不符（截断/服务端变更）→ 不转正、保留分片提示续传——此前 >100MB 即转正，
+    // 半截模型直接溜进生产
     unsigned long long sz = file_size_ull(g_dl_tmp);
-    if (sz > 100ULL * 1024 * 1024 && MoveFileExW(g_dl_tmp.c_str(), g_dl_target.c_str(),
-                                                MOVEFILE_REPLACE_EXISTING)) {
+    if (sz != kModelExpectedBytes) {
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+                 L"[失败] 下载体量不符（%llu MB，应为 397 MB）——分片已保留，再点可续传",
+                 mb_of(sz));
+      log_error(L"[下载] 体量不符：%s（%llu 字节，应为 %llu）", g_dl_tmp.c_str(), sz,
+                kModelExpectedBytes);
+    } else if (!MoveFileExW(g_dl_tmp.c_str(), g_dl_target.c_str(),
+                            MOVEFILE_REPLACE_EXISTING)) {
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+                 L"[失败] 分片转正失败（可能被占用），分片保留可重试");
+      log_error(L"[下载] 转正失败：%s", g_dl_target.c_str());
+    } else {
       if (g_dl_fill) {   // 空框点的下载：把实际落点（默认路径）填回框里再刷状态
         SetDlgItemTextW(g_hwnd, IDC_MODEL, g_dl_target.c_str());
         g_dl_fill = false;
       }
-      set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"模型下载完成（%llu MB）→ %s",
-                 sz >> 20, g_dl_target.c_str());
-      log_error(L"[下载] 完成：%s（%llu MB）", g_dl_target.c_str(), sz >> 20);
-    } else {
+      // B2（2026-11-21）：完成文案补"下一步"（与插件版逐字同文）
       set_status(GetDlgItem(g_hwnd, IDC_STATUS),
-                 L"[失败] 下载内容异常（%llu MB）或转正失败，分片保留可重试续传",
-                 sz >> 20);
-      log_error(L"[下载] 内容异常或转正失败：%s（%llu 字节）", g_dl_tmp.c_str(), sz);
+                 L"模型下载完成——接着选方案、点『保存并生效』启用重排");
+      log_error(L"[下载] 完成：%s（%llu 字节）", g_dl_target.c_str(), sz);
     }
   } else {
     set_status(GetDlgItem(g_hwnd, IDC_STATUS),
@@ -1773,20 +1857,25 @@ static void on_download_model() {
     if (*c == L'/') *c = L'\\';
   unsigned long long exist = 0;
   if (file_size(target, &exist)) {
-    if (exist >= kModelMinBytes) {
+    if (model_state(target) == 2) {
       if (g_dl_fill) {   // 空框点下载 + 默认位已有完整模型 = 同样把路径填回框
         SetDlgItemTextW(g_hwnd, IDC_MODEL, target.c_str());
         refresh_model_status();   // 模型状态区跟着从"不存在"翻到"已就绪"
         g_dl_fill = false;
       }
       set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"模型已存在（%llu MB），无需下载：%s",
-                 exist >> 20, target.c_str());
+                 mb_of(exist), target.c_str());
       return;
     }
-    // ① 小于完整体量 = 疑似半截/损坏：不再当成"已存在"跳过，确认后删除重下
+    // ① 不完整文件不再被当成"已存在"跳过（A4 2026-11-21：默认名体量不符同样拦，
+    //    100~396MB 的半截此前 ≥100MB 就跳过）：确认后删除重下
     wchar_t q[768];
-    swprintf_s(q, L"目标路径已有文件，但只有 %llu MB（疑似未下完或损坏）：\n%s\n\n"
-                  L"删除它并重新下载？", exist >> 20, target.c_str());
+    if (is_default_model_name(target))
+      swprintf_s(q, L"目标路径已有模型文件但体量不符（%llu MB，完整模型应为 397 MB）：\n%s\n\n"
+                    L"删除它并重新下载？", mb_of(exist), target.c_str());
+    else
+      swprintf_s(q, L"目标路径已有模型文件但只有 %llu MB（疑似未下完或损坏）：\n%s\n\n"
+                    L"删除它并重新下载？", mb_of(exist), target.c_str());
     if (MessageBoxW(g_hwnd, q, L"模型文件可疑", MB_YESNO | MB_ICONWARNING) != IDYES) {
       set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已取消下载（保留现有文件）");
       return;
@@ -1837,8 +1926,11 @@ static void on_download_tick() {
     download_finish(code == 0, code);
     return;
   }
-  set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"下载中… %llu MB（目标 %s，约 508 MB）",
-             file_size_ull(g_dl_tmp) >> 20, g_dl_target.c_str());
+  unsigned long long got = file_size_ull(g_dl_tmp);
+  int pct = (int)((got * 100) / kModelExpectedBytes);
+  if (pct > 99) pct = 99;
+  set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"下载中… %llu MB / 397 MB（%d%%）——目标 %s",
+             mb_of(got), pct, g_dl_target.c_str());
 }
 
 // ── 线程数实测（2026-10-01 用户定案：起点 4 / 终点 8；2026-11-19 口径改 t_cand）
@@ -2137,6 +2229,19 @@ static void on_browse() {
              CommDlgExtendedError());
   set_status(GetDlgItem(g_hwnd, IDC_STATUS), msg);
   log_error(L"%s", msg);
+}
+
+// A5（2026-11-21）：下载进行中关窗 → 先确认（此前 WM_DESTROY 直接杀 curl，
+// 用户可能以为下载在后台继续）。分片保留可续传，确认弹框里说明。
+// IDC_CLOSE / IDCANCEL（ESC）/ WM_CLOSE（X 按钮）三条关闭路径共用。
+static void close_with_confirm(HWND h) {
+  if (g_dl_proc) {
+    wchar_t q[512];
+    swprintf_s(q, L"模型下载进行中（已下 %llu MB，分片保留可续传）。\n关闭将中止下载，确定关闭？",
+               mb_of(file_size_ull(g_dl_tmp)));
+    if (MessageBoxW(h, q, L"下载进行中", MB_YESNO | MB_ICONWARNING) != IDYES) return;
+  }
+  DestroyWindow(h);
 }
 
 
