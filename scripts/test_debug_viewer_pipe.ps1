@@ -54,13 +54,18 @@ function Send-Word {
     # fused = CE + 两项之和（查看器总分格显示连加过程，假数据须自洽）
     $fbS = 14.0 * [Math]::Log(1.0 + $eff)
     $u1S = [Math]::Log($uni + 1.0)
-    # v5: 修正分 pf——首候选 5、其余 0；fusedS 含 −pf（与生产同语义，
-    # 查看器总分格尾追 −λ 标注恢复逐项验算）
+    # v5: 修正分 pf——首候选 5、其余 0；fusedS 含 −pf（与生产同语义）
+    # v6: sdelta = 有符号修正（首候选 -5）；v7: seg = token 边界段显——
+    # 首候选给分段（模拟多 token 词，词列应显段显）、其余发空串（单
+    # token 词/旧发送端 → 词列原样）。"修正分"列已删——-5 折进首候选
+    # CE 格数值与公式尾项
     $pfS = if ($i -eq 0) { 5.0 } else { 0.0 }
-    $fusedS = $weighted + $fbS + $u1S - $pfS
-    $w.WriteLine(('C|{0}|{1}|{2:F3}|{3:F3}|{4:F3}|{5}|{6:F3}|0|1|1|1|{7:F3}|{8:F3}|{9:F3}|{10:F3}|{11:F3}|{12:F3}' -f
+    $sdS = if ($i -eq 0) { -5.0 } else { 0.0 }
+    $fusedS = $weighted + $fbS + $u1S + $sdS
+    $segS = if ($i -eq 0) { (($cands[$i].ToCharArray() | ForEach-Object { [string]$_ }) -join '/') } else { '' }
+    $w.WriteLine(('C|{0}|{1}|{2:F3}|{3:F3}|{4:F3}|{5}|{6:F3}|0|1|1|1|{7:F3}|{8:F3}|{9:F3}|{10:F3}|{11:F3}|{12:F3}|{13:F3}|{14}' -f
       ($i + 1), $cands[$i], (1.0 + $i), $weighted, $eff, $uni,
-      $fusedS, $c1, $c2, $c3, $fbS, $u1S, $pfS))
+      $fusedS, $c1, $c2, $c3, $fbS, $u1S, $pfS, $sdS, $segS))
   }
   $t2 = Get-Date -Format HH:mm:ss
   $w.WriteLine("E|$t2|$($cands[0])|0.5|1.0|$tick|$($tick + 1)")

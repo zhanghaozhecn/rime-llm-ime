@@ -2224,6 +2224,52 @@ static std::string tokens_piece(const std::vector<llama_token> &ids) {
   return s;
 }
 
+// 候选词 token 边界段显（2026-11-21 调试窗口协议 v7，"词"列）：逐 token 拼
+// piece，每个 token 结束时若已拼出完整 UTF-8 字符则封一段——分隔符只落在
+// token 边界 ∩ 字符边界：单 token 含多字不劈（标志/测试 在 Qwen3-0.6B 为
+// 单 token → 原样显示），一个字由 2 token 拼成 → 合并成一段（不劈字），
+// 多 token 词按真实边界分段（错事=[错][事] → 错/事，cmak → cm/ak）。
+// 段间 '/'。拼接结果 = 原词文本（字节级 BPE 的 piece 拼接恰好还原原文，
+// 同 tokens_piece）。
+// ⚠ 字符完整性判定（2026-11-21 踩坑修正，插件 rime_llm.cpp 同款）：UTF-8
+// 多字节字符**以续字节结尾**（错 = E9 94 99，末字节是续字节）——"末字节
+// 非续字节"判定是反的，会让 CJK 永不封段、整词并一段（曾据此误报错事/
+// 标志等全为单 token，评分路径 ce2 有值才暴露）。正确做法 = 用 lead 字节
+// 推断期望长度、数续字节凑齐才算完整。
+static std::string token_seg_display(const std::vector<llama_token> &ids) {
+  std::string out, cur;
+  char buf[256];
+  int remain = 0;  // 当前字符还差的续字节数（0 = 处于字符边界）
+  for (auto id : ids) {
+    int n = llama_token_to_piece(g_vocab, id, buf, sizeof(buf), 0, true);
+    for (int k = 0; k < n; k++) {
+      unsigned char b = (unsigned char)buf[k];
+      cur += (char)b;
+      if (remain > 0) {
+        remain--;
+      } else if (b < 0x80) {
+        // ASCII：自身即完整字符，remain 保持 0
+      } else if ((b & 0xE0) == 0xC0) {
+        remain = 1;   // 2 字节字符（还差 1 续字节）
+      } else if ((b & 0xF0) == 0xE0) {
+        remain = 2;   // 3 字节字符（CJK 常态）
+      } else {
+        remain = 3;   // 4 字节字符（扩展区）
+      }
+    }
+    if (remain == 0 && !cur.empty()) {  // token 结束且字符完整 → 封段
+      if (!out.empty()) out += '/';
+      out += cur;
+      cur.clear();
+    }
+  }
+  if (!cur.empty()) {  // 末段残字节（正常不可达）原样收尾，不丢字
+    if (!out.empty()) out += '/';
+    out += cur;
+  }
+  return out;
+}
+
 // ============================================================
 // CE helper: -log(softmax(x)[target])
 // 通用优化（2026-11-06，两版同步；不依赖特定指令集、不改评分语义）：
@@ -2839,6 +2885,11 @@ void LlmRerankTranslation::Collect() {
 
     std::vector<char> dbg_full(candidates_.size(), 0);
 
+    // 候选 token 边界段显（协议 v7，"词"列 标志→单token原样 / cmak→cm/ak）：
+    // 与 candidates_ 对齐；只在下方 token 化处填（ctx 不足/评分跳过时留空
+    // → 查看器显示原词）
+    std::vector<std::string> seg_of(candidates_.size());
+
     // 推理用上文尾部文本（协议 v4，调试窗口灰显；截尾分支内赋值）
     std::string ctx_used;
     {
@@ -2854,11 +2905,12 @@ void LlmRerankTranslation::Collect() {
         }
 
         std::vector<std::vector<llama_token>> cand_ids;
-        for (auto &c : candidates_) {
-          auto ids = tokenize(c->text().c_str());
+        for (size_t ci = 0; ci < candidates_.size(); ci++) {
+          auto ids = tokenize(candidates_[ci]->text().c_str());
           if (ids.empty())
             ids.push_back(0);
           cand_ids.push_back(ids);
+          seg_of[ci] = token_seg_display(ids);
         }
 
         std::vector<double> scores;
@@ -2928,9 +2980,12 @@ void LlmRerankTranslation::Collect() {
       // 无 CE 分候选的融合（2026-11-13 用户定案，取代"回退后两项和"）:
       // CE 取窗内已算 CE 的**最低分**（score = −CE 负值域，最低分 = 最差
       // 证据 → 该候选排到窗底但保留与层1 的正常耦合）。旧语义（融合=层1
-      // 分）会让无法表示的字（tokenizer 打不出的生僻字「𬤊」）以 S1=0
-      // 压过全部负分候选跳首选——aki 实况窗两例实证。全窗无有效 CE 时
-      // 回退层1 分（加 0）。
+      // 分）会让无 CE 候选以 S1=0 压过全部负分候选跳首选——aki 实况窗
+      // 两例实证。触发器随时代更替：当年 = tokenizer 打不出「𬤊」（2026-
+      // 11-15 llama 升级后已可表示——2026-11-21 全词典 8133 单字核查，
+      // 99.7% 单 token、余 24 字 2 token，无一不可表示）；现在 = 评分批
+      // 次 decode 失败的逐候选哨兵分（score_batch step2/3 失败路径 +
+      // 失败自愈）。全窗无有效 CE 时回退层1 分（加 0）。
       double min_valid = 1e308;
       for (int i : order)
         if (has_score[i] && score_of[i] < min_valid)
@@ -3039,6 +3094,11 @@ void LlmRerankTranslation::Collect() {
     // 整体失败）窗口按引擎序全 win=1 无分。v5（2026-11-14）行尾再追加修正
     // 分 pf = 词码对预置降分修正的 λ（0 = 未命中）——总分已含 −λ, 查看器
     // 总分格据此补 −λ 标注恢复逐项验算（append-only, 旧查看器忽略）。
+    // v7（2026-11-21）行尾再追加 seg = token 边界段显（"词"列：单 token 词
+    // 原样、真实多 token 词段间 '/'、2 token 拼成的字合并整字——token 化
+    // 在下方评分窗候选循环统一做，尾窗透传无 token 化 → 空串，查看器显示
+    // 原词）。同日查看器显示口径（协议零改动部分）：修正分专属列删除
+    // （命中时折进 CE 格数值 + 公式尾项，本端 ce/sdelta 照发不合并）。
     // L 头行也在此发（评分/融合后 ev_ms 才是终值；尾部字段 prep = 上文 KV
     // 预解码命中、v4 追加 ctx_used = 推理实际使用的上文尾部文本（调试窗口
     // 灰显前缀）。
@@ -3083,6 +3143,9 @@ void LlmRerankTranslation::Collect() {
           ce3s = live_num(ce3_of[(size_t)src_idx][2]);
         }
         auto er = eng_rank.find(c->text());
+        // v7: seg = token 边界段显——尾窗透传（src_idx=-1）无 token 化 → 空串
+        std::string seg = (src_idx >= 0 && src_idx < (int)seg_of.size())
+                              ? seg_of[(size_t)src_idx] : std::string();
         live_send("C|" +
                   std::to_string(er != eng_rank.end() ? er->second : 0) +
                   "|" + live_esc(c->text()) + "|" + live_num(fb + u1) + "|" +
@@ -3092,8 +3155,10 @@ void LlmRerankTranslation::Collect() {
                   "|" + std::to_string(fin) + "|" + std::to_string(win) +
                   "|" + ce1 + "|" + ce2 + "|" + ce3s + "|" +
                   live_num(fb) + "|" + live_num(u1) + "|" +
-                  live_num(pf) + "|" + live_num(sdelta));
-                  // v3: 词频得分/累计得分; v5: 修正分 pf; v6: 有符号 sdelta
+                  live_num(pf) + "|" + live_num(sdelta) + "|" +
+                  live_esc(seg));
+                  // v3: 词频得分/累计得分; v5: 修正分 pf; v6: 有符号 sdelta;
+                  // v7: token 边界段显 seg（"词"列按真实 token 边界分段）
       };
       if (!order.empty()) {
         std::vector<int> fin_rank(candidates_.size(), 0);
