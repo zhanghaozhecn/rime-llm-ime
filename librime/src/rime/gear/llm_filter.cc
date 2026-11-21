@@ -1188,16 +1188,13 @@ static long long user_uni_count(const std::string &x, const std::string &code) {
   return it == g_user_stats.end() ? 0 : it->second.cum;
 }
 
-// ── 词码对分数修正（2026-11-17 用户定案：固顶与 pairfix 合并为一张有符号表）──
-// 表放用户目录 llm_pairfix.tsv，行 `词<TAB>码<TAB>[+|-]分数`：
-//   +200 / 200 = 加分（固定首选，09876 上屏时写入）
-//   +100 / 100 = 加分（固定次选，手动编辑）
-//   -5         = 扣分（pairfix 预置降噪；无第三列 = 旧默认扣 5）
-// `#` 注释；无文件 = 机制休眠；窗口准入/融合各读一次（每窗一次，
-// 相对推理成本可忽略）——编辑文件即时生效。正分不受 fade 限制
-// （09876 上屏会累计 user_uni，固定首选必须持久）；负分保留 fade：
-// 用户该词码对累计 >= kPairFixFadeUni 次 -> 预置让位。正分候选即使不在
-// 层1 前 k，也优先占用评分窗名额（见 Collect 窗口准入段）。
+// ── 词码对扣分修正（2026-11-21 用户定案解耦：只承载负分 CE 偏差降噪）──
+// 表放用户目录 llm_pairfix.tsv，行 `词<TAB>码<TAB>-分数`（无第三列 =
+// 旧默认 -5）；`#` 注释；无文件 = 机制休眠；融合读一次（每窗一次，
+// 相对推理成本可忽略）——编辑文件即时生效。负分保留 fade：用户该词码对
+// 累计 >= kPairFixFadeUni 次 -> 预置让位。正分行读取端跳过（2026-11-17
+// 的 +200 固定首选/+100 固定次选语义废除——固定候选归拼读双拼
+// pin_candidates.tsv + pin_filter.lua 全局重排，与 LLM 重排解耦）。
 // 旧 2026-11-13 pairfix 推导（wiki 拆半/用户域回放）保留在文件头历史注释：
 // 与@vkh 等污染对按字频抬分；负分只破 CE 险胜的近平局。
 static const double kPairFixPenaltyDefault = 5.0;
@@ -1235,7 +1232,8 @@ static bool pairfix_table(std::map<std::string, double> *out) {
       continue;
     *t1 = '\0';
     char *t2 = strchr(t1 + 1, '\t');
-    // 无第三列 = 旧默认扣 5；第三列 +200/200 = 加分，-5 = 扣分。
+    // 无第三列 = 旧默认扣 5；第三列负数 = 扣分。2026-11-21 解耦：正分
+    // （固定候选）行跳过——归 pin_candidates.tsv / pin_filter.lua。
     double delta = -kPairFixPenaltyDefault;
     if (t2) {
       *t2 = '\0';
@@ -1243,6 +1241,8 @@ static bool pairfix_table(std::map<std::string, double> *out) {
       double v = strtod(t2 + 1, &end);
       if (end == t2 + 1)
         continue;  // 第三列非法：与插件版一致，跳过
+      if (v > 0)
+        continue;
       delta = v;
     }
     if (*line && *(t1 + 1))
@@ -1252,7 +1252,7 @@ static bool pairfix_table(std::map<std::string, double> *out) {
   return true;
 }
 
-// 命中返回有符号分数修正；正分（固定首选/次选）不受 fade 限制
+// 命中返回负分扣分修正（fade 门）；正分行读取端已跳过（解耦后无正分）
 static double pairfix_delta(const std::map<std::string, double> &tbl,
                             const std::string &w,
                             const std::string &code) {
@@ -2693,7 +2693,7 @@ void LlmRerankTranslation::Collect() {
   const size_t kMaxRerank = (size_t)(g_max_candidates > 0 ? g_max_candidates : 6);
   std::vector<an<Candidate>> tail;
   std::vector<double> s1_head;   // 层1 分（对齐 candidates_; 无 CE 分回退用）
-  // 词码对表：窗口准入前读一次；正分候选优先占位，融合段复用。
+  // 词码对表：融合前读一次（2026-11-21 解耦后只含负分），本窗融合复用。
   std::map<std::string, double> pf_tbl;
   bool pf_on = false;
   // two_code_sentence 满长准入（2026-11-16）：⌊码长/2⌋（码 <2 字时 0 = 不启用）
@@ -2719,80 +2719,41 @@ void LlmRerankTranslation::Collect() {
   std::string wskip;
 
   if (allc.size() >= 2 && g_loaded.load()) {
-    // 词码对分数表：窗口准入与融合共用一次读取；无文件 = 休眠。
+    // 词码对分数表：融合段共用一次读取（2026-11-21 解耦后只含负分，不参与
+    // 窗口准入）；无文件 = 休眠。
     pf_on = pairfix_table(&pf_tbl);
     std::vector<size_t> idx(allc.size());
     std::vector<double> s1(allc.size());
-    std::vector<double> delta(allc.size(), 0.0);
     for (size_t i = 0; i < allc.size(); i++) {
       idx[i] = i;
       // 词码对记账（2026-11-13）: eff/uni 查询键 = (候选, 当前窗码 input_)
       s1[i] = g_freq_beta * std::log(1.0 + user_freq_eff(allc[i]->text(), input_)) +
               user_unigram_term(allc[i]->text(), input_);
-      if (pf_on)
-        delta[i] = pairfix_delta(pf_tbl, allc[i]->text(), input_);
     }
     std::stable_sort(idx.begin(), idx.end(),
                      [&s1](size_t a, size_t b) { return s1[a] > s1[b]; });
     size_t nk = (std::min)(kMaxRerank, allc.size());
-    // 两层准入（2026-11-17 有符号词码表）：
-    // ① 正分候选（+200 固定首选 / +100 固定次选）优先占 nk 个名额，
-    //    按分数降序、同分按层1 分/引擎序；不在层1 前 k 也照样进窗。
-    // ② 剩余名额沿用原规则：层1 序 + two_code_sentence 满长优先。
-    // 窗口大小仍 <= nk（不扩窗，decode 行数不变）。
+    // 窗口准入（2026-11-21 解耦：正分固定候选不再占位——固定归
+    // pin_candidates.tsv / pin_filter.lua 全局重排）：层1 序 +
+    // two_code_sentence 满长优先，窗口 <= nk（不扩窗，decode 行数不变）。
     {
       std::vector<bool> in_win(allc.size(), false);
       size_t taken = 0;
-      std::vector<size_t> pos;
-      if (pf_on)
-        for (size_t i = 0; i < allc.size(); i++)
-          if (delta[i] > 0.0)
-            pos.push_back(i);
-      std::stable_sort(pos.begin(), pos.end(),
-                       [&delta, &s1](size_t a, size_t b) {
-                         if (delta[a] != delta[b])
-                           return delta[a] > delta[b];
-                         if (s1[a] != s1[b])
-                           return s1[a] > s1[b];
-                         return a < b;
-                       });
-      for (size_t c : pos) {
-        if (taken >= nk)
-          break;
-        if (!in_win[c]) {
-          in_win[c] = true;
-          ++taken;
-        }
-      }
       for (size_t k = 0; k < idx.size() && taken < nk; k++) {
         size_t c = idx[k];
-        if (in_win[c])
-          continue;
         if (tcs_elen >= 1 && utf8_len(allc[c]->text()) != tcs_elen)
           continue;
         in_win[c] = true;
         ++taken;
       }
-      std::vector<char> pushed(allc.size(), 0);
-      for (size_t c : pos) {
-        if (in_win[c] && !pushed[c]) {
-          candidates_.push_back(allc[c]);
-          s1_head.push_back(s1[c]);
-          pushed[c] = 1;
-        }
-      }
       for (size_t k = 0; k < idx.size(); k++) {
         size_t c = idx[k];
-        if (in_win[c] && !pushed[c]) {
+        if (in_win[c]) {
           candidates_.push_back(allc[c]);
           s1_head.push_back(s1[c]);
-          pushed[c] = 1;
-        }
-      }
-      for (size_t k = 0; k < idx.size(); k++) {
-        size_t c = idx[k];
-        if (!in_win[c])
+        } else {
           tail.push_back(allc[c]);
+        }
       }
     }
     // 语料 W 的 window 字段 = 层1/TCS 准入后、重排前的评分窗（原序）。
@@ -2936,9 +2897,8 @@ void LlmRerankTranslation::Collect() {
     // (高频首选获自保护)。失败哨兵/缺分不参与融合, 保序排尾。
     // 应用于评分/缓存顺序之上、两码整句段之前 (与插件版一致);
     // 缓存只存分数序, 融合每次按当前衰减重放。稳定排序保同分原序 (CE 序)。
-    // 融合分叠加词码对分数修正（2026-11-17 有符号表：正分=固定首选/
-    // 次选，+200/+100 不受 fade；负分=pairfix 降噪，保留 fade）。
-    // 正分窗口准入已在上方层1 块完成；这里按同一张表加 delta。
+    // 融合分叠加词码对扣分修正（负分=CE 系统性偏差降噪，保留 fade；
+    // 2026-11-21 解耦后无正分——固定候选归 pin_filter.lua 全局重排）。
     // debug.txt 行尾 修正%+g，C 行尾追加 sdelta（与插件版一致）。
     std::vector<double> fused_of(candidates_.size(), -1e308);
     if (order.size() > 1) {
