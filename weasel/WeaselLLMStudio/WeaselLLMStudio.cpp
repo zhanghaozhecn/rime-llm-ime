@@ -384,7 +384,11 @@ static std::wstring error_log_path() {
     return cached;
   }
   std::wstring userdir = rime_user_dir();
-  cached = userdir.empty() ? cand : (userdir + L"\\WeaselLLMStudio_error.log");
+  if (userdir.empty()) return cand;
+  // 2026-11-21 起 LLM 数据/日志收进用户文件夹 llm_rerank 子目录
+  std::wstring sub = userdir + L"\\llm_rerank";
+  CreateDirectoryW(sub.c_str(), NULL);   // 已存在无害
+  cached = sub + L"\\WeaselLLMStudio_error.log";
   return cached;
 }
 
@@ -1234,8 +1238,8 @@ static const wchar_t* const TIP_TCS =
     L"其余候选按融合分排后——整句方案的满句长候选优先。\n"
     L"一般字词方案保持关闭。取代原预期词长权重 elw（2026-11-07）。";
 static const wchar_t* const TIP_DEBUG =
-    L"诊断日志：开启后每次重排都往用户文件夹写 rime_llm_debug.txt\n"
-    L"（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。";
+    L"诊断日志：开启后每次重排都往用户文件夹的 llm_rerank 子目录写\n"
+    L"rime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。";
 static const wchar_t* const TIP_SAVE =
     L"把上面的参数写进选中方案文件的 llm_rerank 配置节（键名与该节里相同），\n"
     L"随后自动触发重新部署——部署完成即生效（配置在方案里，不再有全局文件）。\n"
@@ -2866,7 +2870,8 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       // 忘关提醒（2026-09-04）：诊断开着会持续写盘，打开设置时点一下
       if (g_p.debug_fusion)
         set_status(GetDlgItem(h, IDC_STATUS),
-                   L"提醒：诊断日志开着（rime_llm_debug.txt 持续增长，排障完建议关闭）");
+                   L"提醒：诊断日志开着（用户文件夹 llm_rerank 子目录下"
+                   L"rime_llm_debug.txt 持续增长，排障完建议关闭）");
       return 0;
     }
     case WM_COMMAND:

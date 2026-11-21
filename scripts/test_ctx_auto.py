@@ -622,7 +622,7 @@ def main():
     args = ap.parse_args()
 
     logname = "rime_llm_corpus.tsv"
-    events = os.path.join(os.environ["APPDATA"], "Rime", logname)
+    events = os.path.join(os.environ["APPDATA"], "Rime", "llm_rerank", logname)
     if not os.path.exists(events):
         print("events log not found: %s" % events)
         sys.exit(2)

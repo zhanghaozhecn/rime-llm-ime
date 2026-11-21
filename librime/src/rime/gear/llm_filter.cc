@@ -957,20 +957,55 @@ static FILE *open_log_file(const char *filename) {
 #endif
 }
 
-// user_ledger.tsv 路径 (RIME 用户目录; 与日志同目录解析)。
+// ── LLM 记录子目录（2026-11-21 用户定案）─────────────────────────────
+// RIME 用户文件夹下建 llm_rerank 子目录收纳全部 LLM 数据/日志文件
+// （corpus/debug/账本/词码对）；固定候选 pin_candidates.tsv 属拼读双拼
+// 本机功能，仍留用户文件夹根。resolve 规则：
+//   子目录已有 → 用之；根目录旧文件在 → MoveFile 一次性迁移（含 .old
+//   轮转副本；移动失败 = 读旧写旧，下次再迁，绝不丢数据）。
+static bool llm_dir_ensure(const char *ud) {
+  char dir[MAX_PATH];
+  snprintf(dir, sizeof(dir), "%s\\llm_rerank", ud);
+  if (!CreateDirectoryA(dir, nullptr) &&
+      GetLastError() != ERROR_ALREADY_EXISTS)
+    return false;
+  return true;
+}
+
+// 解析 filename 的最终路径：子目录优先 + 根目录旧文件一次性迁移。
+// 返回 false = 拿不到用户目录（调用方自行回退）。
+static bool llm_file_path(const char *filename, char *path, size_t n) {
+  const RimeApi *api = rime_get_api();
+  if (!api || !api->get_user_data_dir) return false;
+  const char *ud = api->get_user_data_dir();
+  if (!ud || !*ud || strlen(ud) >= n - 80) return false;
+  snprintf(path, n, "%s\\llm_rerank\\%s", ud, filename);
+  if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+    return true;  // 子目录已有 → 直接用
+  if (!llm_dir_ensure(ud)) {
+    // 目录建不出（权限异常等）：退回根目录原位置，绝不丢数据
+    snprintf(path, n, "%s\\%s", ud, filename);
+    return true;
+  }
+  char oldp[MAX_PATH];
+  snprintf(oldp, sizeof(oldp), "%s\\%s", ud, filename);
+  if (GetFileAttributesA(oldp) != INVALID_FILE_ATTRIBUTES) {
+    MoveFileA(oldp, path);  // 失败 = 仍读旧写旧（下次 resolve 再迁）
+    char oldo[MAX_PATH], newo[MAX_PATH];
+    snprintf(oldo, sizeof(oldo), "%s.old", oldp);
+    snprintf(newo, sizeof(newo), "%s.old", path);
+    if (GetFileAttributesA(oldo) != INVALID_FILE_ATTRIBUTES)
+      MoveFileA(oldo, newo);
+  }
+  return true;
+}
+
+// user_ledger.tsv 路径 (RIME 用户目录 llm_rerank 子目录; 与日志同目录解析)。
 // 文件名（2026-11-17 用户定案）：user_ledger.tsv = 合并账本（衰减 dee +
 // 累计 cum 同一行）；旧 user_eff.tsv / user_unigram.tsv 由读取端一次性
 // 迁移（只读, 旧文件保留不删），落盘一律写新名。
 static bool user_ledger_file(char *path, size_t n) {
-  const RimeApi *api = rime_get_api();
-  if (api && api->get_user_data_dir) {
-    const char *ud = api->get_user_data_dir();
-    if (ud && *ud) {
-      snprintf(path, n, "%s\\user_ledger.tsv", ud);
-      return true;
-    }
-  }
-  return false;
+  return llm_file_path("user_ledger.tsv", path, n);
 }
 
 // 含中文字符判定（U+4E00–U+9FFF；UTF-8 三字节首字节 E4–E9）。
@@ -1201,15 +1236,7 @@ static const double kPairFixPenaltyDefault = 5.0;
 static const long long kPairFixFadeUni = 3;
 
 static bool pairfix_file(char *path, size_t n) {
-  const RimeApi *api = rime_get_api();
-  if (api && api->get_user_data_dir) {
-    const char *ud = api->get_user_data_dir();
-    if (ud && *ud) {
-      snprintf(path, n, "%s\\llm_pairfix.tsv", ud);
-      return true;
-    }
-  }
-  return false;
+  return llm_file_path("llm_pairfix.tsv", path, n);
 }
 
 // 读参考表 → out[key 词\t码] = 有符号分数；返回 false = 文件缺失（休眠）
@@ -1416,14 +1443,10 @@ static void commit_stack_clear() {
 }
 
 static bool log_file_path(const char *filename, char *path, size_t n) {
-  const RimeApi *api = rime_get_api();
-  if (api && api->get_user_data_dir) {
-    const char *ud = api->get_user_data_dir();
-    if (ud && *ud && strlen(ud) < n - 64) {
-      snprintf(path, n, "%s\\%s", ud, filename);
-      return true;
-    }
-  }
+  // 2026-11-21 起 corpus/debug 收进用户文件夹 llm_rerank 子目录
+  // （llm_file_path 内含根目录旧文件一次性迁移）；用户目录不可得才回退 %TEMP%
+  if (llm_file_path(filename, path, n))
+    return true;
 #ifdef _WIN32
   char tmp[MAX_PATH];
   GetTempPathA(sizeof(tmp), tmp);
@@ -3544,6 +3567,19 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
                                  CandidateList *candidates) {
   if (!translation)
     return translation;
+
+  // llm_rerank 子目录确保（2026-11-21 记录文件收进子目录）：进程内一次。
+  // 与 enabled 无关——固定候选 lua（pin_candidates.tsv 仍在根目录）的
+  // 一次性迁移假定该子目录可被尽早建出；记录文件 resolve 内也会兜底建。
+  static bool llm_subdir_ensured = false;
+  if (!llm_subdir_ensured) {
+    llm_subdir_ensured = true;
+    const RimeApi *api0 = rime_get_api();
+    if (api0 && api0->get_user_data_dir) {
+      const char *ud0 = api0->get_user_data_dir();
+      if (ud0 && *ud0) llm_dir_ensure(ud0);
+    }
+  }
 
   // 词码对记账/语料 C 的码快照：必须在本函数**所有**早退路径之前更新。
   // 此前只在 LlmRerankTranslation 构造时赋值——ctx_empty/model_loading/
