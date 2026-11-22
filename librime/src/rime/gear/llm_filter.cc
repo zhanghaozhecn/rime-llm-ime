@@ -100,18 +100,20 @@ static std::atomic<bool> g_loading{false};
 // 自定义位置用 llm_rerank model_path 显式指向。
 // 注意 Service.deployer().user_data_dir 在引擎启动后才就绪，故不能在
 // 静态初始化求值——g_model_path 留空，加载时懒取默认。
-// 默认模型 = qwen2.5-0.5b-instruct-q4_k_m（2026-11-16 用户定案 base→instruct
-// 切换：聚合效果与 base 无差异（2 万窗对照 +0.02pp）、下载源 ModelScope
-// 官方仓国内直连快；CPU 延迟与 base 无差异（三轮交替配对 ≈50.5ms，
-// 张量逐层同量化——首测 +9% 系小样本非交替测量误差）。
-// 前身 2026-11-14 的 Qwen2.5-0.5B-Q4_K_M（base），更旧 Qwen3.5-0.8B）
+// 默认模型 = Qwen3-0.6B-Base-Q4_K_M（2026-11-19 用户定案 0.6B base；
+// 2026-11-22 补齐此处内置默认——定案当时只改了真机方案节的显式
+// model_path，C++ 默认仍指 qwen2.5-0.5b-instruct，无 model_path 的方案
+// （如 GUI 接入的朙月拼音，模板注释该行）会加载不存在的文件 → failed
+// to load model 死循环，每键 skip=model_loading 无推理，真机排查发现）。
+// 前身 2026-11-16 的 qwen2.5-0.5b-instruct；更旧 2026-11-14 Qwen2.5-0.5B
+// （base）、Qwen3.5-0.8B）
 static std::string default_model_path() {
   try {
     return (Service::instance().deployer().user_data_dir /
-            "qwen2.5-0.5b-instruct-q4_k_m.gguf")
+            "Qwen3-0.6B-Base-Q4_K_M.gguf")
         .string();
   } catch (...) {
-    return "qwen2.5-0.5b-instruct-q4_k_m.gguf";
+    return "Qwen3-0.6B-Base-Q4_K_M.gguf";
   }
 }
 static std::string g_model_path;  // 空 = 未配置，load_model 时按默认兜底
@@ -2865,6 +2867,25 @@ static void async_write_pending(const AsyncPending &pend,
           pend.window_vec, final_list, pend.tick, "ok", "",
           snap.prep_hit, "async");
   debug_write_p(pend.wid, snap.ev_ms, snap.prep_hit);
+  // D 行（2026-11-22 整句分段开发补）：挂账回填此前只有 W ok + P 行，
+  // CE 数值无日志——评测与调试都要逐候选 CE。字段语义与主路径一致：
+  // ce=加权分（scores）、ce1-3=原始分量、eff/u1 回填时刻现算、full=1
+  //（挂账恒整句模式）、key=融合分、sdelta=词码对修正、cerank=提交序
+  //（层1）、finrank=回填后名次。
+  for (size_t r = 0; r < ord.size(); r++) {
+    size_t i = ord[r];
+    double ce = i < snap.scores.size() ? snap.scores[i] : -1e10;
+    auto c3 = (i < snap.ce3.size())
+                  ? snap.ce3[i]
+                  : std::array<double, 3>{NAN, NAN, NAN};
+    const std::string &t = pend.window_vec[i];
+    double eff = user_freq_eff(t, pend.code);
+    double u1 = user_unigram_term(t, pend.code);
+    double pf = pf_on ? pairfix_delta(pf_tbl, t, pend.code) : 0.0;
+    debug_write_d(pend.wid, (int)r + 1, ce, c3[0], c3[1], c3[2], eff,
+                  g_freq_beta * std::log(1.0 + eff), u1, 1, fused[i], pf,
+                  (int)i + 1, (int)r + 1);
+  }
 }
 
 static void async_worker_loop() {
@@ -3091,10 +3112,23 @@ void LlmRerankTranslation::Collect() {
   bool pf_on = false;
 
   std::vector<an<Candidate>> allc;
-  while (!translation_->exhausted()) {
+  // 限量收集（2026-11-22 卡死修复，与插件版同构）：旧全量收集强制引擎
+  // 一次性完整翻译所有候选——朙月大词库歧义/部分码串的 completion 候选
+  // 海量，单码秒级 CPU（enabled=false 对照实测 40 倍差）→ 每键卡死。
+  // 双重限制：256 上限 + **30ms 时间预算**（大词库早停、小词库全收；
+  // 深枚举的单次 Peek 内部秒级、预算无法打断——必须在深枚举发起前
+  // 拦住：30ms 处即 break，候选收集 10~20 个，层1 选窗足够）。层1 词频选窗在已收集范围内仍有效（用户提频
+  // 词在候选前列）。
+  constexpr size_t kMaxCollect = 256;
+  const auto collect_budget = std::chrono::milliseconds(30);
+  const auto collect_start = std::chrono::steady_clock::now();
+  for (size_t n = 0; n < kMaxCollect; n++) {
+    if (std::chrono::steady_clock::now() - collect_start > collect_budget)
+      break;
     auto cand = translation_->Peek();
-    if (cand)
-      allc.push_back(cand);
+    if (!cand)
+      break;
+    allc.push_back(cand);
     translation_->Next();
   }
 

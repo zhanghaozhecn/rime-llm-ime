@@ -48,6 +48,11 @@ scripts/*
 !scripts/test_rime.cpp
 !scripts/build_test_rime.bat
 !scripts/test_llm_context.cpp
+!scripts/test_ctx_auto.py
+!scripts/test_luna_auto.py
+!scripts/stress_corpus.py
+!scripts/pdb_syms.py
+!scripts/symresolve.c
 !scripts/build_test_llm_context.bat
 !scripts/probe_wps_ctx.cpp
 !scripts/build_probe_wps_ctx.bat

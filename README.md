@@ -291,6 +291,15 @@ python scripts\test_ctx_auto.py --app wps     :: WPS：手动开好空文字文�
 
 评分移出按键路径（`llm_filter.cc` 异步评分器，与插件版同构）：Collect 每键投递异步任务（指纹 = 归一化上文+候选文本，持久评分线程 + 40ms 去抖 + score_batch 每 Step 边界可中断），同步路径零 LLM。**字词模式** submit+wait（≤250ms，与旧同步评分等价，当前词重排零回归）；**整句模式**投递即走（层1 序先行），评分结果由两个收割点回填——Collect 入口（翻页/候选窗重建命中缓存即 0 LLM）+ OnCommit（上屏即落账，场景内末词也有 ok 行）。commit 先收割再取消（代次递增，在跑评分在下一个 Step 边界终止）。语料 W 行新形态：整句挂账轮 `skip|async_pending` + 回填 `ok`（flags=`async`）双行；新 skip 名 `async_timeout`。设计全文见研究库《全拼简拼整句重排-调研与设计》§七。
 
+**大词库方案（朙月拼音等）的候选收集限量**（2026-11-22 卡死修复）：Collect
+候选收集双重限制 = 256 上限 + 30ms 时间预算——朙月大词库歧义/部分码串的
+completion 候选海量，全量收集曾致单码 0.5-2.25 秒 CPU（enabled=false 对照
+实测 40 倍差）→ server 消息线程占死 → TSF 管道重连风暴 → 输入法与宿主应用
+全卡。深枚举的单次 Peek 内部秒级、预算无法打断——30ms 阈值须在深枚举发起
+前拦截。限量语义代价：256 外深翻页候选不再出现（可接受）。另：C++ 内置
+默认模型路径已补齐 2026-11-19 定案（Qwen3-0.6B——此前仍指 qwen2.5-0.5b，
+无 model_path 的方案会加载不存在的文件，failed to load model 死循环）。
+
 ### 构建步骤
 
 weasel 基底为 **0.17.4 release tag**（勿用 master——IPC 协议有差异，混用会输入失效）。相对上游的完整改动清单与维护陷阱（rime_api.h 双副本同步、include 路径等）见项目记忆 `memory\upstream-diff.md`，不在本文展开。
