@@ -2891,6 +2891,9 @@ struct AsyncTask {
   std::string fingerprint;
   std::string ctx_norm;        // normalize_ctx 后的上文（token 化源）
   std::vector<std::string> cand_texts;
+  // 子词（PM，部分覆盖候选）清单（2026-11-23）：整句模式才有；只做 token
+  // 前缀复用评分（零 decode）与指纹绑定，不进评分窗
+  std::vector<std::string> pm_texts;
   std::chrono::steady_clock::time_point enq_at;
 };
 static AsyncTask g_async_task;
@@ -2901,11 +2904,38 @@ struct AsyncRes {
   std::vector<double> scores;   // 提交序（= Collect 的 candidates_ 序）
   std::vector<std::array<double, 3>> ce3;
   std::vector<std::string> segs;  // token 边界段显（协议 v7，对齐提交序）
+  // 子词复用分（2026-11-23）：对齐 task.pm_texts；-1e10 = 无前缀匹配
+  std::vector<double> pm_scores;
   std::string ctx_used;           // 推理用上文尾部（协议 v4，调试灰显）
   bool prep_hit = false;
   double ev_ms = 0;
 };
 static AsyncRes g_async_result;
+
+// 指纹（2026-11-22）：归一化上文 \x1f 候选 \x1e 拼接；2026-11-23 追加子词
+// 清单（\x1d 分隔，整句模式才有）——子词复用分与候选集属同一快照，指纹
+// 必须绑定，否则同 FM 不同 PM 的 query 会错命中缓存（与插件版
+// async_fingerprint 同构；字词模式 pm 为空 → 指纹格式保持不变）。
+static std::string async_fingerprint(const std::string &ctx_norm,
+                                     const std::vector<std::string> &cands,
+                                     const std::vector<std::string> &pm) {
+  std::string fp = ctx_norm;
+  fp.push_back('\x1f');
+  for (size_t i = 0; i < cands.size(); i++) {
+    if (i)
+      fp.push_back('\x1e');
+    fp += cands[i];
+  }
+  if (!pm.empty()) {
+    fp.push_back('\x1d');
+    for (size_t i = 0; i < pm.size(); i++) {
+      if (i)
+        fp.push_back('\x1e');
+      fp += pm[i];
+    }
+  }
+  return fp;
+}
 
 // 挂账：整句模式异步投递时登记（fp → W 行所需信息），评分结果收割时补写
 // W ok（flags=async）+ P 行。任务被覆盖/取消则条目随容量清理丢弃（快速
@@ -2985,6 +3015,52 @@ static void async_write_pending(const AsyncPending &pend,
     debug_write_d(pend.wid, (int)r + 1, ce, c3[0], c3[1], c3[2], eff,
                   g_freq_beta * std::log(1.0 + eff), u1, 1, fused[i], pf,
                   (int)i + 1, (int)r + 1);
+  }
+}
+
+// 子词（PM，比等长词短的词典词）的零成本评分（2026-11-23 用户定案，两版
+// 同构）：复用满覆盖（FM）评分窗已算好的 token 前缀 CE——PM 的前 k 个 token
+// 与某个 FM 候选的前 k 个 token 逐位相同（k = min(PM token 数, 3)）时，其
+// 条件概率与 FM 的同位置分量完全相同（同一上文 + 同一前缀），直接取加权和
+// 即可，全程零 decode。无匹配（典型 = 单字 PM 而 FM 首 token 是多字 token）
+// → 哨兵 -1e10，子词块这些条目保引擎序殿后（不参与排序）。
+static void reuse_pm_scores(
+    const std::vector<std::vector<llama_token>> &fm_ids,
+    const std::vector<std::array<double, 3>> &fm_ce3,
+    const std::vector<std::string> &pm_texts,
+    std::vector<double> &out) {
+  static constexpr double W[3] = {1.0, 1.10, 0.60};  // 与 kCeW 同值
+  out.assign(pm_texts.size(), -1e10);
+  for (size_t p = 0; p < pm_texts.size(); p++) {
+    auto ids = tokenize(pm_texts[p].c_str());
+    if (ids.empty())
+      continue;
+    size_t need = ids.size() < 3 ? ids.size() : 3;
+    for (size_t f = 0; f < fm_ids.size(); f++) {
+      const auto &fm = fm_ids[f];
+      if (fm.size() < need)
+        continue;
+      size_t k = 0;
+      for (; k < need; k++)
+        if (fm[k] != ids[k])
+          break;
+      if (k < need)
+        continue;          // 前缀不同：不可复用
+      double s = 0;
+      bool ok = true;
+      for (size_t j = 0; j < need; j++) {
+        double v = fm_ce3[f][j];
+        if (!(v == v) || v <= -1e9) {
+          ok = false;
+          break;
+        }
+        s += W[j] * v;
+      }
+      if (ok) {            // 同前缀的 FM 分量相同，取首个
+        out[p] = -s;
+        break;
+      }
+    }
   }
 }
 
@@ -3069,6 +3145,10 @@ static void async_worker_loop() {
     auto t1 = std::chrono::high_resolution_clock::now();
     res.ev_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     if (done) {
+      // 子词复用评分（2026-11-23）：只用已算好的 FM token/CE 做前缀匹配，
+      // 零 decode——必须先于发布（融合/缓存统一读快照）
+      if (!task.pm_texts.empty())
+        reuse_pm_scores(cand_ids, res.ce3, task.pm_texts, res.pm_scores);
       res.valid = true;
       std::lock_guard<std::mutex> lk(g_async_mu);
       g_async_result = std::move(res);
@@ -3080,6 +3160,7 @@ static void async_worker_loop() {
 
 static std::string async_submit(const std::string &ctx_norm,
                                 const std::vector<std::string> &cand_texts,
+                                const std::vector<std::string> &pm_texts,
                                 bool immediate) {
   if (cand_texts.size() < 2 || ctx_norm.empty())
     return "";
@@ -3091,13 +3172,7 @@ static std::string async_submit(const std::string &ctx_norm,
       g_async_started.store(true);
     }
   }
-  std::string fp = ctx_norm;
-  fp.push_back('\x1f');
-  for (size_t i = 0; i < cand_texts.size(); i++) {
-    if (i)
-      fp.push_back('\x1e');
-    fp += cand_texts[i];
-  }
+  std::string fp = async_fingerprint(ctx_norm, cand_texts, pm_texts);
   {
     std::lock_guard<std::mutex> lk(g_async_mu);
     long gen = g_async_gen.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -3108,6 +3183,7 @@ static std::string async_submit(const std::string &ctx_norm,
     g_async_task.fingerprint = fp;
     g_async_task.ctx_norm = ctx_norm;
     g_async_task.cand_texts = cand_texts;
+    g_async_task.pm_texts = pm_texts;
     g_async_task.enq_at = std::chrono::steady_clock::now();
   }
   g_async_cv.notify_all();
@@ -3204,7 +3280,10 @@ void LlmRerankTranslation::Collect() {
   // （评测 sweep_2layer 同语义, 全窗参评）。文件序无关性: 引擎调频与否仅
   // 影响冷词同分打破（目标卷入 ≤0.05pp 窗, 研究库 §三十三·附 6）。
   const size_t kMaxRerank = (size_t)(g_max_candidates > 0 ? g_max_candidates : 6);
-  std::vector<an<Candidate>> tail;
+  std::vector<an<Candidate>> tail;      // FM 窗外候选（层1 序透传）
+  std::vector<an<Candidate>> pm_tail;   // 子词（PM，引擎序；2026-11-23）
+  std::vector<std::string> pm_texts;    // 子词清单（引擎序去重，走指纹/复用分）
+  std::vector<double> pm_scores_of;     // 子词复用分（对齐 pm_texts）
   std::vector<double> s1_head;   // 层1 分（对齐 candidates_; 无 CE 分回退用）
   std::vector<char> win_fm;      // 窗内候选 FM 标志（对齐 candidates_，整句模式）
   // 词码对表：融合前读一次（2026-11-21 解耦后只含负分），本窗融合复用。
@@ -3246,6 +3325,18 @@ void LlmRerankTranslation::Collect() {
     for (size_t i = 0; i < allc.size(); i++)
       is_fm[i] = (allc[i]->start() == seg_start_ &&
                   allc[i]->end() == seg_end_) ? 1 : 0;
+    // 子词（PM，比等长词短的词典词）清单（2026-11-23 用户定案，两版同构）：
+    // 非满覆盖候选按引擎序去重——只用于"共用 FM 推理结果"的零成本排序与
+    // 指纹绑定，不进评分窗（三块输出的第三块；关闭态无子词概念）
+    {
+      std::map<std::string, char> pm_seen;
+      for (size_t i = 0; i < allc.size(); i++) {
+        if (is_fm[i] || pm_seen.count(allc[i]->text()))
+          continue;
+        pm_seen[allc[i]->text()] = 1;
+        pm_texts.push_back(allc[i]->text());
+      }
+    }
   }
 
   // 语料 W 事件（2026-11-17）：一次满码尝试一条，含 skip 原因。
@@ -3298,9 +3389,18 @@ void LlmRerankTranslation::Collect() {
           candidates_.push_back(allc[c]);
           s1_head.push_back(s1[c]);
           win_fm.push_back(sent_on ? is_fm[c] : (char)0);
-        } else {
-          tail.push_back(allc[c]);
+        } else if (!sent_on || is_fm[c]) {
+          tail.push_back(allc[c]);   // FM 窗外候选：层1 序透传
         }
+      }
+      // 子词块（2026-11-23）：**引擎序**入列（不跟层1 走——三块契约
+      // "匹配在前、部分在后"；块内顺序由下方复用分融合排序决定，无复用
+      // 分者保此处引擎序殿后）。上面的 idx 循环是层1 序，故单独按 allc
+      // 原序收集。
+      if (sent_on) {
+        for (size_t i = 0; i < allc.size(); i++)
+          if (!in_win[i] && !is_fm[i])
+            pm_tail.push_back(allc[i]);
       }
     }
     // 语料 W 的 window 字段 = 层1/TCS 准入后、重排前的评分窗（原序）。
@@ -3377,21 +3477,17 @@ void LlmRerankTranslation::Collect() {
       std::vector<llama_token> ctx_probe = tokenize(ctx.c_str());
       if ((int)ctx_probe.size() >= g_min_tokens) {
         // ═══ 评分三路径（2026-11-22 异步基建，同步路径零 LLM）═══
-        // 指纹 = 归一化上文 \x1f 候选 \x1e 拼接（与插件版同构；上下文/
-        // 候选变化自然失效，无需失效链）。①缓存命中（同指纹重复 query，
-        // 0 LLM）②字词模式 submit+wait（immediate 跳去抖 + 250ms 上限
-        // ——与既有同步评分等价的延迟面，当前词重排零回归）③整句模式
-        // 纯异步投递（挂账 pending，评分结果由后续 Collect 收割回填）。
-        std::string fp = ctx;
-        fp.push_back('\x1f');
+        // 指纹 = 归一化上文 \x1f 候选 \x1e 拼接（2026-11-23 再追加子词
+        // 清单 \x1d——复用分与候选集同快照；与插件版同构；上下文/候选变化
+        // 自然失效，无需失效链）。①缓存命中（同指纹重复 query，0 LLM）
+        // ②字词模式 submit+wait（immediate 跳去抖 + 250ms 上限——与既有
+        // 同步评分等价的延迟面，当前词重排零回归）③整句模式纯异步投递
+        //（挂账 pending，评分结果由后续 Collect 收割回填）。
         std::vector<std::string> cand_texts;
         cand_texts.reserve(candidates_.size());
-        for (size_t ci = 0; ci < candidates_.size(); ci++) {
-          if (ci)
-            fp.push_back('\x1e');
-          fp += candidates_[ci]->text();
+        for (size_t ci = 0; ci < candidates_.size(); ci++)
           cand_texts.push_back(candidates_[ci]->text());
-        }
+        std::string fp = async_fingerprint(ctx, cand_texts, pm_texts);
 
         AsyncRes snap;
         bool have_snap = false;
@@ -3401,7 +3497,7 @@ void LlmRerankTranslation::Collect() {
           have_snap = true;
         }
         if (!have_snap) {
-          std::string sfp = async_submit(ctx, cand_texts, !sent_on);
+          std::string sfp = async_submit(ctx, cand_texts, pm_texts, !sent_on);
           if (sfp.empty()) {
             wstatus = "skip";
             wskip = "async_failed";  // 任务不成立（理论上文/窗已过守卫）
@@ -3452,6 +3548,7 @@ void LlmRerankTranslation::Collect() {
           ev_ms = snap.ev_ms;
           prep_hit = snap.prep_hit;
           ctx_used = snap.ctx_used;
+          pm_scores_of = snap.pm_scores;   // 子词复用分（2026-11-23）
           for (size_t i = 0; i < candidates_.size(); i++) {
             score_of[i] = snap.scores[i];
             has_score[i] = snap.scores[i] > -1e9;
@@ -3553,6 +3650,54 @@ void LlmRerankTranslation::Collect() {
       order.clear();
       for (auto &x : fused)
         order.push_back(x.second);
+    }
+
+    // ═══ 子词块排序（2026-11-23 用户定案：共用等长词的推理结果，零成本）═══
+    // PM 的前 k 个 token 与某个 FM 候选的前 k 个 token 逐位相同（k =
+    // min(PM token 数, 3)）时，其条件概率与 FM 的同位置 CE 分量完全相同
+    //（同一上文 + 同一前缀）——评分线程已用 FM token 前缀匹配好复用分
+    //（零 decode）。有复用分 → 与 FM 同款融合（CE + β·log1p(eff) + 累计 +
+    // pairfix）后按分降序（同分保引擎序）；无复用分（典型 = 单字 PM 而 FM
+    // 首 token 是多字 token）→ 保引擎序殿后；评分未就绪（async_pending 轮，
+    // pm_scores_of 空）→ 整块引擎序（旧行为不变）。
+    if (sent_on && pm_tail.size() > 1 &&
+        pm_scores_of.size() == pm_texts.size()) {
+      std::map<std::string, size_t> pm_idx;
+      for (size_t i = 0; i < pm_texts.size(); i++)
+        pm_idx[pm_texts[i]] = i;
+      std::vector<size_t> ord(pm_tail.size());
+      std::vector<double> fused(pm_tail.size(), -1e308);
+      std::vector<char> has(pm_tail.size(), 0);
+      for (size_t i = 0; i < pm_tail.size(); i++) {
+        ord[i] = i;
+        auto it = pm_idx.find(pm_tail[i]->text());
+        if (it == pm_idx.end())
+          continue;
+        double s = pm_scores_of[it->second];
+        if (s <= -1e9)
+          continue;
+        has[i] = 1;
+        double s1 = g_freq_beta *
+                        std::log(1.0 + user_freq_eff(pm_tail[i]->text(), input_)) +
+                    user_unigram_term(pm_tail[i]->text(), input_);
+        double pf = pf_on
+                        ? pairfix_delta(pf_tbl, pm_tail[i]->text(), input_)
+                        : 0.0;
+        fused[i] = s + s1 + pf;
+      }
+      std::stable_sort(ord.begin(), ord.end(), [&](size_t a, size_t b) {
+        bool ha = has[a] != 0, hb = has[b] != 0;
+        if (ha != hb)
+          return ha;              // 有复用分者在前
+        if (!ha)
+          return a < b;           // 无分者保引擎序殿后
+        return fused[a] > fused[b];
+      });
+      std::vector<an<Candidate>> sorted;
+      sorted.reserve(pm_tail.size());
+      for (size_t k : ord)
+        sorted.push_back(pm_tail[k]);
+      pm_tail.swap(sorted);
     }
 
     // 两码整句最终置顶块已删（2026-11-22 整句模式定案）：满覆盖候选已在
@@ -3682,12 +3827,18 @@ void LlmRerankTranslation::Collect() {
         int base = (int)candidates_.size();
         for (size_t j = 0; j < tail.size(); j++)
           live_c(tail[j], -1, "", "", 0, base + (int)j + 1, 0, 0);
+        base += (int)tail.size();
+        for (size_t j = 0; j < pm_tail.size(); j++)
+          live_c(pm_tail[j], -1, "", "", 0, base + (int)j + 1, 0, 0);
       } else {
         for (size_t i = 0; i < candidates_.size(); i++)
           live_c(candidates_[i], (int)i, "", "", 0, (int)i + 1, 0, 1);
         int base = (int)candidates_.size();
         for (size_t j = 0; j < tail.size(); j++)
           live_c(tail[j], -1, "", "", 0, base + (int)j + 1, 0, 0);
+        base += (int)tail.size();
+        for (size_t j = 0; j < pm_tail.size(); j++)
+          live_c(pm_tail[j], -1, "", "", 0, base + (int)j + 1, 0, 0);
       }
     }
     std::vector<std::string> final_vec;
@@ -3713,7 +3864,11 @@ void LlmRerankTranslation::Collect() {
     }
   }
 
+  // 三块输出（2026-11-22 整句模式）：FM 窗外候选按层1 序 → 子词块（2026-
+  // 11-23 起按复用分融合排序，无分者引擎序殿后）。关闭态 only 层1 序 tail。
   for (auto &c : tail)
+    candidates_.push_back(c);
+  for (auto &c : pm_tail)
     candidates_.push_back(c);
 }
 
