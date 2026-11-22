@@ -53,6 +53,7 @@ scripts/*
 !scripts/stress_corpus.py
 !scripts/pdb_syms.py
 !scripts/symresolve.c
+!scripts/rime_cand_probe.cpp
 !scripts/build_test_llm_context.bat
 !scripts/probe_wps_ctx.cpp
 !scripts/build_probe_wps_ctx.bat

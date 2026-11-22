@@ -618,7 +618,7 @@ def ensure_foreground(hwnd=None, office=False):
     return False
 
 
-def ime_heal(hwnd, ev_path):
+def ime_heal(hwnd, ev_paths):
     """环境自愈（2026-09-13 深夜真机教训全收录）：
     1. 点击客户区复位 caret（编辑焦点丢失时注入键全部无效）
     2. wkjl 探针：满码评分行出现 = weasel 活 + 中文态（一石二鸟——
@@ -627,10 +627,17 @@ def ime_heal(hwnd, ev_path):
        小狼毫通常在 2-3 轮内回到）
     4. 中途若输入法选择器滞留抢前台（类名异常）→ Esc 关闭
     注意：绝不能 taskkill WeaselServer——会丢各应用的输入法绑定（Windows
-    自动切到其他 TIP），恢复只能逐窗 Win+Space，且部分应用要重启。"""
+    自动切到其他 TIP），恢复只能逐窗 Win+Space，且部分应用要重启。
+    2026-11-22 分方案目录：行数按全部语料文件（含方案子目录）汇总。"""
     def nlines():
-        return len(open(ev_path, encoding="utf-8", errors="replace")
-                   .read().splitlines())
+        total = 0
+        for p in corpus_paths():     # 每轮重扫：切方案/新目录即时纳入
+            try:
+                total += len(open(p, encoding="utf-8", errors="replace")
+                             .read().splitlines())
+            except OSError:
+                pass
+        return total
     def probe():
         n0 = nlines()
         for ch in "wkjl":
@@ -722,7 +729,7 @@ def main():
     user32.SetForegroundWindow(hwnd) if hwnd else None
     time.sleep(0.6)
 
-    if not ime_heal(hwnd, events):
+    if not ime_heal(hwnd, paths):
         print("ERROR: IME not usable after heal attempts - "
               "check tray input method is 小狼毫 Chinese mode, then rerun")
         sys.exit(2)

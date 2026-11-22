@@ -429,27 +429,41 @@ def l3_two_key(hwnd, cor, dbg):
 
 
 def check_schema(log):
-    """最新 H 行须为 luna_pinyin（当前方案校验）。跨方案目录取 ts 最新的
-    H 行——当前方案的语料文件才是刚写过 H 的那个。"""
-    rows = []
-    for p in log.paths:
-        for ln in log._lines(p):
-            if ln.startswith("H\t"):
-                parts = ln.split("\t")
-                rows.append((parts[2] if len(parts) > 2 else "", parts))
-    rows.sort(key=lambda x: x[0])
-    if not rows:
-        warn("no H row")
-        return
-    last = rows[-1][1]
-    schema = last[4] if len(last) > 4 else "?"
+    """当前方案校验（luna_pinyin）。
+
+    2026-11-22 按方案分目录后不能再看"最新 H 行"——当前方案的 H 行要等本方案
+    首次打字才写，切换后立即跑测试时最新 H 仍属旧方案（实测 pdsp 05:28 的 H
+    压过 luna 05:09 的 H → 误报 ABORT）。改按**部署产物** build/default.yaml
+    的 schema_list 判定（恰好一个方案 = 当前唯一可选方案）；读不到时回退
+    最新 H 行（旧行为）。"""
+    import re as _re
+    dy = os.path.join(APPDATA, "Rime", "build", "default.yaml")
+    try:
+        txt = open(dy, encoding="utf-8", errors="replace").read()
+        m = _re.search(r"schema_list:\s*\n((?:\s*-\s*schema:\s*\S+\s*\n?)+)", txt)
+        ids = _re.findall(r"schema:\s*(\S+)", m.group(1)) if m else []
+    except OSError:
+        ids = []
+    schema = ids[0] if len(ids) == 1 else None
+    if schema is None:
+        rows = []
+        for p in log.paths:
+            for ln in log._lines(p):
+                if ln.startswith("H\t"):
+                    parts = ln.split("\t")
+                    rows.append((parts[2] if len(parts) > 2 else "", parts))
+        rows.sort(key=lambda x: x[0])
+        if not rows:
+            warn("no H row")
+            return
+        last = rows[-1][1]
+        schema = last[4] if len(last) > 4 else "?"
+        print("[pre] 当前方案 = %s（按最新 H 行判定）" % schema)
     if schema != "luna_pinyin":
         print("ABORT: 当前方案 = %s（需 luna_pinyin，请手动切换后重跑）"
               % schema)
         sys.exit(3)
-    print("[pre] 当前方案 = luna_pinyin ✓（model=%s sentence=%s）"
-          % (last[6] if len(last) > 6 else "?",
-             last[10] if len(last) > 10 else "?"))
+    print("[pre] 当前方案 = luna_pinyin ✓（schema_list 唯一）")
 
 
 def main():

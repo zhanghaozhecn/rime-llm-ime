@@ -9,6 +9,9 @@
 #include <algorithm>
 #include <stack>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <boost/algorithm/string/join.hpp>
 #include <boost/range/adaptor/reversed.hpp>
 #include <rime/common.h>
@@ -450,9 +453,25 @@ static bool has_exact_match_phrase(Ptr ptr, Iter iter, size_t consumed) {
 
 // ScriptTranslation implementation
 
+// 引擎耗时探针（2026-11-23，滑窗改造定位用）：RIME_PROBE_TIMING=1 时
+// 在 stderr 打印每次 Query 的分段耗时（建音节图/词典查询/造句）。
+// 默认零开销（一次 getenv + 分支），不影响生产行为。
+static bool probe_timing_on() {
+  static const bool on = getenv("RIME_PROBE_TIMING") != nullptr;
+  return on;
+}
+static double probe_now_ms() {
+  using namespace std::chrono;
+  return duration<double, std::milli>(
+             steady_clock::now().time_since_epoch()).count();
+}
+
 bool ScriptTranslation::Evaluate(Dictionary* dict, UserDictionary* user_dict) {
+  const bool tm = probe_timing_on();
+  const double t0 = tm ? probe_now_ms() : 0.0;
   size_t consumed = syllabifier_->BuildSyllableGraph(*dict->prism());
   const auto& syllable_graph = syllabifier_->syllable_graph();
+  const double t1 = tm ? probe_now_ms() : 0.0;
   bool predict_word = translator_->enable_word_completion() &&
                       start_ + consumed == end_of_input_;
 
@@ -465,6 +484,7 @@ bool ScriptTranslation::Evaluate(Dictionary* dict, UserDictionary* user_dict) {
         user_dict->Lookup(syllable_graph, 0, kUnlimitedDepth,
                           predict_word ? kNumSyllablesToPredictWord : 0);
   }
+  const double t2 = tm ? probe_now_ms() : 0.0;
   if (!phrase_ && !user_phrase_)
     return false;
 
@@ -504,6 +524,15 @@ bool ScriptTranslation::Evaluate(Dictionary* dict, UserDictionary* user_dict) {
       else
         sentences_.clear();
     }
+  }
+
+  const double t3 = tm ? probe_now_ms() : 0.0;
+  if (tm) {
+    fprintf(stderr,
+            "[timing] buildgraph=%.2f lookup=%.2f sentence=%.2f groups=%zu/%zu\n",
+            t1 - t0, t2 - t1, t3 - t2,
+            phrase_ ? phrase_->size() : 0,
+            user_phrase_ ? user_phrase_->size() : 0);
   }
 
   return !CheckEmpty();
@@ -715,13 +744,31 @@ WordGraph ScriptTranslation::PrepareForMakingSentence(
   return graph;
 }
 
+// 滑窗组句（2026-11-23，千问 seg_window_syllables 思路）：WordGraph 的 key
+// = 音节边界位置（升序）。窗口 W>0 时只在前 W 个音节位置内组句（前缀整句），
+// 控制长拼写串的组句规模；W<=0 或位置不足 → 原 total_length（行为不变）。
+static size_t EffectiveSentenceLength(const WordGraph& graph,
+                                      size_t total_length, int window) {
+  if (window <= 0)
+    return total_length;
+  size_t n = 0;
+  for (const auto& sv : graph) {
+    if (++n > static_cast<size_t>(window))
+      return sv.first;  // 第 W+1 个位置 = 窗口末端
+  }
+  return total_length;
+}
+
 deque<an<Sentence>> ScriptTranslation::MakeSentences(
     Dictionary* dict,
     UserDictionary* user_dict) {
   const auto& syllable_graph = syllabifier_->syllable_graph();
   WordGraph graph = PrepareForMakingSentence(dict, user_dict);
+  const size_t total_len = EffectiveSentenceLength(
+      graph, syllable_graph.interpreted_length,
+      translator_->seg_window_syllables());
   auto sentences =
-      poet_->MakeSentences(graph, syllable_graph.interpreted_length,
+      poet_->MakeSentences(graph, total_len,
                            translator_->GetPrecedingText(start_),
                            max_sentences_, sentence_cutoff_threshold_);
   for (auto& sentence : sentences) {
@@ -735,8 +782,11 @@ an<Sentence> ScriptTranslation::MakeSentence(Dictionary* dict,
                                              UserDictionary* user_dict) {
   const auto& syllable_graph = syllabifier_->syllable_graph();
   WordGraph graph = PrepareForMakingSentence(dict, user_dict);
+  const size_t total_len = EffectiveSentenceLength(
+      graph, syllable_graph.interpreted_length,
+      translator_->seg_window_syllables());
   if (auto sentence =
-          poet_->MakeSentence(graph, syllable_graph.interpreted_length,
+          poet_->MakeSentence(graph, total_len,
                               translator_->GetPrecedingText(start_))) {
     sentence->Offset(start_);
     sentence->set_syllabifier(syllabifier_);

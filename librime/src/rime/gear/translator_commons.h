@@ -168,6 +168,8 @@ class TranslatorOptions {
   Projection& preedit_formatter() { return preedit_formatter_; }
   Projection& comment_formatter() { return comment_formatter_; }
   const hash_set<string>& blacklist() { return blacklist_; }
+  // 滑窗组句音节数（0 = 关闭，2026-11-23）
+  int seg_window_syllables() const { return seg_window_syllables_; }
 
  protected:
   string delimiters_;
@@ -178,6 +180,10 @@ class TranslatorOptions {
   double initial_quality_ = 0.;
   int max_sentences_ = 1;
   double sentence_cutoff_threshold_ = 0.1;
+  // 滑窗组句（2026-11-23）：>0 时句子只在前 N 个音节位置内组句（前缀整句），
+  // 控制长拼写串的组句规模；0 = 关闭（缺省，行为不变）。
+  // 语义 = 千问 fork 的 seg_window_syllables（poet 滑窗分段造句）。
+  int seg_window_syllables_ = 0;
   Projection preedit_formatter_;
   Projection comment_formatter_;
   Patterns user_dict_disabling_patterns_;

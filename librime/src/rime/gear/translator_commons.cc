@@ -129,6 +129,10 @@ TranslatorOptions::TranslatorOptions(const Ticket& ticket) {
     max_sentences_ = std::min(std::max(1, max_sentences_), 100);
     config->GetDouble(ticket.name_space + "/sentence_cutoff_threshold",
                       &sentence_cutoff_threshold_);
+    // 滑窗组句（2026-11-23）：0 = 关闭；>0 = 句子只在前 N 个音节位置内组句
+    config->GetInt(ticket.name_space + "/seg_window_syllables",
+                   &seg_window_syllables_);
+    seg_window_syllables_ = std::max(0, seg_window_syllables_);
 
     preedit_formatter_.Load(
         config->GetList(ticket.name_space + "/preedit_format"));

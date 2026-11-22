@@ -3216,13 +3216,12 @@ void LlmRerankTranslation::Collect() {
   // 一次性完整翻译所有候选——朙月大词库的候选爆炸主要来自连续声母简拼
   // （全拼串的 completion 有限，简拼串海量），单码秒级 CPU
   // （enabled=false 对照实测 40 倍差）→ 每键卡死。
-  // 双重限制：32 上限 + **30ms 时间预算**（个数闸管收多少、预算闸管贵不
+  // 双重限制：16 上限 + **30ms 时间预算**（个数闸管收多少、预算闸管贵不
   // 贵；深枚举的单次 Peek 内部秒级、预算无法打断——必须在深枚举发起前
-  // 拦住）。上限取 32（2026-11-22 用户定案）：全拼打字正确候选大部分本
-  // 就在引擎前 10，且 Rime user_dict 自带用户调频——打过的词引擎自己会
-  // 提前，层1 全量收集的边际价值可忽略（与 ledger 证据链重叠）；窗口 6
-  // + 满覆盖组 + 翻页余量 = 32 足够。
-  constexpr size_t kMaxCollect = 32;
+  // 拦住）。上限取 16（2026-11-23 wiki 全拼实测：真实引擎候选序中正确候选
+  // 位置 p95=2 / p99=7 / p99.9=20，16 覆盖 99.82% 词型、99.92% 词频加权；
+  // 32 的边际覆盖仅 +0.16pp，性价比不足）。
+  constexpr size_t kMaxCollect = 16;
   const auto collect_budget = std::chrono::milliseconds(30);
   const auto collect_start = std::chrono::steady_clock::now();
   for (size_t n = 0; n < kMaxCollect; n++) {
