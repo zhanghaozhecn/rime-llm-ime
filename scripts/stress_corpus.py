@@ -11,6 +11,22 @@ import subprocess
 
 APPDATA = os.environ.get("APPDATA", "")
 CORPUS = os.path.join(APPDATA, r"Rime\llm_rerank\rime_llm_corpus.tsv")
+
+
+def corpus_paths():
+    """2026-11-22 按方案分文件夹：语料在 llm_rerank\\<方案>\\；根目录旧
+    混合文件一并纳入（历史码照样回放）。"""
+    base = os.path.join(APPDATA, "Rime")
+    paths = [os.path.join(base, "rime_llm_corpus.tsv"), CORPUS]
+    root = os.path.join(base, "llm_rerank")
+    try:
+        for name in sorted(os.listdir(root)):
+            p = os.path.join(root, name, "rime_llm_corpus.tsv")
+            if os.path.isfile(p):
+                paths.append(p)
+    except OSError:
+        pass
+    return [p for p in paths if os.path.isfile(p)]
 NOTEPAD_HWND = 393644
 KEY_GAP = 0.06          # 码内 60ms/键 = 快速连打（贴近卡死场景）
 CODE_PAUSE = 0.35
@@ -219,18 +235,23 @@ def main():
         print("usage: stress_corpus.py <server_pid>")
         sys.exit(2)
 
-    # ── 语料码序列提取（tsf 来源真实输入码，首次出现序）──
+    # ── 语料码序列提取（tsf 来源真实输入码，首次出现序；跨方案目录汇总）──
     codes, seen = [], set()
-    with open(CORPUS, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            p = line.split("\t")
-            if p[0] == "W" and len(p) > 5 and p[3] == "tsf":
-                c = p[4]
-                if (c and c not in seen and 1 < len(c) <= 24
-                        and all("a" <= x <= "z" for x in c)):
-                    seen.add(c)
-                    codes.append(c)
-    print("codes=%d (unique, tsf)" % len(codes))
+    for path in corpus_paths():
+        try:
+            f = open(path, "r", encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                p = line.split("\t")
+                if p[0] == "W" and len(p) > 5 and p[3] == "tsf":
+                    c = p[4]
+                    if (c and c not in seen and 1 < len(c) <= 24
+                            and all("a" <= x <= "z" for x in c)):
+                        seen.add(c)
+                        codes.append(c)
+    print("codes=%d (unique, tsf, %d files)" % (len(codes), len(corpus_paths())))
     codes = codes[:80]      # 控制时长 ~90s
 
     # ── 前台 + TSF 重连 ──

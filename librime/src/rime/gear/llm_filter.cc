@@ -924,6 +924,11 @@ struct UserStatEntry {
 static std::map<std::string, UserStatEntry> g_user_stats;
 static long long g_user_tick = 0;
 static bool g_user_stats_loaded = false;
+// 内存账本所属方案（2026-11-22 按方案分目录）：切方案时旧账本先落盘到
+// **旧方案**目录，再清空重载新方案账本——否则新方案保存会把旧方案条目
+// 写进新文件（两套方案混写）
+static std::string g_stats_schema;
+static void user_stats_save_to(const std::string &sid);  // 定义在后
 static int  g_user_stats_dirty = 0;
 // [回撤退款] 引擎线程 bump/查询 × server IPC 线程退款（reset hook）→
 // 账本统一互斥（recursive：bump→ensure_loaded/save 嵌套加锁）。
@@ -967,47 +972,117 @@ static FILE *open_log_file(const char *filename) {
 #endif
 }
 
-// ── LLM 记录子目录（2026-11-21 用户定案）─────────────────────────────
-// RIME 用户文件夹下建 llm_rerank 子目录收纳全部 LLM 数据/日志文件
-// （corpus/debug/账本/词码对）；固定候选 pin_candidates.tsv 属拼读双拼
-// 本机功能，仍留用户文件夹根。resolve 规则：
-//   子目录已有 → 用之；根目录旧文件在 → MoveFile 一次性迁移（含 .old
-//   轮转副本；移动失败 = 读旧写旧，下次再迁，绝不丢数据）。
-static bool llm_dir_ensure(const char *ud) {
-  char dir[MAX_PATH];
-  snprintf(dir, sizeof(dir), "%s\\llm_rerank", ud);
-  if (!CreateDirectoryA(dir, nullptr) &&
-      GetLastError() != ERROR_ALREADY_EXISTS)
+// ── 方案子目录（2026-11-22 用户定案：四件全分）───────────────────────
+// 目录 = <用户文件夹>\llm_rerank\<方案 ID>\：corpus/debug/账本/词码对
+// 四个文件全部按方案隔离（不同方案混写同一语料/日志会让分析无法按方案
+// 切分）。迁移规则："有状态资产"（账本/词码对）在该方案首次读写时从旧
+// 位置**复制**一份（旧文件保留不删）——每个方案各得一份快照，此后独立
+// 演进（键 = 词+码，码与方案绑定、天然不相交，历史条目跨方案共存无害）；
+// 日志（corpus/debug）不复制，该方案从空文件开始写（否则每方案各背一份
+// 全量历史，违背分目录初衷；旧混合日志留作历史）。
+static std::mutex g_schema_mu;
+static std::string g_schema_dir;
+
+static std::string schema_dir_sanitized(const std::string &sid) {
+  if (sid.empty())
+    return "";
+  std::string out;
+  for (size_t i = 0; i < sid.size() && i < 64; i++) {
+    unsigned char c = (unsigned char)sid[i];
+    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+    out.push_back(ok ? (char)c : '_');
+  }
+  return out;
+}
+
+// LoadSchema / Apply 刷新（方案切换 = 新 session → 新 schema_id）
+static void llm_set_schema_id(const std::string &sid) {
+  std::string s = schema_dir_sanitized(sid);
+  std::lock_guard<std::mutex> lk(g_schema_mu);
+  if (g_schema_dir != s)
+    g_schema_dir = s;
+}
+
+static std::string llm_schema_dir_name() {
+  std::lock_guard<std::mutex> lk(g_schema_mu);
+  return g_schema_dir;  // 空 = 方案不可得 → 调用方退回 llm_rerank 根
+}
+
+static bool llm_dir_ensure(const char *dir) {
+  if (!CreateDirectoryA(dir, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
     return false;
   return true;
 }
 
-// 解析 filename 的最终路径：子目录优先 + 根目录旧文件一次性迁移。
+// 解析 filename 的最终路径：<llm_rerank>\<方案>\filename。
+// migrate=true（账本/词码对）→ 该方案首用时从旧位置（llm_rerank 根 /
+// 用户文件夹根）复制一份，旧文件保留；复制失败暂用旧位置，下次再试。
 // 返回 false = 拿不到用户目录（调用方自行回退）。
-static bool llm_file_path(const char *filename, char *path, size_t n) {
+static bool llm_file_path_ex(const char *filename, char *path, size_t n,
+                             bool migrate, const std::string &sid) {
   const RimeApi *api = rime_get_api();
   if (!api || !api->get_user_data_dir) return false;
   const char *ud = api->get_user_data_dir();
   if (!ud || !*ud || strlen(ud) >= n - 80) return false;
-  snprintf(path, n, "%s\\llm_rerank\\%s", ud, filename);
+  char root[MAX_PATH], dir[MAX_PATH];
+  snprintf(root, sizeof(root), "%s\\llm_rerank", ud);
+  // 方案不可得 → 直接用 llm_rerank 根（部署期/崩溃恢复等边缘场景，旧行为）
+  if (sid.empty())
+    snprintf(dir, sizeof(dir), "%s", root);
+  else
+    snprintf(dir, sizeof(dir), "%s\\%s", root, sid.c_str());
+  snprintf(path, n, "%s\\%s", dir, filename);
   if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
-    return true;  // 子目录已有 → 直接用
-  if (!llm_dir_ensure(ud)) {
-    // 目录建不出（权限异常等）：退回根目录原位置，绝不丢数据
+    return true;  // 该方案文件已有 → 直接用
+  if (migrate) {
+    // 旧位置 1 = llm_rerank 根（方案层还不存在时）；
+    // 旧位置 2 = 用户文件夹根
+    for (int i = 0; i < 2; i++) {
+      const char *src = (i == 0) ? root : ud;
+      char oldp[MAX_PATH];
+      snprintf(oldp, sizeof(oldp), "%s\\%s", src, filename);
+      if (strcmp(oldp, path) == 0)   // 目标即旧位置（方案不可得）
+        continue;
+      if (GetFileAttributesA(oldp) == INVALID_FILE_ATTRIBUTES)
+        continue;
+      if (llm_dir_ensure(root) && llm_dir_ensure(dir) &&
+          CopyFileA(oldp, path, TRUE)) {
+        // 顺带复制 .old 轮转副本（有则复制，无则无操作）
+        char oldo[MAX_PATH], newo[MAX_PATH];
+        snprintf(oldo, sizeof(oldo), "%s.old", oldp);
+        snprintf(newo, sizeof(newo), "%s.old", path);
+        if (GetFileAttributesA(oldo) != INVALID_FILE_ATTRIBUTES)
+          CopyFileA(oldo, newo, TRUE);
+        return true;
+      }
+      snprintf(path, n, "%s", oldp);  // 复制失败：暂用旧位置，下次再试
+      return true;
+    }
+  }
+  if (!llm_dir_ensure(root) || !llm_dir_ensure(dir)) {
+    // 目录建不出（权限异常等）：退回用户文件夹根原位置，绝不丢数据
     snprintf(path, n, "%s\\%s", ud, filename);
     return true;
   }
-  char oldp[MAX_PATH];
-  snprintf(oldp, sizeof(oldp), "%s\\%s", ud, filename);
-  if (GetFileAttributesA(oldp) != INVALID_FILE_ATTRIBUTES) {
-    MoveFileA(oldp, path);  // 失败 = 仍读旧写旧（下次 resolve 再迁）
-    char oldo[MAX_PATH], newo[MAX_PATH];
-    snprintf(oldo, sizeof(oldo), "%s.old", oldp);
-    snprintf(newo, sizeof(newo), "%s.old", path);
-    if (GetFileAttributesA(oldo) != INVALID_FILE_ATTRIBUTES)
-      MoveFileA(oldo, newo);
-  }
   return true;
+}
+
+// 日志（corpus/debug）：不迁移，该方案独享新文件
+static bool llm_file_path(const char *filename, char *path, size_t n) {
+  return llm_file_path_ex(filename, path, n, false, llm_schema_dir_name());
+}
+
+// 有状态资产（账本/词码对）：首用复制快照
+static bool llm_state_file_path(const char *filename, char *path, size_t n) {
+  return llm_file_path_ex(filename, path, n, true, llm_schema_dir_name());
+}
+
+// 指定方案的账本/词码对路径（切方案时把**旧方案**内存账本落盘到旧目录）
+static bool llm_state_file_path_for(const std::string &sid,
+                                    const char *filename, char *path,
+                                    size_t n) {
+  return llm_file_path_ex(filename, path, n, true, sid);
 }
 
 // user_ledger.tsv 路径 (RIME 用户目录 llm_rerank 子目录; 与日志同目录解析)。
@@ -1015,7 +1090,14 @@ static bool llm_file_path(const char *filename, char *path, size_t n) {
 // 累计 cum 同一行）；旧 user_eff.tsv / user_unigram.tsv 由读取端一次性
 // 迁移（只读, 旧文件保留不删），落盘一律写新名。
 static bool user_ledger_file(char *path, size_t n) {
-  return llm_file_path("user_ledger.tsv", path, n);
+  // 有状态资产：该方案首次使用时从旧位置复制快照（2026-11-22 分目录）
+  return llm_state_file_path("user_ledger.tsv", path, n);
+}
+
+// 指定方案的账本路径（切方案落盘旧账本用，2026-11-22）
+static bool user_ledger_file_for(const std::string &sid, char *path,
+                                 size_t n) {
+  return llm_state_file_path_for(sid, "user_ledger.tsv", path, n);
 }
 
 // 含中文字符判定（U+4E00–U+9FFF；UTF-8 三字节首字节 E4–E9）。
@@ -1142,9 +1224,16 @@ static void user_stats_load_legacy_uni() {
 
 static void user_stats_ensure_loaded() {
   std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
-  if (g_user_stats_loaded)
+  const std::string sid = llm_schema_dir_name();
+  if (g_user_stats_loaded && g_stats_schema == sid)
     return;
+  if (g_user_stats_loaded) {
+    // 方案切换（2026-11-22 分目录）：旧方案账本落盘到旧目录后重载新方案
+    user_stats_save_to(g_stats_schema);
+    g_user_stats.clear();
+  }
   g_user_stats_loaded = true;
+  g_stats_schema = sid;
   char path[MAX_PATH];
   if (!user_ledger_file(path, sizeof(path)))
     return;
@@ -1246,7 +1335,8 @@ static const double kPairFixPenaltyDefault = 5.0;
 static const long long kPairFixFadeUni = 3;
 
 static bool pairfix_file(char *path, size_t n) {
-  return llm_file_path("llm_pairfix.tsv", path, n);
+  // 有状态资产：该方案首次使用时从旧位置复制快照（2026-11-22 分目录）
+  return llm_state_file_path("llm_pairfix.tsv", path, n);
 }
 
 // 读参考表 → out[key 词\t码] = 有符号分数；返回 false = 文件缺失（休眠）
@@ -1303,10 +1393,14 @@ static double pairfix_delta(const std::map<std::string, double> &tbl,
   return it->second;
 }
 
-static void user_stats_save() {
+static void user_stats_save_to(const std::string &sid) {
   std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
   char path[MAX_PATH];
-  if (!user_ledger_file(path, sizeof(path)))
+  const std::string target = sid.empty() ? llm_schema_dir_name() : sid;
+  bool got = target == llm_schema_dir_name()
+                 ? user_ledger_file(path, sizeof(path))
+                 : user_ledger_file_for(target, path, sizeof(path));
+  if (!got)
     return;
   FILE *f = fopen(path, "w");
   if (!f)
@@ -1329,6 +1423,10 @@ static void user_stats_save() {
             kv.second.tick, kv.second.cum);
   }
   fclose(f);
+}
+
+static void user_stats_save() {
+  user_stats_save_to(g_stats_schema);
 }
 
 static void user_stats_bump(const std::string &w, const std::string &code) {
@@ -1405,9 +1503,11 @@ static const char *kCorpusMagic = "#RIME_CORPUS\tv2\t";
 static const char *kDebugMagic = "#RIME_DEBUG|v2|";
 static const unsigned long long kDebugRotateBytes = 10ull * 1024 * 1024;
 static std::mutex g_log_mu;
-static bool g_corpus_checked = false;
+// 头部检查按**路径**缓存（2026-11-22 分方案）：同一进程可能写多个方案的
+// 语料/debug 文件，一次性布尔会让第二个方案跳过头部校验直接追加
+static std::string g_corpus_checked_path;
 static bool g_corpus_ok = true;
-static bool g_debug_checked = false;
+static std::string g_debug_checked_path;
 static bool g_debug_ok = true;
 static std::atomic<long long> g_event_seq{0};
 static std::mutex g_event_mu;
@@ -1630,8 +1730,8 @@ static void corpus_write_raw(const std::string &line) {
   char path[MAX_PATH];
   if (!log_file_path(kCorpusFile, path, sizeof(path)))
     return;
-  if (!g_corpus_checked) {
-    g_corpus_checked = true;
+  if (g_corpus_checked_path != path) {
+    g_corpus_checked_path = path;
     g_corpus_ok = check_header_locked(
         path, kCorpusMagic,
         (std::string(kCorpusMagic) + now_stamp() + "\tsource").c_str());
@@ -1653,8 +1753,8 @@ static void debug_write_raw(const std::string &line, bool force) {
   char path[MAX_PATH];
   if (!log_file_path(kDebugFile, path, sizeof(path)))
     return;
-  if (!g_debug_checked) {
-    g_debug_checked = true;
+  if (g_debug_checked_path != path) {
+    g_debug_checked_path = path;
     g_debug_ok = check_header_locked(
         path, kDebugMagic,
         (std::string(kDebugMagic) + now_stamp() + "|source").c_str());
@@ -3113,13 +3213,16 @@ void LlmRerankTranslation::Collect() {
 
   std::vector<an<Candidate>> allc;
   // 限量收集（2026-11-22 卡死修复，与插件版同构）：旧全量收集强制引擎
-  // 一次性完整翻译所有候选——朙月大词库歧义/部分码串的 completion 候选
-  // 海量，单码秒级 CPU（enabled=false 对照实测 40 倍差）→ 每键卡死。
-  // 双重限制：256 上限 + **30ms 时间预算**（大词库早停、小词库全收；
-  // 深枚举的单次 Peek 内部秒级、预算无法打断——必须在深枚举发起前
-  // 拦住：30ms 处即 break，候选收集 10~20 个，层1 选窗足够）。层1 词频选窗在已收集范围内仍有效（用户提频
-  // 词在候选前列）。
-  constexpr size_t kMaxCollect = 256;
+  // 一次性完整翻译所有候选——朙月大词库的候选爆炸主要来自连续声母简拼
+  // （全拼串的 completion 有限，简拼串海量），单码秒级 CPU
+  // （enabled=false 对照实测 40 倍差）→ 每键卡死。
+  // 双重限制：32 上限 + **30ms 时间预算**（个数闸管收多少、预算闸管贵不
+  // 贵；深枚举的单次 Peek 内部秒级、预算无法打断——必须在深枚举发起前
+  // 拦住）。上限取 32（2026-11-22 用户定案）：全拼打字正确候选大部分本
+  // 就在引擎前 10，且 Rime user_dict 自带用户调频——打过的词引擎自己会
+  // 提前，层1 全量收集的边际价值可忽略（与 ledger 证据链重叠）；窗口 6
+  // + 满覆盖组 + 翻页余量 = 32 足够。
+  constexpr size_t kMaxCollect = 32;
   const auto collect_budget = std::chrono::milliseconds(30);
   const auto collect_start = std::chrono::steady_clock::now();
   for (size_t n = 0; n < kMaxCollect; n++) {
@@ -3622,6 +3725,10 @@ void LlmRerankTranslation::Collect() {
 static void on_context_changed(const char *text);  // defined below
 
 LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
+  // 方案子目录（2026-11-22 四件全分）：先固定当前方案 ID——H 行/账本/
+  // 词码对/语料的路径解析都依赖它，必须早于本构造内的任何写入
+  if (engine_ && engine_->schema())
+    llm_set_schema_id(engine_->schema()->schema_id());
   // read LLM config from the scheme's llm_rerank section.
   // The filter's position in the filter pipeline is scheme-defined, so the
   // config lives in the scheme: the LLM-enabled scheme is maintained in the
@@ -4058,15 +4165,24 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
   // llm_rerank 子目录确保（2026-11-21 记录文件收进子目录）：进程内一次。
   // 与 enabled 无关——固定候选 lua（pin_candidates.tsv 仍在根目录）的
   // 一次性迁移假定该子目录可被尽早建出；记录文件 resolve 内也会兜底建。
+  // 2026-11-22 分方案后：只确保根目录，方案层由 llm_file_path_ex 建。
   static bool llm_subdir_ensured = false;
   if (!llm_subdir_ensured) {
     llm_subdir_ensured = true;
     const RimeApi *api0 = rime_get_api();
     if (api0 && api0->get_user_data_dir) {
       const char *ud0 = api0->get_user_data_dir();
-      if (ud0 && *ud0) llm_dir_ensure(ud0);
+      if (ud0 && *ud0) {
+        char root0[MAX_PATH];
+        snprintf(root0, sizeof(root0), "%s\\llm_rerank", ud0);
+        llm_dir_ensure(root0);
+      }
     }
   }
+
+  // 方案 ID 跟随（2026-11-22 分目录）：session 内固定，变更检查微秒级
+  if (engine_ && engine_->schema())
+    llm_set_schema_id(engine_->schema()->schema_id());
 
   // 词码对记账/语料 C 的码快照：必须在本函数**所有**早退路径之前更新。
   // 此前只在 LlmRerankTranslation 构造时赋值——ctx_empty/model_loading/

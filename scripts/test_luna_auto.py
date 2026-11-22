@@ -22,8 +22,6 @@ import time
 import subprocess
 
 APPDATA = os.environ.get("APPDATA", "")
-CORPUS = os.path.join(APPDATA, r"Rime\llm_rerank\rime_llm_corpus.tsv")
-DEBUGF = os.path.join(APPDATA, r"Rime\llm_rerank\rime_llm_debug.txt")
 TAG = ""
 
 PASS, FAIL, WARN = [], [], []
@@ -136,26 +134,86 @@ def clear_doc():
     time.sleep(0.3)
 
 
-# ── 语料观察（wait_new 兼容整句模式异步挂账行）──────────────
+# ── 语料观察（跨方案目录汇总：2026-11-22 起文件在 llm_rerank\<方案>\）──
+def _corpus_paths():
+    base = os.path.join(APPDATA, "Rime")
+    paths = [os.path.join(base, "rime_llm_corpus.tsv")]
+    root = os.path.join(base, "llm_rerank")
+    paths.append(os.path.join(root, "rime_llm_corpus.tsv"))
+    try:
+        for name in sorted(os.listdir(root)):
+            p = os.path.join(root, name, "rime_llm_corpus.tsv")
+            if os.path.isfile(p):
+                paths.append(p)
+    except OSError:
+        pass
+    return [p for p in paths if os.path.isfile(p)]
+
+
+def _debug_paths():
+    base = os.path.join(APPDATA, "Rime")
+    paths = [os.path.join(base, "rime_llm_debug.txt")]
+    root = os.path.join(base, "llm_rerank")
+    paths.append(os.path.join(root, "rime_llm_debug.txt"))
+    try:
+        for name in sorted(os.listdir(root)):
+            p = os.path.join(root, name, "rime_llm_debug.txt")
+            if os.path.isfile(p):
+                paths.append(p)
+    except OSError:
+        pass
+    return [p for p in paths if os.path.isfile(p)]
+
+
 class CorpusLog:
     def __init__(self):
-        self.mark = self._nlines()
+        self.paths = _corpus_paths()
+        self.mark = {p: self._nlines(p) for p in self.paths}
 
-    def _lines(self):
+    def _lines(self, path):
         try:
-            with open(CORPUS, "r", encoding="utf-8", errors="replace") as f:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
                 return f.read().splitlines()
         except OSError:
             return []
 
-    def _nlines(self):
-        return len(self._lines())
+    def _nlines(self, path):
+        return len(self._lines(path))
+
+    def _refresh(self):
+        for p in _corpus_paths():
+            if p not in self.mark:
+                self.mark[p] = self._nlines(p)
+                self.paths.append(p)
+
+    def _new(self):
+        """本观察期新增行，跨文件按 ts 升序（新→旧 = reversed）。"""
+        self._refresh()
+        out = []
+        for p in self.paths:
+            lines = self._lines(p)
+            m = self.mark.get(p, 0)
+            if len(lines) < m:
+                m = 0
+            for ln in lines[m:]:
+                if not ln or ln.startswith("#"):
+                    continue
+                parts = ln.split("\t")
+                ts = parts[2] if len(parts) > 2 else ""
+                out.append((ts, ln))
+        out.sort(key=lambda x: x[0])
+        return [x[1] for x in out]
+
+    def reset_marks(self):
+        self._refresh()
+        for p in self.paths:
+            self.mark[p] = self._nlines(p)
 
     def wait_new(self, code, timeout=4.0):
         """该码的最新评分受理行：优先 ok，兼容 skip|async_pending。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            for ln in reversed(self._lines()[self.mark:]):
+            for ln in reversed(self._new()):
                 p = ln.split("\t")
                 if len(p) < 14 or p[0] != "W" or p[4] != code:
                     continue
@@ -172,7 +230,7 @@ class CorpusLog:
         """该码的最新 skip 行且 skip=reason（full_len_lt2 等预期性跳过）。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            for ln in reversed(self._lines()[self.mark:]):
+            for ln in reversed(self._new()):
                 p = ln.split("\t")
                 if len(p) < 14 or p[0] != "W" or p[4] != code:
                     continue
@@ -184,7 +242,7 @@ class CorpusLog:
     def wait_commit(self, code=None, timeout=4.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            for ln in reversed(self._lines()[self.mark:]):
+            for ln in reversed(self._new()):
                 p = ln.split("\t")
                 if len(p) < 11 or p[0] != "C":
                     continue
@@ -196,20 +254,38 @@ class CorpusLog:
 
 
 class DebugLog:
-    """debug.txt 的 P/D 行（debug_fusion 开启才写）。"""
+    """debug.txt 的 P/D 行（debug_fusion 开启才写；同样跨方案目录汇总）。"""
 
     def __init__(self):
-        self.mark = self._nlines()
+        self.paths = _debug_paths()
+        self.mark = {p: self._nlines(p) for p in self.paths}
 
-    def _lines(self):
+    def _lines(self, path):
         try:
-            with open(DEBUGF, "r", encoding="utf-8", errors="replace") as f:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
                 return f.read().splitlines()
         except OSError:
             return []
 
-    def _nlines(self):
-        return len(self._lines())
+    def _nlines(self, path):
+        return len(self._lines(path))
+
+    def _refresh(self):
+        for p in _debug_paths():
+            if p not in self.mark:
+                self.mark[p] = self._nlines(p)
+                self.paths.append(p)
+
+    def _new(self):
+        self._refresh()
+        out = []
+        for p in self.paths:
+            lines = self._lines(p)
+            m = self.mark.get(p, 0)
+            if len(lines) < m:
+                m = 0
+            out.extend(lines[m:])
+        return out
 
     def wait_d(self, wid, timeout=4.0):
         """wid 的 D 行列表 [(rank, ce, ce1..ce3, finrank)]；ce 数值 =
@@ -217,7 +293,7 @@ class DebugLog:
         deadline = time.time() + timeout
         while time.time() < deadline:
             rows = []
-            for ln in self._lines()[self.mark:]:
+            for ln in self._new():
                 if not ln.startswith(wid + "|D|"):
                     continue
                 f = dict(kv.split("=", 1) for kv in ln.split("|")[3:]
@@ -236,7 +312,7 @@ class DebugLog:
     def wait_p(self, wid, timeout=3.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            for ln in self._lines()[self.mark:]:
+            for ln in self._new():
                 if ln.startswith(wid + "|P|"):
                     return ln
             time.sleep(0.15)
@@ -253,7 +329,7 @@ def clear_and_focus(hwnd, log):
     u.SetForegroundWindow(hwnd)
     time.sleep(0.4)
     clear_doc()
-    log.mark = log._nlines()
+    log.reset_marks()
 
 
 # ── 场景 ─────────────────────────────────────────────────────
@@ -353,16 +429,19 @@ def l3_two_key(hwnd, cor, dbg):
 
 
 def check_schema(log):
-    """最新 H 行须为 luna_pinyin（当前方案校验）。"""
-    try:
-        with open(CORPUS, "r", encoding="utf-8", errors="replace") as f:
-            hlines = [l for l in f.read().splitlines() if l.startswith("H\t")]
-    except OSError:
-        hlines = []
-    if not hlines:
+    """最新 H 行须为 luna_pinyin（当前方案校验）。跨方案目录取 ts 最新的
+    H 行——当前方案的语料文件才是刚写过 H 的那个。"""
+    rows = []
+    for p in log.paths:
+        for ln in log._lines(p):
+            if ln.startswith("H\t"):
+                parts = ln.split("\t")
+                rows.append((parts[2] if len(parts) > 2 else "", parts))
+    rows.sort(key=lambda x: x[0])
+    if not rows:
         warn("no H row")
         return
-    last = hlines[-1].split("\t")
+    last = rows[-1][1]
     schema = last[4] if len(last) > 4 else "?"
     if schema != "luna_pinyin":
         print("ABORT: 当前方案 = %s（需 luna_pinyin，请手动切换后重跑）"

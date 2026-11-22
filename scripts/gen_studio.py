@@ -139,7 +139,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       // 忘关提醒（2026-09-04）：诊断开着会持续写盘，打开设置时点一下
       if (g_p.debug_fusion)
         set_status(GetDlgItem(h, IDC_STATUS),
-                   L"提醒：诊断日志开着（用户文件夹 llm_rerank 子目录下"
+                   L"提醒：诊断日志开着（用户文件夹 llm_rerank\\<方案> 子目录下"
                    L"rime_llm_debug.txt 持续增长，排障完建议关闭）");
       return 0;
     }

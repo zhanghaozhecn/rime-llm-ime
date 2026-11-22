@@ -1334,8 +1334,9 @@ static const wchar_t* const TIP_TCS =
     L"开启后编码匹配固定为 .{2,}（2 码起参与重排，输入框锁定）。\n"
     L"取代 two_code_sentence 两码整句（2026-11-22）。";
 static const wchar_t* const TIP_DEBUG =
-    L"诊断日志：开启后每次重排都往用户文件夹的 llm_rerank 子目录写\n"
-    L"rime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。\n"
+    L"诊断日志：开启后每次重排都往用户文件夹的 llm_rerank\\<方案> 子目录写\n"
+    L"rime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化；语料/账本/词码对\n"
+    L"同目录，按方案隔离）。排障用，平时关闭。\n"
     L"实时调试窗口：插件版随『复制文件』装到 Rime 用户文件夹\n"
     L"llm_rerank\\viewer\\open_debug_window.bat；源码版走托盘「LLM 设置+调试」。";
 static const wchar_t* const TIP_SAVE =
@@ -2271,7 +2272,8 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       // 忘关提醒（2026-09-04）：诊断开着会持续写盘，打开设置时点一下
       if (g_p.debug_fusion)
         set_status(GetDlgItem(h, IDC_STATUS),
-                   L"提醒：诊断日志开着（rime_llm_debug.txt 持续增长，排障完建议关闭）");
+                   L"提醒：诊断日志开着（llm_rerank\\<方案>\\rime_llm_debug.txt "
+                   L"持续增长，排障完建议关闭）");
       return 0;
     case WM_COMMAND:
       if (LOWORD(wp) == IDC_MODEL &&

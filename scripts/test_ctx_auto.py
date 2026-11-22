@@ -196,22 +196,70 @@ def find_window_by_class(cls, timeout=8.0):
 
 
 # ── 语料观察（两版统一 rime_llm_corpus.tsv 的 W 行）─────────────
+# 2026-11-22 按方案分文件夹：语料在 llm_rerank\<方案>\ 下，旧位置（llm_rerank
+# 根 / Rime 用户目录根）的混合历史文件仍可能被读到——统一汇总全部候选文件，
+# 新行按 ts 排序（跨文件合并，"最新行"语义不变）。
+def corpus_paths():
+    base = os.path.join(os.environ.get("APPDATA", ""), "Rime")
+    paths = [os.path.join(base, "rime_llm_corpus.tsv")]
+    root = os.path.join(base, "llm_rerank")
+    paths.append(os.path.join(root, "rime_llm_corpus.tsv"))
+    try:
+        for name in sorted(os.listdir(root)):
+            p = os.path.join(root, name, "rime_llm_corpus.tsv")
+            if os.path.isfile(p):
+                paths.append(p)
+    except OSError:
+        pass
+    return [p for p in paths if os.path.isfile(p)]
+
+
 class EventsLog:
     """W 行 TSV: W id ts src code ctx engine_top window final tick status skip prep flags"""
 
-    def __init__(self, path):
-        self.path = path
-        self.mark = self._nlines()
+    def __init__(self, paths):
+        self.paths = list(paths)
+        self.mark = {p: self._nlines(p) for p in self.paths}
 
-    def _lines(self):
+    def _lines(self, path):
         try:
-            with open(self.path, "r", encoding="utf-8", errors="replace") as f:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
                 return f.read().splitlines()
         except OSError:
             return []
 
-    def _nlines(self):
-        return len(self._lines())
+    def _nlines(self, path):
+        return len(self._lines(path))
+
+    def _refresh(self):
+        """测试中途出现的新方案文件（首次建目录）：从现在起算，不吃旧行。"""
+        for p in corpus_paths():
+            if p not in self.mark:
+                self.mark[p] = self._nlines(p)
+                self.paths.append(p)
+
+    def _new(self):
+        """本观察期新增行，跨文件按 ts 升序（新→旧 = reversed）。"""
+        self._refresh()
+        out = []
+        for p in self.paths:
+            lines = self._lines(p)
+            m = self.mark.get(p, 0)
+            if len(lines) < m:      # 文件被重写/截断
+                m = 0
+            for ln in lines[m:]:
+                if not ln or ln.startswith("#"):
+                    continue
+                parts = ln.split("\t")
+                ts = parts[2] if len(parts) > 2 else ""
+                out.append((ts, ln))
+        out.sort(key=lambda x: x[0])
+        return [x[1] for x in out]
+
+    def reset_marks(self):
+        self._refresh()
+        for p in self.paths:
+            self.mark[p] = self._nlines(p)
 
     def wait_new(self, code, timeout=4.0):
         """等待本观察期之后出现的、码=code 的最新评分行。优先 ok 行（final
@@ -224,7 +272,7 @@ class EventsLog:
         while time.time() < deadline:
             # 反向取第一个 ok 或 async_pending 行 = 最新评分受理行
             #（ok 优先会吃到旧场景的 ok 行——pending 行更新却一致）
-            for ln in reversed(self._lines()[self.mark:]):
+            for ln in reversed(self._new()):
                 parts = ln.split("\t")
                 if len(parts) < 14 or parts[0] != "W" or parts[4] != code:
                     continue
@@ -248,7 +296,7 @@ class EventsLog:
         拆分前的病态形态 = word 带标点（"家庭，"）code="jstg," rank 全 -1。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            for ln in reversed(self._lines()[self.mark:]):
+            for ln in reversed(self._new()):
                 parts = ln.split("\t")
                 if len(parts) < 11 or parts[0] != "C":
                     continue
@@ -304,7 +352,6 @@ def type_word_and_wait(code, log, settle=None):
     wait_new 自行轮询，settle 只承担词间节奏与 kick 读链余量。"""
     if settle is None:
         settle = RHY["word"]
-    sub = log.mark
     type_code(code)
     time.sleep(settle)
     row = log.wait_new(code, timeout=3.0)
@@ -642,11 +689,13 @@ def main():
     args = ap.parse_args()
 
     logname = "rime_llm_corpus.tsv"
-    events = os.path.join(os.environ["APPDATA"], "Rime", "llm_rerank", logname)
-    if not os.path.exists(events):
-        print("events log not found: %s" % events)
+    paths = corpus_paths()
+    if not paths:
+        print("events log not found under %s\\Rime\\llm_rerank"
+              % os.environ.get("APPDATA", ""))
         sys.exit(2)
-    log = EventsLog(events)
+    print("[pre] corpus files: %d（按方案分目录，汇总读取）" % len(paths))
+    log = EventsLog(paths)
 
     hwnd = None
     if args.app == "notepad":
@@ -705,7 +754,7 @@ def main():
             # 场景起点推进观察位：同名码在上一场景/上一节奏轮的旧行不作数
             #（wait_new 反向找最新行，不推进的话陈旧行会假 PASS——双节奏
             # 同码跑两遍放大了这一既有隐患）
-            log.mark = log._nlines()
+            log.reset_marks()
             try:
                 fn(log)
             except Exception as e:
