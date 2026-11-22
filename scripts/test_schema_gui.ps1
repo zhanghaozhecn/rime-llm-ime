@@ -112,6 +112,14 @@ function Click-Add($hw) {
   Reload-Params $hw           # 先重读（测试刚在外部改过文件；否则触发"文件已变更"确认框）
   return (Click-Save $hw)     # 保存即自动接入（缺件补齐）
 }
+# 裸保存（保持调用点原有的精确时序/断言），但补 A1 应答（2026-11-21 起
+# enabled=true 且模型缺失会弹 YesNo 确认——沙箱无模型，必答"是"才落盘；
+# 此前 v2026.11.21-6 上线 A1 时本套件漏更，phase7 起模态卡死级联 16 处假失败）
+function Save-Raw($hw) {
+  [void][W]::PostMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+  [void](Dismiss-Prompt $hw "是")
+  Start-Sleep -Milliseconds 900
+}
 # 重读当前方案（刷新按钮已删）：向主窗口投 CBN_SELCHANGE —— 源码版直接读 CB_GETCURSEL，
 # 故合成通知即可触发 load_schema_params（不依赖原生控件是否真的发了通知）。
 # 界面有未保存改动时该动作会弹"未保存的改动"确认框（2026-10-01）→ 用 -Answer 自动应答。
@@ -244,7 +252,9 @@ engine:
 llm_rerank:
   enabled: true
   min_code_len: 4
+  two_code_sentence: true
 '@ | Out-File -FilePath $test -Encoding ascii
+  Reload-Params $hw   # 合成 CBN_SELCHANGE 重读文件（界面无改动 → 直接覆盖）
   $st = Click-Add $hw
   Write-Host ("  status: " + $st)
   $f = Get-Content $test -Encoding UTF8
@@ -253,6 +263,11 @@ llm_rerank:
   # 旧节被剥掉后按界面值重建（旧键 min_code_len 不再回流）
   Assert "配置节重建恰 1" ((($f | Where-Object { $_ -match '^llm_rerank:' }).Count) -eq 1)
   Assert "旧键 min_code_len 未回流" ((($f | Where-Object { $_ -match 'min_code_len' }).Count) -eq 0)
+  # 旧键 two_code_sentence 迁移（2026-11-22 整句模式改名）：读入界面后按新键落盘
+  Assert "旧键 two_code_sentence 迁移为 sentence_mode: true" ((($f | Where-Object { $_ -match '^  sentence_mode: true$' }).Count) -eq 1)
+  Assert "旧键 two_code_sentence 不再产出" ((($f | Where-Object { $_ -match 'two_code_sentence' }).Count) -eq 0)
+  # 整句模式锁定编码匹配（2026-11-22）：迁移 on → 重建节 code_pattern 恒 '.{2,}'
+  Assert "code_pattern 锁定 .{2,}（整句模式 on 迁移）" ((($f | Where-Object { $_ -match "^  code_pattern: '\.\{2,\}'$" }).Count) -eq 1)
   Show-File
 
   Write-Host "== phase4: 剥离 =="
@@ -303,8 +318,7 @@ engine:
   $txt = [W]::GetDlgItem($hw, 1016)                    # IDC_CODE_PAT
   [W]::SendMessage($txt, 0x000C, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # WM_SETTEXT ""（先清空）
   [W]::SendMessageStr($txt, 0x000C, [IntPtr]::Zero, "[abcde]{4}") | Out-Null # WM_SETTEXT 目标值
-  [void][W]::PostMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)  # IDC_SAVE
-  Start-Sleep -Milliseconds 900
+  Save-Raw $hw   # IDC_SAVE + A1 应答（沙箱无模型必弹，2026-11-21 起）
   $y = Get-Content $test -Encoding UTF8
   Assert "code_pattern 单引号写出 [abcde]{4}" (($y | Where-Object { $_ -match "^  code_pattern: '\[abcde\]\{4\}'$" }).Count -eq 1)
   Assert "enabled: true" (($y | Where-Object { $_ -match '^  enabled: true$' }).Count -eq 1)
@@ -312,7 +326,7 @@ engine:
   Assert "max_candidates: 6" (($y | Where-Object { $_ -match '^  max_candidates: 6$' }).Count -eq 1)
   Assert "cpu_cores: 4" (($y | Where-Object { $_ -match '^  cpu_cores: 4$' }).Count -eq 1)
   Assert "无 freq_beta（标定产物退出配置面 2026-11-05）" (($y | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
-  Assert "two_code_sentence: false（默认关闭）" (($y | Where-Object { $_ -match '^  two_code_sentence: false$' }).Count -eq 1)
+  Assert "sentence_mode: false（默认关闭，2026-11-22 取代 two_code_sentence）" (($y | Where-Object { $_ -match '^  sentence_mode: false$' }).Count -eq 1)
   Assert "无 expected_length_weight（elw 退役 2026-11-07）" (($y | Where-Object { $_ -match 'expected_length_weight' }).Count -eq 0)
   Assert "debug_fusion: false" (($y | Where-Object { $_ -match '^  debug_fusion: false$' }).Count -eq 1)
   Assert "model_path 未配置 → 注释占位（与插件版同款）" (($y | Where-Object { $_ -match '^  # model_path:' }).Count -eq 1)
@@ -324,7 +338,7 @@ engine:
   # 键序与插件版 Get-LlmCfgLines 逐字一致（两版配置节相同，仅组件行不同）
   $expect = @('  enabled: true', "  code_pattern: '[abcde]{4}'", '  max_tokens: 20',
               '  max_candidates: 6', '  cpu_cores: 4',
-              '  two_code_sentence: false', '  debug_fusion: false')
+              '  sentence_mode: false', '  debug_fusion: false')
   $i0 = 0; for ($i = 0; $i -lt $y.Count; $i++) { if ($y[$i] -match '^llm_rerank:') { $i0 = $i } }
   $got = @($y[($i0 + 1)..($i0 + 7)])
   Assert "节内键序与插件版一致" (($got -join '|') -eq ($expect -join '|'))
@@ -371,7 +385,7 @@ model_path: d:/gguf_models/legacy.gguf
   Assert "迁移值写进方案节 cpu_cores: 7" (($f | Where-Object { $_ -match '^  cpu_cores: 7$' }).Count -eq 1)
   Assert "迁移方案节无 freq_beta（旧键收敛）" (($f | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
   Assert "迁移方案节无 expected_length_weight（elw 退役不迁移）" (($f | Where-Object { $_ -match 'expected_length_weight' }).Count -eq 0)
-  Assert "迁移方案节 two_code_sentence: false（默认）" (($f | Where-Object { $_ -match '^  two_code_sentence: false$' }).Count -eq 1)
+  Assert "迁移方案节 sentence_mode: false（默认，整句模式新键）" (($f | Where-Object { $_ -match '^  sentence_mode: false$' }).Count -eq 1)
   Assert "迁移值写进方案节 max_tokens: 12" (($f | Where-Object { $_ -match '^  max_tokens: 12$' }).Count -eq 1)
   Assert "迁移的 code_pattern 单引号落盘" (($f | Where-Object { $_ -match "^  code_pattern: '\.\{3,4\}'$" }).Count -eq 1)
   Assert "迁移的 model_path 落盘（正斜杠）" (($f | Where-Object { $_ -match '^  model_path: d:/gguf_models/legacy\.gguf$' }).Count -eq 1)
@@ -381,12 +395,10 @@ model_path: d:/gguf_models/legacy.gguf
   Write-Host "== phase9: 出错写错误日志（正常不写）=="
   $logFile = Join-Path (Split-Path $exe -Parent) "WeaselLLMSetup_error.log"
   if (Test-Path $logFile) { Remove-Item $logFile -Force }
-  [void][W]::PostMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)  # 正常保存
-  Start-Sleep -Milliseconds 700
+  Save-Raw $hw   # 正常保存（+ A1 应答）
   Assert "正常保存不写错误日志" (-not (Test-Path $logFile))
   Set-ItemProperty -Path $test -Name IsReadOnly -Value $true          # 方案只读 → 保存必失败
-  [void][W]::PostMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
-  Start-Sleep -Milliseconds 700
+  Save-Raw $hw   # A1 先弹（enabled+模型缺失）→ 应答后写入才撞只读失败
   Assert "状态行出现失败" ((Read-Ctl $hw 1103) -match '失败')
   Assert "错误日志已生成" (Test-Path $logFile)
   if (Test-Path $logFile) {
@@ -411,8 +423,8 @@ model_path: d:/gguf_models/legacy.gguf
   Assert ("已选中预装方案（实测 '$(Read-Ctl $hw 1031)'）") ((Read-Ctl $hw 1031) -like "*（程序）")
   Assert "选中预装方案时状态提示会先复制" ((Read-Stat $hw) -match '预装方案')
   # 注意：不能走 Click-Add（它内部会把选择重置到第 0 项）；这里直接点「保存并生效」（= 复制 + 自动接入）
-  [void][W]::PostMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
-  Start-Sleep -Milliseconds 1200
+  Save-Raw $hw   # + A1 应答
+  Start-Sleep -Milliseconds 400   # 复制+接入比普通保存多等一拍
   $st = Read-Stat $hw
   Write-Host ("  status: " + $st)
   $copied = Join-Path (Join-Path $sandbox "Rime") $progName
@@ -506,8 +518,7 @@ model_path: d:/gguf_models/legacy.gguf
   [void][W]::SendMessageStr($modelCtl, 0x000C, [IntPtr]::Zero, "model.gguf")
   Start-Sleep -Milliseconds 300
   $before12 = (Get-FileHash $test -Algorithm SHA1).Hash
-  [void][W]::PostMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
-  Start-Sleep -Milliseconds 700
+  Save-Raw $hw   # 校验拒绝在前不弹 A1，应答为无害空转
   Assert ("相对路径保存被拒绝（实测 '" + (Read-Ctl $hw 1103) + "'）") ((Read-Ctl $hw 1103) -match '必须是绝对路径')
   Assert "被拒绝时方案文件未被改写" ((Get-FileHash $test -Algorithm SHA1).Hash -eq $before12)
   # 恢复成默认路径（界面干净化 → 后续动作不再弹确认）
@@ -567,7 +578,9 @@ model_path: d:/gguf_models/legacy.gguf
   # download_finish 真转正分支另行一次性手验（预置 .download 分片让 curl 秒收尾）。
   Write-Host "== phase12b: 下载完成自动回填默认路径 =="
   $fakeFull = Join-Path (Join-Path $sandbox "Rime") "Qwen3-0.6B-Base-Q4_K_M.gguf"
-  $fs12b = [IO.File]::Create($fakeFull); [void]$fs12b.SetLength(105MB); $fs12b.Close()
+  # 种子用精确字节 396,704,640（A4 起 2026-11-21 默认名 < 精确字节 = suspect，
+  # 会弹"体量不符重下?"确认框打断本相位——同插件套件 G14 的修法；稀疏文件不占盘）
+  $fs12b = [IO.File]::Create($fakeFull); [void]$fs12b.SetLength(396704640); $fs12b.Close()
   [void][W]::SendMessageStr($modelCtl, 0x000C, [IntPtr]::Zero, "")   # 清空框 = 用户场景
   Start-Sleep -Milliseconds 300
   [void][W]::PostMessage([W]::GetDlgItem($hw, 1007), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)

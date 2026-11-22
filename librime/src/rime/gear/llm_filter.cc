@@ -128,8 +128,10 @@ static boost::regex g_code_re;          // 编译缓存（llm_apply_params 时�
 static bool g_code_re_ok = true;        // 模式非法 → false（回退默认成功后仍为 true）
 static int g_min_code_len = 4;          // 保留：仅日志/兼容，不再作为用户配置项
 static int g_max_code_len = 0;          // 保留：同上（0 = 无上限）
-static bool g_two_code_sentence = false;  // 两码整句：满长组优先 (2026-11-07
-// 用户定案取代 expected_length_weight——elw·span 间接量退役)
+static bool g_sentence_mode = false;  // 整句模式：满覆盖候选进评分窗 (2026-11-22
+// 用户定案，取代 two_code_sentence 两码整句满长规则——词长==⌊码长/2⌋ 退役；
+// span 判定候选覆盖整个活动段，引擎 lattice 保证简拼/单韵母短码的合法解析
+// 共存，两码方案下与旧规则逐位等价)
 // 用户词频对数融合 (2026-09-02): fused = score + β·log(1+eff), β **内置常数**
 // (2026-11-05 标定产物退出用户配置面——用户没有标定能力, 与 kFreqTau 同待遇;
 //  **2026-11-14 默认模型改 Qwen2.5-0.5B 后重标定** β=14 + kCeW (1.0,1.10,
@@ -173,7 +175,7 @@ struct LlmParamSet {
   bool has_min_code_len = false; int min_code_len = 4;   // 旧键：解析保留、不再生效
   bool has_max_code_len = false; int max_code_len = 0;   // 旧键：解析保留、不再生效
   bool has_code_pattern = false; std::string code_pattern;  // 2026-09-30 新键
-  bool has_tcs = false;          bool two_code_sentence = false;
+  bool has_sentence = false;     bool sentence_mode = false;
   // freq_beta 字段已删（2026-11-05 退出用户配置面）→ g_freq_beta 内置常数
   bool has_min_tokens = false;   int min_tokens = 1;
   bool has_max_tokens = false;   int max_tokens = 20;  // 2026-11-19: 0.6B ctx*=20
@@ -188,8 +190,15 @@ static void load_model_async();      // fwd decl（定义在下方）
 static void llm_apply_params() {
   const LlmParamSet &s = g_schema_params;
   g_enabled = s.has_enabled ? s.enabled : false;
+  // 整句模式先于 code_pattern 读取（2026-11-22 锁定编码匹配要用）
+  g_sentence_mode = s.has_sentence ? s.sentence_mode : false;
   // 触发条件：code_pattern。空串 = 不限制（总是匹配）。
+  // 整句模式锁定编码匹配（2026-11-22 用户定案）：sentence_mode on 时
+  // 恒 '.{2,}'（2 码起参与重排）——方案节该行读取端忽略（手改 yaml 也
+  // 不生效）；off 时方案节值生效
   g_code_pattern = s.has_code_pattern ? s.code_pattern : kDefaultCodePattern;
+  if (g_sentence_mode)
+    g_code_pattern = ".{2,}";
   g_code_re_ok = true;
   if (!g_code_pattern.empty()) {
     try {
@@ -209,7 +218,6 @@ static void llm_apply_params() {
   // 仅保留数值以免日志/兼容字段为空。
   g_min_code_len = s.has_min_code_len ? s.min_code_len : 4;
   g_max_code_len = s.has_max_code_len ? s.max_code_len : 0;
-  g_two_code_sentence = s.has_tcs ? s.two_code_sentence : false;
   // g_freq_beta 恒为内置常数（2026-11-05 退出用户配置面，不再从方案读取；
   // 方案残留 freq_beta 旧行忽略，保存时由 GUI 剥除）
   g_debug_fusion = s.has_debug_fusion ? s.debug_fusion : false;
@@ -1805,7 +1813,7 @@ static void write_h(const std::string &schema, const std::string &model) {
                      "\t" + tsv_escape(g_code_pattern) + "\t" +
                      std::to_string(g_max_candidates) + "\t" +
                      std::to_string(g_max_ctx_tokens) + "\t" +
-                     (g_two_code_sentence ? "1" : "0") + "\t" + beta + "\t400";
+                     (g_sentence_mode ? "1" : "0") + "\t" + beta + "\t400";
   corpus_write_raw(line);
 }
 
@@ -2734,9 +2742,11 @@ static void retry_pending_prepare() {
 
 LlmRerankTranslation::LlmRerankTranslation(an<Translation> translation,
                                            const std::string &input,
+                                           size_t seg_start, size_t seg_end,
                                            const std::string &ctx,
                                            const std::string &src)
-    : translation_(translation), input_(input), ctx_(ctx), src_(src) {
+    : translation_(translation), input_(input), seg_start_(seg_start),
+      seg_end_(seg_end), ctx_(ctx), src_(src) {
   // 词码对记账（2026-11-13）: 记最近窗码供 OnCommit 用（commit 时 input
   // 已清空; 同插件版 pending_code 捕获语义。engine thread, 无竞争）
   g_last_input = input;
@@ -2765,11 +2775,10 @@ void LlmRerankTranslation::Collect() {
   const size_t kMaxRerank = (size_t)(g_max_candidates > 0 ? g_max_candidates : 6);
   std::vector<an<Candidate>> tail;
   std::vector<double> s1_head;   // 层1 分（对齐 candidates_; 无 CE 分回退用）
+  std::vector<char> win_fm;      // 窗内候选 FM 标志（对齐 candidates_，整句模式）
   // 词码对表：融合前读一次（2026-11-21 解耦后只含负分），本窗融合复用。
   std::map<std::string, double> pf_tbl;
   bool pf_on = false;
-  // two_code_sentence 满长准入（2026-11-16）：⌊码长/2⌋（码 <2 字时 0 = 不启用）
-  int tcs_elen = g_two_code_sentence ? (int)(input_.length() / 2) : 0;
 
   std::vector<an<Candidate>> allc;
   while (!translation_->exhausted()) {
@@ -2777,6 +2786,20 @@ void LlmRerankTranslation::Collect() {
     if (cand)
       allc.push_back(cand);
     translation_->Next();
+  }
+
+  // 整句模式满覆盖准入（2026-11-22 取代 two_code_sentence 满长规则）：
+  // FM = 候选 start/end 恰为活动段 [seg_start_, seg_end_)（覆盖全部音节，
+  // "音节数一致"；引擎 lattice 已编码全部合法解析——歧义、简拼、单韵母
+  // 短码，filter 不复刻音节化）。候选 span 经 Shadow/Uniquified 包装继承
+  // （simplifier/uniquifier 之后仍可靠），无须剥壳。
+  bool sent_on = g_sentence_mode;
+  std::vector<char> is_fm;   // 对齐 allc（sent_on 时有效）
+  if (sent_on) {
+    is_fm.resize(allc.size(), 0);
+    for (size_t i = 0; i < allc.size(); i++)
+      is_fm[i] = (allc[i]->start() == seg_start_ &&
+                  allc[i]->end() == seg_end_) ? 1 : 0;
   }
 
   // 语料 W 事件（2026-11-17）：一次满码尝试一条，含 skip 原因。
@@ -2806,14 +2829,14 @@ void LlmRerankTranslation::Collect() {
                      [&s1](size_t a, size_t b) { return s1[a] > s1[b]; });
     size_t nk = (std::min)(kMaxRerank, allc.size());
     // 窗口准入（2026-11-21 解耦：正分固定候选不再占位——固定归
-    // pin_candidates.tsv / pin_filter.lua 全局重排）：层1 序 +
-    // two_code_sentence 满长优先，窗口 <= nk（不扩窗，decode 行数不变）。
+    // pin_candidates.tsv / pin_filter.lua 全局重排）：层1 序 + 整句模式
+    // 满覆盖优先，窗口 <= nk（不扩窗，decode 行数不变）。
     {
       std::vector<bool> in_win(allc.size(), false);
       size_t taken = 0;
       for (size_t k = 0; k < idx.size() && taken < nk; k++) {
         size_t c = idx[k];
-        if (tcs_elen >= 1 && utf8_len(allc[c]->text()) != tcs_elen)
+        if (sent_on && !is_fm[c])
           continue;
         in_win[c] = true;
         ++taken;
@@ -2823,6 +2846,7 @@ void LlmRerankTranslation::Collect() {
         if (in_win[c]) {
           candidates_.push_back(allc[c]);
           s1_head.push_back(s1[c]);
+          win_fm.push_back(sent_on ? is_fm[c] : (char)0);
         } else {
           tail.push_back(allc[c]);
         }
@@ -2848,9 +2872,10 @@ void LlmRerankTranslation::Collect() {
     w_written = true;
   }
 
-  // 满长准入后窗不足 2 个（不足即空着的极端形态）：无重排意义、整窗跳过
-  // 评分——显式发 S 事件（此前该路径静默，调试窗口对此窗零输出）
-  if (tcs_elen >= 1 && candidates_.size() < 2 && allc.size() >= 2) {
+  // 满覆盖准入后窗不足 2 个（不足即空着的极端形态）：无重排意义、整窗跳过
+  // 评分——显式发 S 事件（此前该路径静默，调试窗口对此窗零输出）。
+  // skip 名沿用 full_len_lt2（语料解析兼容）。
+  if (sent_on && candidates_.size() < 2 && allc.size() >= 2) {
     live_send(std::string("S|") + now_hms() + "|full_len_lt2|" +
               live_esc(input_) + "|" + src_);
     write_w(wid, src_, input_, wctx, engine_vec, window_vec, {}, g_user_tick,
@@ -3025,33 +3050,14 @@ void LlmRerankTranslation::Collect() {
         order.push_back(x.second);
     }
 
-    // 两码整句 (two_code_sentence, 2026-11-07 用户定案取代 elw): 词长==
-    // ⌊码长/2⌋ 的候选一组直接优先 (组内融合分降序, 同分稳定保融合序),
-    // 其余按融合分降序——即原 elw 的极限行为 (elw·span 加成→∞),
-    // 不再需要 span 间接量。失败哨兵分排尾部 (与插件版一致)。
-    // 2026-11-16 起满长组已在层1 准入时优先占满评分窗（见上方层1 块），
-    // 窗内候选全为满长组 → 本块对最终序恒 no-op，保留作保险 + dbg_full 标记。
-    if (g_two_code_sentence && order.size() > 1) {
-      int expected_len = (int)(input_.length() / 2);
-      if (expected_len >= 1) {
-        struct TCSItem { double score; bool match; int idx; };
-        std::vector<TCSItem> items;
-        items.reserve(order.size());
-        for (int i : order) {
-          bool match = utf8_len(candidates_[i]->text()) == expected_len;
-          if (g_debug_fusion && match)
-            dbg_full[i] = true;
-          items.push_back({fused_of[i], match, i});
-        }
-        std::stable_sort(items.begin(), items.end(),
-                         [](const TCSItem &a, const TCSItem &b) {
-                           if (a.match != b.match) return (int)a.match > (int)b.match;
-                           if (a.score != b.score) return a.score > b.score;
-                           return false;  // stable 保融合序
-                         });
-        order.clear();
-        for (auto &it : items) order.push_back(it.idx);
-      }
+    // 两码整句最终置顶块已删（2026-11-22 整句模式定案）：满覆盖候选已在
+    // 层1 准入时结构性占满评分窗（窗内全 FM，见上方准入块），融合序即
+    // 满覆盖组内序——旧保险块对最终序恒 no-op，连同词长==⌊码长/2⌋ 判据
+    // 一并退役。调试 full 标志（协议字段：win=1 行 FM 与否）由窗准入的
+    // win_fm 直接标记。
+    if (g_sentence_mode) {
+      for (size_t i = 0; i < dbg_full.size() && i < win_fm.size(); i++)
+        dbg_full[i] = win_fm[i] ? true : false;
     }
 
     // debug P + 逐候选 D（2026-11-17）：只写语料没有的特征/耗时；
@@ -3079,12 +3085,8 @@ void LlmRerankTranslation::Collect() {
           ce2 = ce3_of[(size_t)i][1];
           ce3v = ce3_of[(size_t)i][2];
         }
-        int full = 0;
-        if (g_two_code_sentence) {
-          int elen = (int)(input_.length() / 2);
-          if (elen >= 1 && utf8_len(candidates_[i]->text()) == elen)
-            full = 1;
-        }
+        int full = (g_sentence_mode && i < (int)win_fm.size() &&
+                    win_fm[(size_t)i]) ? 1 : 0;
         debug_write_d(wid, (int)k + 1, ce, ce1, ce2, ce3v, eff, fb, u1, full,
                       fused_of[i], sdelta, ce_rank[i], (int)k + 1);
       }
@@ -3254,7 +3256,14 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     if (config->GetInt("llm_rerank/max_candidates", &v)) { p.has_max_cand = true; p.max_cand = v; }
     if (config->GetInt("llm_rerank/cpu_cores", &v)) { p.has_cpu_cores = true; p.cpu_cores = v; }
     // bool b 复用上方 enabled/debug_fusion 的声明（同作用域）
-    if (config->GetBool("llm_rerank/two_code_sentence", &b)) { p.has_tcs = true; p.two_code_sentence = b; }
+    // 整句模式（2026-11-22 取代 two_code_sentence）：新键优先；旧键只在新键
+    // 缺席时兜底一次——真机旧方案 two_code_sentence: true 直升整句模式，
+    // 保存后自然换新键（硬忽略会让已启用整句的机器静默退化）
+    if (config->GetBool("llm_rerank/sentence_mode", &b)) {
+      p.has_sentence = true; p.sentence_mode = b;
+    } else if (config->GetBool("llm_rerank/two_code_sentence", &b)) {
+      p.has_sentence = true; p.sentence_mode = b;
+    }
     llm_apply_params();
     std::string sid;
     if (engine_->schema())
@@ -3652,7 +3661,25 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
   // 词码对记账/语料 C 的码快照：必须在本函数**所有**早退路径之前更新。
   // 此前只在 LlmRerankTranslation 构造时赋值——ctx_empty/model_loading/
   // pattern 早退会留下上一个词的码，导致下一个提交的 C 行码错配。
-  g_last_input = engine_->context()->input();
+  // 2026-11-22 整句模式取码：活动段切片。librime 只对未确认的最后一段
+  // 做翻译（TranslateSegments），故活动段 = composition.back()；多段续打
+  // （前段已选定）时 code_pattern/词频键/语料 code 随切片，单段组合 =
+  // 全串（双拼与既有行为逐位一致）。候选 span 是对**原始 input** 的，
+  // FM 判定须与段边界 [seg_start, seg_end) 比较，切片随构造参数传递。
+  size_t seg_start = 0, seg_end = engine_->context()->input().length();
+  {
+    const Composition &comp = engine_->context()->composition();
+    if (!comp.empty()) {
+      const Segment &seg = comp.back();
+      if (seg.end > seg.start && seg.end <= seg_end && seg.start < seg_end) {
+        seg_start = seg.start;
+        seg_end = seg.end;
+      }
+    }
+  }
+  const std::string code =
+      engine_->context()->input().substr(seg_start, seg_end - seg_start);
+  g_last_input = code;
 
   // 参数在部署期快照（方案 llm_rerank 节）——改配置需重新部署，无热重载
   if (!g_enabled)
@@ -3671,7 +3698,7 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
   {
     // 触发条件（2026-09-30）：编码串全串匹配 code_pattern（与 speller/
     // auto_select_pattern 同引擎同语义）。空模式 = 不限制。
-    const std::string &code = engine_->context()->input();
+    // 2026-11-22 整句模式：匹配对象 = 活动段切片 code（多段续打正确）。
     bool matched = true;
     if (!g_code_pattern.empty()) {
       matched = g_code_re_ok && boost::regex_match(code, g_code_re);
@@ -3680,14 +3707,13 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
       // 实时调试（2026-11-10）：跳过原因 S 行——"为什么没触发"是调试窗口
       // 的主要用途之一（pattern / ctx_empty / model_loading / few_candidates）
       live_send(std::string("S|") + now_hms() + "|pattern|" +
-                live_esc(engine_->context()->input()) + "|-");
+                live_esc(code) + "|-");
       return translation;  // code outside code_pattern
     }
   }
 
   // context source: TSF caret text, or commit history fallback
   auto [ctx, src] = GetContextTextPair();
-  const std::string code = engine_->context()->input();
   if (ctx.empty()) {
     // 常开语料：满码但无上文的 skip 事件（W 行，status=skip）
     std::string wid = new_event_id("W", g_user_tick);
@@ -3707,7 +3733,7 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
     return translation;  // model still loading, keep original order
   }
 
-  return New<LlmRerankTranslation>(translation, engine_->context()->input(),
+  return New<LlmRerankTranslation>(translation, code, seg_start, seg_end,
                                    ctx, src);
 }
 

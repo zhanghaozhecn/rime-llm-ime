@@ -70,7 +70,7 @@ static int g_cfg_y = 0;   // 左列 y 起点（ts(8)，顶对齐）
 #define IDC_CORES        1015
 #define IDC_CODE_PAT     1016   // 编码匹配正则（2026-09-30 取代 min/max_code_len）
 #define IDC_BENCH        1017   // 实测线程数（2026-10-01 用户定案：与插件版同位置）
-#define IDC_TCS          1021   // 两码整句（2026-11-07 取代 IDC_ELW 预期词长权重）
+#define IDC_TCS          1021   // 整句模式（2026-11-22 泛化自两码整句 two_code_sentence）
 #define IDC_DEBUG        1023
 #define IDC_MAX_CAND     1024
 // 方案接入（2026-09-29 GUI 化，语义同 installer\schema_add.ps1）
@@ -90,7 +90,9 @@ struct Params {
   // 代码内默认值保留，yaml/schema 里的旧行读取时忽略、写入时不再产出）
   // 2026-11-19 随生产模型切 Qwen3-0.6B base 同步定案（研究 ctx*=20、0.6B k*=6）：
   int max_tokens = 20, cpu_cores = 4;
-  bool two_code_sentence = false;  // 两码整句：满长组优先（2026-11-07 取代 elw）
+  bool sentence_mode = false;      // 整句模式：满覆盖候选进评分窗（2026-11-22 泛化
+                                   // 自 two_code_sentence 两码整句满长规则）
+  bool has_sentence_mode = false;  // 方案节里出现过新键（旧键兜底只在新键缺席时）
   // freq_beta 已删（2026-11-05 标定产物退出用户配置面 → β=12 内置常数，两版统一；
 // v3 2026-11-06 六维联合标定：β12/τ400；用户 bigram 项 2026-11-08 退役，
 // 融合项只剩累计 Unigram log(0.5·p1)）
@@ -232,7 +234,7 @@ static bool load_legacy_params(Params* p) {
     if (val.empty()) continue;
     if (key == "enabled") p->enabled = (val == "true");
     else if (key == "code_pattern") p->code_pattern = val;
-    // expected_length_weight 已退役（2026-11-07 → two_code_sentence），不迁移
+    // expected_length_weight 已退役（2026-11-07 → 布尔开关），不迁移
     else if (key == "max_tokens") p->max_tokens = atoi(val.c_str());
     else if (key == "max_candidates") p->max_candidates = atoi(val.c_str());
     else if (key == "cpu_cores") p->cpu_cores = atoi(val.c_str());
@@ -252,7 +254,7 @@ static bool load_legacy_params(Params* p) {
 // %APPDATA%\Rime\llm_rerank.yaml）----
 // 节内键序与插件版 installer\install_plugin.ps1 的 Get-LlmCfgLines /
 // Update-LlmSection **逐字一致**：enabled / code_pattern / max_tokens /
-// max_candidates / cpu_cores / two_code_sentence /
+// max_candidates / cpu_cores / sentence_mode /
 // debug_fusion / model_path —— 两版方案配置节相同，仅组件行不同。
 // （freq_beta 已删 2026-11-05：标定产物退出配置面；旧方案残留行读取时忽略）
 static const char* kCfgSection = "llm_rerank:";
@@ -295,7 +297,16 @@ static bool parse_llm_section(const std::vector<std::string>& lines) {
              key == "freq_beta" ||
              key == "expected_length_weight") { /* 旧键忽略（freq_beta 2026-11-05、
                                                   elw 2026-11-07 退出配置面） */ }
-    else if (key == "two_code_sentence") g_p.two_code_sentence = (val == "true");
+    else if (key == "sentence_mode") {
+      g_p.sentence_mode = (val == "true");
+      g_p.has_sentence_mode = true;
+    }
+    // two_code_sentence 旧键（2026-11-22 改名 sentence_mode）：只在新键缺席时
+    // 兜底一次——真机旧方案直升整句模式，保存后自然换新键（硬忽略会让
+    // 已启用整句的机器静默退化）
+    else if (key == "two_code_sentence") {
+      if (!g_p.has_sentence_mode) g_p.sentence_mode = (val == "true");
+    }
     else if (key == "max_tokens") g_p.max_tokens = atoi(val.c_str());
     else if (key == "max_candidates") g_p.max_candidates = atoi(val.c_str());
     else if (key == "cpu_cores") g_p.cpu_cores = atoi(val.c_str());
@@ -315,7 +326,7 @@ static std::vector<std::string> build_llm_section() {
   sprintf_s(buf, "  max_tokens: %d", g_p.max_tokens); sec.push_back(buf);
   sprintf_s(buf, "  max_candidates: %d", g_p.max_candidates); sec.push_back(buf);
   sprintf_s(buf, "  cpu_cores: %d", g_p.cpu_cores); sec.push_back(buf);
-  sec.push_back(g_p.two_code_sentence ? "  two_code_sentence: true" : "  two_code_sentence: false");
+  sec.push_back(g_p.sentence_mode ? "  sentence_mode: true" : "  sentence_mode: false");
   sec.push_back(g_p.debug_fusion ? "  debug_fusion: true" : "  debug_fusion: false");
   if (!g_p.model_path.empty()) {
     std::string p = wide_to_utf8(g_p.model_path);
@@ -1108,6 +1119,26 @@ static void on_schema_remove() {
 }
 
 // ---- 控件读写 ----
+// 整句模式锁定编码匹配（2026-11-22）：勾选 → 框固定 '.{2,}' 禁用；
+// 取消 → 恢复勾选前的值可编辑（params_to_ui 读入路径显式设置框状态，
+// 不依赖本事件——BM_SETCHECK 不发 BN_CLICKED，无联动循环）
+static std::wstring g_pat_before_sent;
+static void on_sent_toggle() {
+  HWND pat = GetDlgItem(g_hwnd, IDC_CODE_PAT);
+  if (SendMessageW(GetDlgItem(g_hwnd, IDC_TCS), BM_GETCHECK, 0, 0) == BST_CHECKED) {
+    wchar_t buf[512] = {0};
+    GetDlgItemTextW(g_hwnd, IDC_CODE_PAT, buf, 512);
+    g_pat_before_sent = buf;
+    SetDlgItemTextW(g_hwnd, IDC_CODE_PAT, L".{2,}");
+    EnableWindow(pat, FALSE);
+  } else {
+    EnableWindow(pat, TRUE);
+    if (!g_pat_before_sent.empty())
+      SetDlgItemTextW(g_hwnd, IDC_CODE_PAT, g_pat_before_sent.c_str());
+    g_pat_before_sent.clear();
+  }
+}
+
 static void ui_to_params() {
   g_p.enabled = SendMessageW(GetDlgItem(g_hwnd, IDC_ENABLED), BM_GETCHECK, 0, 0) == BST_CHECKED;
   g_p.debug_fusion = SendMessageW(GetDlgItem(g_hwnd, IDC_DEBUG), BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -1129,8 +1160,11 @@ static void ui_to_params() {
       if (*p < 128) pat += (char)*p;
     g_p.code_pattern = trim(pat);
   }
-  g_p.two_code_sentence =
+  g_p.sentence_mode =
       SendMessageW(GetDlgItem(g_hwnd, IDC_TCS), BM_GETCHECK, 0, 0) == BST_CHECKED;
+  // 整句模式锁定编码匹配（2026-11-22）：勾选时恒 '.{2,}'——即使输入框被
+  // 跨进程工具改过也以锁定值为准（输入框本身已禁用，此处为兜底）
+  if (g_p.sentence_mode) g_p.code_pattern = ".{2,}";
   GetDlgItemTextW(g_hwnd, IDC_MODEL, buf, 512);
   std::wstring def = default_model_path();
   g_p.model_path = (wcscmp(buf, def.c_str()) == 0) ? std::wstring() : buf;
@@ -1164,7 +1198,13 @@ static void params_to_ui() {
   SendMessageW(GetDlgItem(g_hwnd, IDC_DEBUG), BM_SETCHECK,
                g_p.debug_fusion ? BST_CHECKED : BST_UNCHECKED, 0);
   SetDlgItemTextW(g_hwnd, IDC_MODEL, shown_model().c_str());
-  SetDlgItemTextW(g_hwnd, IDC_CODE_PAT, utf8_to_wide(g_p.code_pattern).c_str());
+  // 整句模式锁定编码匹配显示（2026-11-22）：勾选 → 框固定 '.{2,}' 禁用；
+  // 未勾选 → 方案值可编辑（勾选前的原值记在 g_pat_before_sent 供恢复）
+  SetDlgItemTextW(g_hwnd, IDC_CODE_PAT,
+                  g_p.sentence_mode ? L".{2,}"
+                                    : utf8_to_wide(g_p.code_pattern).c_str());
+  EnableWindow(GetDlgItem(g_hwnd, IDC_CODE_PAT),
+               g_p.sentence_mode ? FALSE : TRUE);
   wchar_t buf[64];
   struct { int id; int v; } rows[] = {
       {IDC_MAX_TOK, g_p.max_tokens},
@@ -1174,7 +1214,7 @@ static void params_to_ui() {
     SetDlgItemTextW(g_hwnd, r.id, buf);
   }
   SendMessageW(GetDlgItem(g_hwnd, IDC_TCS), BM_SETCHECK,
-               g_p.two_code_sentence ? BST_CHECKED : BST_UNCHECKED, 0);
+               g_p.sentence_mode ? BST_CHECKED : BST_UNCHECKED, 0);
   scan_models(GetDlgItem(g_hwnd, IDC_MODEL));
   refresh_model_status();
   g_ui_sig = ui_signature();   // 脏标记基准（打开下拉是否重读当前文件）
@@ -1284,7 +1324,8 @@ static const wchar_t* const TIP_CODE_PAT =
     L"默认 .{4} = 恰 4 码。例：\n"
     L"　.{4,} 4 码以上　　.{3,4} 3~4 码\n"
     L"　[abcde]{4} 指定首码　　空 = 不限制\n"
-    L"含 \\ 的写法要用单引号，如 '\\d{4}'。";
+    L"含 \\ 的写法要用单引号，如 '\\d{4}'。\n"
+    L"整句模式开启时本项固定为 .{2,}（输入框锁定）。";
 static const wchar_t* const TIP_MAX_TOK =
     L"上文长度上限：取光标前多少个 token 作为重排依据（默认 20）。\n"
     L"越大越准，但每次都更慢。";
@@ -1304,13 +1345,15 @@ static const wchar_t* const TIP_BENCH =
     L"约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。";
 // TIP_BETA 已删（2026-11-05：用户词频权重 β 退出用户配置面 → FREQ_BETA=12 内置
 // 常数，与 τ 同待遇——用户没有标定能力；方案残留旧行保存时剥除）
-// TIP_ELW 已删（2026-11-07：预期词长权重 elw 退役 → two_code_sentence 开关）
+// TIP_ELW 已删（2026-11-07：预期词长权重 elw 退役 → 布尔开关）
 static const wchar_t* const TIP_TCS =
-    L"两码整句 two_code_sentence（默认关闭）。\n"
-    L"开启后（双拼/五笔/郑码等两码一字整句方案）：词长恰为\n"
-    L"floor(码长/2) 字的候选作为一组直接优先（组内按融合分），\n"
-    L"其余候选按融合分排后——整句方案的满句长候选优先。\n"
-    L"一般字词方案保持关闭。取代原预期词长权重 elw（2026-11-07）。";
+    L"整句模式 sentence_mode（默认关闭）。\n"
+    L"开启后：只有覆盖整个活动段（音节数与编码一致）的候选进\n"
+    L"LLM 评分窗——全拼/简拼整句的满覆盖候选优先，部分编码对应的\n"
+    L"候选保持引擎序排后；两码一字方案（双拼/五笔/郑码）下与旧\n"
+    L"「词长==⌊码长/2⌋」效果一致。\n"
+    L"开启后编码匹配固定为 .{2,}（2 码起参与重排，输入框锁定）。\n"
+    L"取代 two_code_sentence 两码整句（2026-11-22）。";
 static const wchar_t* const TIP_DEBUG =
     L"诊断日志：开启后每次重排都往用户文件夹的 llm_rerank 子目录写\n"
     L"rime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。\n"
@@ -1425,11 +1468,18 @@ static void cfg_make_ui() {
   }
   y += ts(10);
 
-  // ═══ 触发条件（单行）════════════════════════════════════
+  // ═══ 触发条件（编码匹配 + 整句模式）═════════════════════
+  // 整句模式归入本组（2026-11-22 用户定案：取消「候选排序融合」组——
+  // 满覆盖准入本质是触发/准入条件；复选框不再带英文键名）
   {
     int gy = y; y += ts(26);
     row_input(y, tw(L"编码匹配:", g_font), L"编码匹配:", IDC_CODE_PAT, 240, 0,
               TIP_CODE_PAT, HX);
+    HWND cb = mk(0, L"整句模式", BS_AUTOCHECKBOX | WS_TABSTOP, PAD + ts(12),
+                 y + ts(2), tw(L"整句模式", g_font) + ts(26), ts(22), IDC_TCS);
+    tip_add(cb, TIP_TCS);
+    mk_help(HX, y + ts(4), TIP_TCS);
+    y += ts(30);
     mk_group(L"触发条件", PAD, gy, CW, y - gy + ts(8));
   }
   y += ts(10);
@@ -1437,8 +1487,8 @@ static void cfg_make_ui() {
   // ═══ 推理规模：三个参数各一行，标签列用同一个实测宽度
   // （2026-09-30 第二次定案：融合分不再平铺公式——公式移进「?」悬停说明；
   //  2026-11-05 用户定案：删「用户词频权重」行——freq_beta 为标定产物退出
-  //  配置面 → FREQ_BETA=12 内置常数；2026-11-07 用户定案：「预期词长权重」
-  //  行退役 → 「候选排序融合」组只剩「两码整句」复选框）═══
+  //  配置面 → FREQ_BETA=12 内置常数；2026-11-22 用户定案：「候选排序融合」
+  //  组取消——整句模式移入「触发条件」组）═══
   {
     struct { const wchar_t* label; int id; const wchar_t* tip; } rows[] = {
         {L"上文 token 上限:", IDC_MAX_TOK, TIP_MAX_TOK},
@@ -1462,24 +1512,13 @@ static void cfg_make_ui() {
       }
     }
     mk_group(L"推理规模", PAD, gy, CW, y - gy + ts(8));
-    y += ts(10);
-
-    gy = y; y += ts(26);
-    HWND cb = mk(0, L"两码整句 two_code_sentence",
-                 BS_AUTOCHECKBOX | WS_TABSTOP, PAD + ts(12), y + ts(2),
-                 tw(L"两码整句 two_code_sentence", g_font) + ts(26), ts(22),
-                 IDC_TCS);
-    tip_add(cb, TIP_TCS);
-    mk_help(HX, y + ts(4), TIP_TCS);
-    y += ts(30);
-    mk_group(L"候选排序融合", PAD, gy, CW, y - gy + ts(8));
   }
-  y += ts(12);
+  y += ts(10);
 
   // ═══ 诊断 + 保存 ═════════════════════════════════════════
   {
-    HWND cb = mk(0, L"诊断日志 debug_fusion", BS_AUTOCHECKBOX | WS_TABSTOP, LX, y,
-                 tw(L"诊断日志 debug_fusion", g_font) + ts(26), ts(22), IDC_DEBUG);
+    HWND cb = mk(0, L"诊断日志", BS_AUTOCHECKBOX | WS_TABSTOP, LX, y,
+                 tw(L"诊断日志", g_font) + ts(26), ts(22), IDC_DEBUG);
     tip_add(cb, TIP_DEBUG);
     mk_help(HX, y + ts(2), TIP_DEBUG);
     y += ts(30);

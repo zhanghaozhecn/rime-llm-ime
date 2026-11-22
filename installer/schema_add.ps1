@@ -101,21 +101,23 @@ function Edit-SchemaSource([string]$schemaPath) {
 # llm_rerank 配置节模板 —— 与插件版 rime-llm-rerank\installer\install_plugin.ps1
 # 的 Get-LlmCfgLines **逐字一致**（2026-09-30 用户定案：两版方案配置节相同，
 # 仅组件行不同）：enabled / code_pattern / max_tokens / max_candidates /
-# cpu_cores / freq_beta / expected_length_weight / debug_fusion / model_path
+# cpu_cores / sentence_mode / debug_fusion / model_path
+# （freq_beta/elw 退役 2026-11-05/07；two_code_sentence → sentence_mode
+#   整句模式改名 2026-11-22；默认 20/6 为 2026-11-19 0.6B 时代值——
+#   本次顺手修正陈旧模板 10/5 与 Qwen3.5-0.8B 默认模型名）
 function Get-LlmCfgLines([string]$modelPath) {
   $l = @(
     "", "llm_rerank:",
     "  enabled: true",
     "  code_pattern: '.{4}'",
-    "  max_tokens: 10",
-    "  max_candidates: 5",
+    "  max_tokens: 20",
+    "  max_candidates: 6",
     "  cpu_cores: 4",
-    "  freq_beta: 1.50",
-    "  expected_length_weight: 0.20",
+    "  sentence_mode: false",
     "  debug_fusion: false"
   )
   if ($modelPath) { $l += "  model_path: " + ($modelPath -replace '\\', '/') }
-  else { $l += "  # model_path: <绝对路径；默认 = $UserDir\Qwen3.5-0.8B-Q4_K_M.gguf>" }
+  else { $l += "  # model_path: <绝对路径；默认 = $UserDir\Qwen3-0.6B-Base-Q4_K_M.gguf>" }
   return $l
 }
 

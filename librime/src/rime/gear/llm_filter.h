@@ -20,6 +20,7 @@ class LlmRerankTranslation : public Translation {
  public:
   LlmRerankTranslation(an<Translation> translation,
                        const std::string& input,
+                       size_t seg_start, size_t seg_end,
                        const std::string& ctx,
                        const std::string& src);
   bool Next() override;
@@ -30,7 +31,9 @@ class LlmRerankTranslation : public Translation {
 
   an<Translation> translation_;
   std::vector<an<Candidate>> candidates_;
-  std::string input_;  // input code, for the per-inference event log
+  std::string input_;  // input code (活动段切片), for the per-inference event log
+  size_t seg_start_ = 0;  // 活动段在原始 input 中的区间 [seg_start_, seg_end_)
+  size_t seg_end_ = 0;    // （整句模式满覆盖 FM 判定用；单段 = [0, input 全长)）
   std::string ctx_;    // normalized context text (TSF or commit history)
   std::string src_;    // context source: "tsf" | "rime"
   size_t index_ = 0;
