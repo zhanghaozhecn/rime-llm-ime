@@ -170,14 +170,18 @@ int main(int argc, char** argv) {
       continue;
     }
     // 用 simulate_key_sequence（如有）——按 key_sequence 常规解析，等价
-    // 于真实逐键；缺失则回退逐键 process_key
-    if (api->simulate_key_sequence) {
-      api->simulate_key_sequence(sid, line);
-    }
+    // 于真实逐键；缺失则回退逐键 process_key。
+    // ⚠ 2026-11-23 修：原实现二者都跑（输入被打两遍 → "wo" 的候选变成
+    // "窝窝/我我"，Q 行耗时/候选数全部对翻倍码串），改为二选一。
     double t0 = now_ms();
     int keys_ok = 0;
-    for (size_t i = 0; i < n; i++) {
-      if (api->process_key(sid, (int)(unsigned char)line[i], 0)) keys_ok++;
+    if (api->simulate_key_sequence) {
+      api->simulate_key_sequence(sid, line);
+      keys_ok = (int)n;
+    } else {
+      for (size_t i = 0; i < n; i++) {
+        if (api->process_key(sid, (int)(unsigned char)line[i], 0)) keys_ok++;
+      }
     }
     double t1 = now_ms();
     {
