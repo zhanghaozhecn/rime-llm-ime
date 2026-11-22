@@ -2335,11 +2335,18 @@ static double ce_target(const float *logits, int target_id, float m, double lse)
 //   Step 3: decode second tokens (rows deduped by (c0,c1) pair; extra
 //           pairs seq_cp their own seq) -> CE of cand[2]
 // ============================================================
-static void score_batch(const std::vector<llama_token> &ctx_ids,
+// 返回 true = 评分完成（结果可发布）；false = 中途取消（异步评分器代次
+// 变化——新 submit 覆盖 / cancel，结果整体丢弃）。中断检查点 = 拿锁后 /
+// CE1 后(Step2 前) / Step2 后(Step3 前)：批 decode 单步 ~10-25ms，Step
+// 粒度中断足够（2026-11-22 异步基建，两版同构）。同步调用（非异步路径/
+// 研究工具）传缺省 nullptr/0，恒走完。
+static bool score_batch(const std::vector<llama_token> &ctx_ids,
                         const std::vector<std::vector<llama_token>> &cands,
                         std::vector<double> &scores_out,
                         std::vector<std::array<double, 3>> *ce3_out = nullptr,
-                        bool *prep_hit_out = nullptr) {
+                        bool *prep_hit_out = nullptr,
+                        const std::atomic<long> *cancel_gen = nullptr,
+                        long my_gen = 0) {
   scores_out.assign(cands.size(), -1e10);
   if (ce3_out)  // 三分量初值 NaN（缺 token / 失败位 → 调试端显示空）
     ce3_out->assign(cands.size(), {NAN, NAN, NAN});
@@ -2347,10 +2354,18 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
     *prep_hit_out = false;
   int n_cands = (int)cands.size();
   if (n_cands == 0)
-    return;
+    return true;
+
+  auto cancelled = [&]() {
+    return cancel_gen &&
+           cancel_gen->load(std::memory_order_relaxed) != my_gen;
+  };
 
   auto t0 = std::chrono::high_resolution_clock::now();
-  std::lock_guard<std::mutex> lock(g_mutex);
+  std::unique_lock<std::mutex> lock(g_mutex);
+  // 拿锁后先查一次：等待锁期间任务可能已被覆盖（白跑整段 Step1）
+  if (cancelled())
+    return false;
   auto t1 = std::chrono::high_resolution_clock::now();
   double wait_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -2407,7 +2422,7 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
     llama_batch_free(ctx_batch);
     if (!decoded_ok) {
       log_error("ctx decode failed");
-      return;  // prep 存储只在成功时覆写
+      return true;  // prep 存储只在成功时覆写；结果全哨兵照常发布
     }
     // self-refresh prep: seq0 just decoded (generation bumped), KV and
     // logits are consistent, so later scores for the same ctx (page turn,
@@ -2445,6 +2460,10 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
   auto ts_ce1_1 = std::chrono::high_resolution_clock::now();
   double ms_ce1 =
       std::chrono::duration<double, std::milli>(ts_ce1_1 - ts_ce1_0).count();
+
+  // 中断检查（Step2 前）：此时未分配 worker seq，无 KV 泄漏
+  if (cancelled())
+    return false;
 
   // Step 2/3: 前缀去重批量 decode（2026-11-07，两版同步）
   // 行按"已解码前缀"分组：step2 行 = 候选首 token（去重）；step3 行 =
@@ -2541,6 +2560,13 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
   // Step 3: 前缀 (c0,c1) 去重 decode
   const int V = (int)rows3.size();
   if (V > 0 && step2_ok) {
+    // 中断检查（Step3 前）：step2 worker seq 已分配，先释放再退出
+    if (cancelled()) {
+      auto *mem0 = llama_get_memory(g_ctx);
+      for (int s = 1; s <= seq_top; s++)
+        llama_memory_seq_rm(mem0, s, 0, -1);
+      return false;
+    }
     auto ts3_0 = std::chrono::high_resolution_clock::now();
     // seq 分配：每个首 token 的第一个对复用 step2 seq；后续对
     // seq_cp(step2 seq → 新 seq)——拷贝发生在 step3 decode 的 update
@@ -2639,6 +2665,7 @@ static void score_batch(const std::vector<llama_token> &ctx_ids,
           "r2=%d r3=%d",
           wait_ms, ms1, ms_ce1, ms2a, ms2b, ms3, ms_score, total_ms,
           use_prep ? 1 : 0, ctx_len, n_cands, U, V);
+  return true;
 }
 
 // ============================================================
@@ -2737,6 +2764,289 @@ static void retry_pending_prepare() {
 }
 
 // ============================================================
+// 异步评分器（2026-11-22 异步基建，两版同构）
+// 同步路径零 LLM：Collect 每键 async_submit 投递，评分在持久工作线程执行；
+// 字词模式 submit+wait（与既有同步评分等价的延迟面——当前词重排零回归），
+// 整句模式 submit 不等待（0 LLM 打字流畅），结果经后续 Collect 的收割点
+// 回填（同指纹重复 query 即缓存命中；整句挂账补写语料 W ok）。
+// 任务槽覆盖式 + 代次中断（submit/cancel 递增 g_async_gen，score_batch
+// 每 Step 边界检查）+ 40ms 去抖（非 immediate 任务，等编码稳定才开跑）。
+// 指纹 = 归一化上文 \x1f 候选 \x1e 拼接原串（上文/候选变化自然失效，无需
+// 失效链）。结果槽只存最近完成一份。
+// ============================================================
+static std::atomic<long> g_async_gen{1};
+static std::mutex g_async_mu;
+static std::condition_variable g_async_cv;
+static std::thread g_async_thread;
+static std::atomic<bool> g_async_started{false};
+
+static constexpr int kAsyncDebounceMs = 40;
+
+struct AsyncTask {
+  bool valid = false;
+  long gen = 0;                // 提交时的代次（中断判定基准）
+  bool immediate = false;      // wait 模式：跳过去抖立即开跑
+  std::string fingerprint;
+  std::string ctx_norm;        // normalize_ctx 后的上文（token 化源）
+  std::vector<std::string> cand_texts;
+  std::chrono::steady_clock::time_point enq_at;
+};
+static AsyncTask g_async_task;
+
+struct AsyncRes {
+  bool valid = false;
+  std::string fingerprint;
+  std::vector<double> scores;   // 提交序（= Collect 的 candidates_ 序）
+  std::vector<std::array<double, 3>> ce3;
+  std::vector<std::string> segs;  // token 边界段显（协议 v7，对齐提交序）
+  std::string ctx_used;           // 推理用上文尾部（协议 v4，调试灰显）
+  bool prep_hit = false;
+  double ev_ms = 0;
+};
+static AsyncRes g_async_result;
+
+// 挂账：整句模式异步投递时登记（fp → W 行所需信息），评分结果收割时补写
+// W ok（flags=async）+ P 行。任务被覆盖/取消则条目随容量清理丢弃（快速
+// 连打的中间键不落语料 = "只有完成的评分才落 W"的异步语义）。
+struct AsyncPending {
+  std::string wid;
+  std::string code;            // 活动段切片码
+  std::string wctx;
+  std::vector<std::string> engine_vec;
+  std::vector<std::string> window_vec;   // 层1窗（提交序）
+  long long tick = 0;
+  std::string src;
+  bool sent_on = false;        // 挂账来源（整句模式恒 true）
+};
+static std::map<std::string, AsyncPending> g_async_pending;
+
+// 评分快照缓存（fp → AsyncRes）：同指纹重复 query（翻页/候选窗重建/收割
+// 回填）命中即融合，0 LLM。融合分每次现算（eff/pairfix 微秒级），缓存只存
+// 原始评分快照——语义与同步版逐位一致。
+static std::map<std::string, AsyncRes> g_async_cache;
+
+// 挂账回填：补写 W ok + P 行。final = 窗内候选融合重排（文本域现算，与
+// 同步版融合公式逐位一致；eff/uni/pairfix 为微秒级内存查询；账本 tick 与
+// 提交时刻的漂移 ≤1 词提交，v1 接受——D/L/C 明细行省略，W final 序已够
+// 评测）。
+static void async_write_pending(const AsyncPending &pend,
+                                const AsyncRes &snap) {
+  std::map<std::string, double> pf_tbl;
+  bool pf_on = pairfix_table(&pf_tbl);
+  double min_valid = 0.0;
+  bool have_min = false;
+  for (size_t i = 0; i < pend.window_vec.size(); i++) {
+    double s = i < snap.scores.size() ? snap.scores[i] : -1e10;
+    if (s > -1e9 && (!have_min || s < min_valid)) {
+      min_valid = s;
+      have_min = true;
+    }
+  }
+  std::vector<size_t> ord(pend.window_vec.size());
+  std::vector<double> fused(pend.window_vec.size(), -1e308);
+  for (size_t i = 0; i < pend.window_vec.size(); i++) {
+    ord[i] = i;
+    double s = i < snap.scores.size() ? snap.scores[i] : -1e10;
+    const std::string &t = pend.window_vec[i];
+    double s1 = g_freq_beta * std::log(1.0 + user_freq_eff(t, pend.code)) +
+                user_unigram_term(t, pend.code);
+    double pf = pf_on ? pairfix_delta(pf_tbl, t, pend.code) : 0.0;
+    if (s > -1e9)
+      fused[i] = s + s1 + pf;
+    else  // 无 CE 分（哨兵/缺失）：层1 分 + 窗内最低 LLM 分（压制窗底）
+      fused[i] = s1 + (have_min ? min_valid : 0.0) + pf;
+  }
+  std::stable_sort(ord.begin(), ord.end(), [&fused](size_t a, size_t b) {
+    return fused[a] > fused[b];  // stable = 同分保提交序（层1 序）
+  });
+  std::vector<std::string> final_list;
+  for (size_t k : ord) final_list.push_back(pend.window_vec[k]);
+  write_w(pend.wid, pend.src, pend.code, pend.wctx, pend.engine_vec,
+          pend.window_vec, final_list, pend.tick, "ok", "",
+          snap.prep_hit, "async");
+  debug_write_p(pend.wid, snap.ev_ms, snap.prep_hit);
+}
+
+static void async_worker_loop() {
+  for (;;) {
+    AsyncTask task;
+    {
+      std::unique_lock<std::mutex> lk(g_async_mu);
+      g_async_cv.wait(lk, [] { return g_async_task.valid; });
+      task = g_async_task;
+      g_async_task.valid = false;   // 领走
+      // 去抖：非 immediate 任务等 40ms 无更新才开跑；期间新任务到达
+      //（notify 唤醒）则换新任务重新等。immediate（字词 wait 路径）跳过。
+      if (!task.immediate) {
+        for (;;) {
+          auto deadline =
+              task.enq_at + std::chrono::milliseconds(kAsyncDebounceMs);
+          bool updated = g_async_cv.wait_until(lk, deadline, [&] {
+            return g_async_task.valid && g_async_task.enq_at > task.enq_at;
+          });
+          if (!updated)
+            break;
+          task = g_async_task;
+          g_async_task.valid = false;
+        }
+      }
+    }
+    // 领取后已被覆盖/取消（gen 前进）：丢弃，回到等待
+    if (task.gen != g_async_gen.load(std::memory_order_relaxed))
+      continue;
+
+    // 模型懒加载触发（与同步路径同语义：不等待加载——加载中任务发布
+    // 失败结果，wait 路径上层 skip not_ready；就绪后后续任务正常评分）
+    if (!g_loaded.load()) {
+      if (!g_loading.load())
+        load_model_async();
+      std::lock_guard<std::mutex> lk(g_async_mu);
+      g_async_result = AsyncRes{};
+      g_async_cv.notify_all();
+      continue;
+    }
+
+    AsyncRes res;
+    res.fingerprint = task.fingerprint;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    std::vector<llama_token> ctx_ids = tokenize(task.ctx_norm.c_str());
+    bool ctx_ok = (int)ctx_ids.size() >= g_min_tokens;
+    std::vector<std::vector<llama_token>> cand_ids;
+    if (ctx_ok) {
+      // token 域截尾（与同步路径同款：保留尾部 g_max_ctx_tokens 个 token；
+      // ctx_used = 截尾时保留段的 piece 拼接，未截尾 = 全文）
+      if ((int)ctx_ids.size() > g_max_ctx_tokens) {
+        ctx_ids.erase(ctx_ids.begin(),
+                      ctx_ids.end() - g_max_ctx_tokens);
+        res.ctx_used = tokens_piece(ctx_ids);
+      } else {
+        res.ctx_used = task.ctx_norm;
+      }
+      for (auto &s : task.cand_texts) {
+        auto ids = tokenize(s.c_str());
+        if (ids.empty())
+          ids.push_back(0);
+        res.segs.push_back(token_seg_display(ids));
+        cand_ids.push_back(std::move(ids));
+      }
+    }
+    if (!ctx_ok || cand_ids.size() < 2) {
+      std::lock_guard<std::mutex> lk(g_async_mu);
+      g_async_result = AsyncRes{};   // 失败发布（valid=false）
+      g_async_cv.notify_all();
+      continue;
+    }
+    bool done = false;
+    try {
+      done = score_batch(ctx_ids, cand_ids, res.scores, &res.ce3,
+                         &res.prep_hit, &g_async_gen, task.gen);
+    } catch (...) {
+      log_error("exception in async score_batch");
+    }
+    // 评分线程锁已释放：补跑被延迟的 prepare（同步路径收尾动作同款）
+    retry_pending_prepare();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    res.ev_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    if (done) {
+      res.valid = true;
+      std::lock_guard<std::mutex> lk(g_async_mu);
+      g_async_result = std::move(res);
+      g_async_cv.notify_all();
+    }
+    // 中断（done=false）：不发布，结果槽留给新任务
+  }
+}
+
+static std::string async_submit(const std::string &ctx_norm,
+                                const std::vector<std::string> &cand_texts,
+                                bool immediate) {
+  if (cand_texts.size() < 2 || ctx_norm.empty())
+    return "";
+  if (!g_async_started.load()) {
+    std::lock_guard<std::mutex> lk(g_async_mu);
+    if (!g_async_started.load()) {
+      g_async_thread = std::thread(async_worker_loop);
+      g_async_thread.detach();    // 进程内常驻，随进程退出
+      g_async_started.store(true);
+    }
+  }
+  std::string fp = ctx_norm;
+  fp.push_back('\x1f');
+  for (size_t i = 0; i < cand_texts.size(); i++) {
+    if (i)
+      fp.push_back('\x1e');
+    fp += cand_texts[i];
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_async_mu);
+    long gen = g_async_gen.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_async_task = AsyncTask{};
+    g_async_task.valid = true;
+    g_async_task.gen = gen;
+    g_async_task.immediate = immediate;
+    g_async_task.fingerprint = fp;
+    g_async_task.ctx_norm = ctx_norm;
+    g_async_task.cand_texts = cand_texts;
+    g_async_task.enq_at = std::chrono::steady_clock::now();
+  }
+  g_async_cv.notify_all();
+  return fp;
+}
+
+// 字词模式：阻塞等待指纹匹配的评分结果（与既有同步评分等价的延迟面）。
+static bool async_wait(const std::string &fp, int timeout_ms, AsyncRes &out) {
+  std::unique_lock<std::mutex> lk(g_async_mu);
+  bool got = g_async_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                                 [&] {
+                                   return g_async_result.valid &&
+                                          g_async_result.fingerprint == fp;
+                                 });
+  if (!got)
+    return false;
+  out = g_async_result;
+  g_async_result.valid = false;   // 取走即清（调用方有缓存）
+  return true;
+}
+
+// 整句模式：非阻塞收割最近完成的评分结果。
+static bool async_poll(AsyncRes &out) {
+  std::lock_guard<std::mutex> lk(g_async_mu);
+  if (!g_async_result.valid)
+    return false;
+  out = g_async_result;
+  g_async_result.valid = false;
+  return true;
+}
+
+// 代次递增 + 清任务槽：提交后中断在跑的评分（省 CPU 与锁占用）。
+// 结果槽保留——完成的评分成果仍可被后续收割点回收。
+static void async_cancel() {
+  g_async_gen.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lk(g_async_mu);
+  g_async_task = AsyncTask{};
+}
+
+// 收割点（2026-11-22）：回收最近完成的评分成果——回填缓存 + 补写挂账
+//（W ok / flags=async + P 行）。两个调用点：① Collect 入口（每次 query，
+// 翻页/候选窗重建命中缓存即 0 LLM）；② OnCommit（上屏时本词评分多半已
+// 完成——立即落账，场景内最后一词也有 ok 行，语料断言与词码对 ref 关联
+// 都不再依赖"下一次 query"）。调用方须与 Collect 同线程（commit 通知与
+// process_key 同在 server 消息线程——语料写入无跨线程竞争）。
+static void async_harvest() {
+  AsyncRes old;
+  if (!async_poll(old))
+    return;
+  g_async_cache[old.fingerprint] = old;
+  auto pit = g_async_pending.find(old.fingerprint);
+  if (pit != g_async_pending.end()) {
+    async_write_pending(pit->second, old);
+    g_async_pending.erase(pit);
+  }
+  if (g_async_cache.size() > 16)
+    g_async_cache.clear();
+}
+
+// ============================================================
 // LlmRerankTranslation
 // ============================================================
 
@@ -2812,6 +3122,11 @@ void LlmRerankTranslation::Collect() {
   bool w_written = false;
   std::string wstatus = "ok";
   std::string wskip;
+
+  // 异步基建收割点（2026-11-22）：每次 Collect 先收割最近完成的异步评分
+  //（回填缓存 + 挂账补写）——同指纹重复 query（翻页/候选窗重建）即命中
+  // 0 LLM。收割与本次 query 自身的指纹无关（收割的是历史任务成果）。
+  async_harvest();
 
   if (allc.size() >= 2 && g_loaded.load()) {
     // 词码对分数表：融合段共用一次读取（2026-11-21 解耦后只含负分，不参与
@@ -2918,53 +3233,107 @@ void LlmRerankTranslation::Collect() {
     // → 查看器显示原词）
     std::vector<std::string> seg_of(candidates_.size());
 
-    // 推理用上文尾部文本（协议 v4，调试窗口灰显；截尾分支内赋值）
+    // 推理用上文尾部文本（协议 v4，调试窗口灰显；快照路径从 snap 读）
     std::string ctx_used;
     {
-      std::vector<llama_token> ctx_ids = tokenize(ctx.c_str());
-      if ((int)ctx_ids.size() >= g_min_tokens) {
-        // 协议 v4（2026-11-12）：推理用尾部文本（调试窗口灰显）——截尾时 =
-        // 截尾保留 ids 的 piece 拼接（精确 token 边界）；未截尾 = 全文
-        if ((int)ctx_ids.size() > g_max_ctx_tokens) {
-          ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - g_max_ctx_tokens);
-          ctx_used = tokens_piece(ctx_ids);
-        } else {
-          ctx_used = ctx;
-        }
-
-        std::vector<std::vector<llama_token>> cand_ids;
+      // 上文 token 数检查（与同步版同语义，skip 原因语料兼容）：不足即
+      // ctx_short 跳过，不投递异步任务
+      std::vector<llama_token> ctx_probe = tokenize(ctx.c_str());
+      if ((int)ctx_probe.size() >= g_min_tokens) {
+        // ═══ 评分三路径（2026-11-22 异步基建，同步路径零 LLM）═══
+        // 指纹 = 归一化上文 \x1f 候选 \x1e 拼接（与插件版同构；上下文/
+        // 候选变化自然失效，无需失效链）。①缓存命中（同指纹重复 query，
+        // 0 LLM）②字词模式 submit+wait（immediate 跳去抖 + 250ms 上限
+        // ——与既有同步评分等价的延迟面，当前词重排零回归）③整句模式
+        // 纯异步投递（挂账 pending，评分结果由后续 Collect 收割回填）。
+        std::string fp = ctx;
+        fp.push_back('\x1f');
+        std::vector<std::string> cand_texts;
+        cand_texts.reserve(candidates_.size());
         for (size_t ci = 0; ci < candidates_.size(); ci++) {
-          auto ids = tokenize(candidates_[ci]->text().c_str());
-          if (ids.empty())
-            ids.push_back(0);
-          cand_ids.push_back(ids);
-          seg_of[ci] = token_seg_display(ids);
+          if (ci)
+            fp.push_back('\x1e');
+          fp += candidates_[ci]->text();
+          cand_texts.push_back(candidates_[ci]->text());
         }
 
-        std::vector<double> scores;
-        std::vector<std::array<double, 3>> ce3;
-        auto ev_t0 = std::chrono::high_resolution_clock::now();
-        score_batch(ctx_ids, cand_ids, scores, &ce3, &prep_hit);
-        auto ev_t1 = std::chrono::high_resolution_clock::now();
-        // 2026-11-18: the inference lock is free again - run any prepare that
-        // was deferred while this score was holding it.
-        retry_pending_prepare();
-        ev_ms =
-            std::chrono::duration<double, std::milli>(ev_t1 - ev_t0).count();
-
-        if (scores.size() == candidates_.size()) {
-          for (size_t i = 0; i < scores.size(); i++) {
-            score_of[i] = scores[i];
-            has_score[i] = scores[i] > -1e9;
-            ce3_of[i] = ce3[i];
+        AsyncRes snap;
+        bool have_snap = false;
+        auto cit = g_async_cache.find(fp);
+        if (cit != g_async_cache.end()) {
+          snap = cit->second;
+          have_snap = true;
+        }
+        if (!have_snap) {
+          std::string sfp = async_submit(ctx, cand_texts, !sent_on);
+          if (sfp.empty()) {
+            wstatus = "skip";
+            wskip = "async_failed";  // 任务不成立（理论上文/窗已过守卫）
+            live_send(std::string("S|") + now_hms() + "|async_failed|" +
+                      live_esc(input_) + "|" + src_);
+          } else if (sent_on) {
+            // 整句模式：投递即走（打字流畅优先——40ms 去抖 + 可中断
+            // decode，快速连打自动作废重投）。当前轮层1 序 + 挂账
+            // pending，评分结果由后续 Collect 的收割点补写语料（W ok
+            // / flags=async + P 行）。
+            AsyncPending pend;
+            pend.wid = wid;
+            pend.code = input_;
+            pend.wctx = wctx;
+            pend.engine_vec = engine_vec;
+            pend.window_vec = window_vec;
+            pend.tick = g_user_tick;
+            pend.src = src_;
+            pend.sent_on = true;
+            g_async_pending[sfp] = pend;
+            if (g_async_pending.size() > 32)
+              g_async_pending.clear();
+            wstatus = "skip";
+            wskip = "async_pending";
+            live_send(std::string("S|") + now_hms() + "|async_pending|" +
+                      live_esc(input_) + "|" + src_);
+          } else {
+            // 字词模式：同步等待评分完成（等价既有同步评分——当前词
+            // 重排零回归；wait 超时 = skip，评分线程继续跑完发布，
+            // 后续 Collect 可经收割点回收进缓存）
+            AsyncRes res;
+            if (async_wait(sfp, 250, res)) {
+              g_async_cache[sfp] = res;
+              if (g_async_cache.size() > 16)
+                g_async_cache.clear();
+              snap = res;
+              have_snap = true;
+            } else {
+              wstatus = "skip";
+              wskip = "async_timeout";
+              live_send(std::string("S|") + now_hms() + "|async_timeout|" +
+                        live_esc(input_) + "|" + src_);
+            }
           }
-          std::vector<int> ord(scores.size());
+        }
+
+        if (have_snap && snap.scores.size() == candidates_.size()) {
+          ev_ms = snap.ev_ms;
+          prep_hit = snap.prep_hit;
+          ctx_used = snap.ctx_used;
+          for (size_t i = 0; i < candidates_.size(); i++) {
+            score_of[i] = snap.scores[i];
+            has_score[i] = snap.scores[i] > -1e9;
+            ce3_of[i] = snap.ce3.size() == candidates_.size()
+                            ? snap.ce3[i]
+                            : std::array<double, 3>{NAN, NAN, NAN};
+            if (i < snap.segs.size())
+              seg_of[i] = snap.segs[i];
+          }
+          std::vector<int> ord(snap.scores.size());
           for (size_t i = 0; i < ord.size(); i++)
             ord[i] = (int)i;
-          std::sort(ord.begin(), ord.end(),
-                    [&](int a, int b) { return scores[a] > scores[b]; });
+          std::sort(ord.begin(), ord.end(), [&](int a, int b) {
+            return snap.scores[a] > snap.scores[b];
+          });
           order = std::move(ord);
-        } else {
+        } else if (have_snap) {
+          // 快照长度失配（防御，正常不可达——fp 绑定同候选集）
           wstatus = "skip";
           wskip = "score_failed";
           live_send(std::string("S|") + now_hms() + "|score_failed|" +
@@ -2978,7 +3347,7 @@ void LlmRerankTranslation::Collect() {
         live_send(std::string("S|") + now_hms() + "|ctx_short|" +
                   live_esc(input_) + "|" + src_);
         debug_write_raw(wid + "|X|scope=ctx|msg=ctx_tokens=" +
-                            std::to_string((int)ctx_ids.size()) +
+                            std::to_string((int)ctx_probe.size()) +
                             " min=" + std::to_string(g_min_tokens),
                         false);
       }
@@ -3343,6 +3712,13 @@ static void on_context_changed(const char *text) {
 }
 
 void LlmFilter::OnCommit(const std::string &commit_text) {
+  // 异步基建（2026-11-22）：先收割（上屏时本词评分多半已完成——立即落账，
+  // 场景内最后一词也有 ok 行，语料断言/词码对 ref 不依赖"下一次 query"），
+  // 再取消（提交后上文变化，中断在跑的评分——代次递增 + 清任务槽，
+  // score_batch Step 边界生效；挂账条目随代次废弃）。结果槽内未收割的
+  // 旧成果不受 cancel 影响。
+  async_harvest();
+  async_cancel();
   // Commit-history fallback accumulation (engine thread):
   // reset-generation sync first (edit keys / window switch invalidate the
   // old accumulation), then append this commit.

@@ -277,7 +277,7 @@ rime-llm-ime/
 
 ### 真机自动化回归（test_ctx_auto.py）
 
-`scripts\test_ctx_auto.py` 用 SendInput 合成真实键击走完整输入法链路（编码→候选→LLM 重排→上屏，不绕过任何环节），从统一语料 `rime_llm_corpus.tsv` 的 W 行逐词断言上文来源（uia/com/rime）与内容、最终首选=上屏词——把退格 / 撤销 / 移光标 / 粘贴等上文信号场景变成一键回归（2026-09-13 真机 12/12 通过，验证插件版信号层修复）：
+`scripts\test_ctx_auto.py` 用 SendInput 合成真实键击走完整输入法链路（编码→候选→LLM 重排→上屏，不绕过任何环节），从统一语料 `rime_llm_corpus.tsv` 的 W 行逐词断言上文来源（uia/com/rime）与内容、最终首选=上屏词——把退格 / 撤销 / 移光标 / 粘贴等上文信号场景变成一键回归（2026-09-13 真机 12/12 通过，验证插件版信号层修复；2026-11-22 起六场景 × fast/slow 双节奏 = 32 断言，wait_new 兼容整句模式异步挂账行 `skip|async_pending`——评分行的 ctx/src/window 挂账轮已写齐，依赖 final 序的断言仍只认 ok 行）：
 
 ```bat
 python scripts\test_ctx_auto.py               :: 记事本 5 场景（s1 基线/s2 退格/s3 撤销/s4 移光标/s5 粘贴）
@@ -286,6 +286,10 @@ python scripts\test_ctx_auto.py --app wps     :: WPS：手动开好空文字文�
 ```
 
 运行期间手离开键鼠约 20 秒；自动清旧记事本起新窗口，内置输入法自愈（评分探针 + Win+Space 循环）。三个写进脚本注释的关键事实：满 4 码不自动顶屏（上屏由第 5 键或空格触发，编辑前须先空格顶屏否则删的是编码）；INPUT 结构 union 必须含 MOUSEINPUT（x64 上 40 字节，32B 被 SendInput 静默拒绝）；绝不能 taskkill WeaselServer（丢输入法绑定，恢复只能逐窗 Win+Space）。`--engine source|plugin` 仅标示被测版本，**两版都读同一个 `rime_llm_corpus.tsv`**；`--app wps` 验证 COM 通道（自动找 Office 窗口切前台）。两版回归基线：插件版记事本/WPS 各 12/12、源码版各 11/11（冷启动首词无评分行属行为差异）。
+
+### 异步评分（2026-11-22 起，字词/整句两模式统一）
+
+评分移出按键路径（`llm_filter.cc` 异步评分器，与插件版同构）：Collect 每键投递异步任务（指纹 = 归一化上文+候选文本，持久评分线程 + 40ms 去抖 + score_batch 每 Step 边界可中断），同步路径零 LLM。**字词模式** submit+wait（≤250ms，与旧同步评分等价，当前词重排零回归）；**整句模式**投递即走（层1 序先行），评分结果由两个收割点回填——Collect 入口（翻页/候选窗重建命中缓存即 0 LLM）+ OnCommit（上屏即落账，场景内末词也有 ok 行）。commit 先收割再取消（代次递增，在跑评分在下一个 Step 边界终止）。语料 W 行新形态：整句挂账轮 `skip|async_pending` + 回填 `ok`（flags=`async`）双行；新 skip 名 `async_timeout`。设计全文见研究库《全拼简拼整句重排-调研与设计》§七。
 
 ### 构建步骤
 

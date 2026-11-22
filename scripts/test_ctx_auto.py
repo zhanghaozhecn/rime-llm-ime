@@ -214,18 +214,30 @@ class EventsLog:
         return len(self._lines())
 
     def wait_new(self, code, timeout=4.0):
-        """等待本观察期之后出现的、码=code 的最新 ok 评分行。"""
+        """等待本观察期之后出现的、码=code 的最新评分行。优先 ok 行（final
+        序可用）；无 ok 时接受 skip=async_pending 行（2026-11-22 整句模式
+        异步基建：评分移出按键路径后，挂账轮第 4 键写 skip 行、ok 行要等
+        上屏/下一 query 收割回填（跨场景可达 5-10s）——pending 行的
+        ctx/src/engine/window 字段挂账轮已写齐，足以承载上下文传播断言；
+        result 为空，依赖 final 的断言（S6 ranks）仍只认 ok 行）。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
+            # 反向取第一个 ok 或 async_pending 行 = 最新评分受理行
+            #（ok 优先会吃到旧场景的 ok 行——pending 行更新却一致）
             for ln in reversed(self._lines()[self.mark:]):
                 parts = ln.split("\t")
                 if len(parts) < 14 or parts[0] != "W" or parts[4] != code:
                     continue
-                if parts[10] != "ok":  # skip 行无 final，不作为评分断言
-                    continue
-                return {"code": parts[4], "cands": parts[7],
-                        "ctx": parts[5], "result": parts[8],
-                        "src": parts[3], "id": parts[1]}
+                if parts[10] == "ok":
+                    return {"code": parts[4], "cands": parts[7],
+                            "ctx": parts[5], "result": parts[8],
+                            "src": parts[3], "id": parts[1],
+                            "pending": False}
+                if parts[10] == "skip" and parts[11] == "async_pending":
+                    return {"code": parts[4], "cands": parts[7],
+                            "ctx": parts[5], "result": "",
+                            "src": parts[3], "id": parts[1],
+                            "pending": True}
             time.sleep(0.15)
         return None
 
@@ -338,10 +350,18 @@ def s1_base(log):
     # （LLM 重排可能不选词表首选：v3 常数下"发现"后 wkjl 合法改选 痢疾，
     # 2026-11-11 本机实测——断言跟随实际提交而非词表，避免环境态漂移误报。
     # w1 冷启动无评分行，其上屏词是方案原始首选，w2 断言仍用词表的 发现）
-    w2_committed = (rows["wkjl"] or {}).get("result", "nil").split(",")[0]
+    # 上屏词 = 前一词 C 提交行的实际词（2026-11-22 异步基建：评分行可能是
+    # pending（result 空）；wkjl 由 krng 首键顶屏，断言时 C 行已写——跟随
+    # 实际提交而非词表，避免环境态漂移误报；C 行无则回退 result 首选）
+    w2_committed = "立即"
+    c_w2 = log.wait_commit(code="wkjl", timeout=2.0)
+    if c_w2 is not None:
+        w2_committed = c_w2["word"]
+    elif (rows["wkjl"] or {}).get("result"):
+        w2_committed = rows["wkjl"]["result"].split(",")[0]
     check(ctx_has(rows["wkjl"], "发现"), "S1 w2 ctx has w1",
           "ctx=…%s" % (rows["wkjl"] or {}).get("ctx", "")[-12:])
-    check(w2_committed != "nil" and ctx_has(rows["krng"], w2_committed),
+    check(ctx_has(rows["krng"], w2_committed),
           "S1 w3 ctx has w2",
           "w2=%s ctx=…%s" % (w2_committed,
                              (rows["krng"] or {}).get("ctx", "")[-12:]))
