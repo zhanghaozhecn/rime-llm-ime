@@ -28,6 +28,7 @@ public class W {
   [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, EnumProc cb, IntPtr l);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, ref int pid);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   // 控件几何（phase13 断言按钮位置用）
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L; public int T; public int R; public int B; }
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
@@ -83,6 +84,12 @@ function Read-Ctl($hw, [int]$id) {
   $sb = New-Object System.Text.StringBuilder ($len + 2)
   [void][W]::SendMessageBuf($h, 0x000D, [IntPtr]($len + 1), $sb)             # WM_GETTEXT
   return $sb.ToString()
+}
+# 控件是否可见（用于「前缀自动确认」只在整句模式显示的断言）
+function Visible-Ctl($hw, [int]$id) {
+  $h = [W]::GetDlgItem($hw, $id)
+  if ($h -eq [IntPtr]::Zero) { return $false }
+  return [bool][W]::IsWindowVisible($h)
 }
 # 保存并生效（1101）= 自适应：缺节/缺组件行时自动补齐（原「接入 LLM」已并入，2026-10-01）
 function Get-WText([IntPtr]$h) {
@@ -327,6 +334,9 @@ engine:
   Assert "cpu_cores: 4" (($y | Where-Object { $_ -match '^  cpu_cores: 4$' }).Count -eq 1)
   Assert "无 freq_beta（标定产物退出配置面 2026-11-05）" (($y | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
   Assert "sentence_mode: false（默认关闭，2026-11-22 取代 two_code_sentence）" (($y | Where-Object { $_ -match '^  sentence_mode: false$' }).Count -eq 1)
+  Assert "prefix_confirm: false（前缀自动确认默认关闭，仅整句模式生效）" (($y | Where-Object { $_ -match '^  prefix_confirm: false$' }).Count -eq 1)
+  # 前缀自动确认复选框（2026-11-23）：整句模式关 → 隐藏（只在整句模式显示）
+  Assert "「前缀自动确认」隐藏（整句模式关）" (-not (Visible-Ctl $hw 1022))
   Assert "无 expected_length_weight（elw 退役 2026-11-07）" (($y | Where-Object { $_ -match 'expected_length_weight' }).Count -eq 0)
   Assert "debug_fusion: false" (($y | Where-Object { $_ -match '^  debug_fusion: false$' }).Count -eq 1)
   Assert "model_path 未配置 → 注释占位（与插件版同款）" (($y | Where-Object { $_ -match '^  # model_path:' }).Count -eq 1)
@@ -338,13 +348,31 @@ engine:
   # 键序与插件版 Get-LlmCfgLines 逐字一致（两版配置节相同，仅组件行不同）
   $expect = @('  enabled: true', "  code_pattern: '[abcde]{4}'", '  max_tokens: 20',
               '  max_candidates: 6', '  cpu_cores: 4',
-              '  sentence_mode: false', '  debug_fusion: false')
+              '  sentence_mode: false', '  prefix_confirm: false',
+              '  debug_fusion: false')
   $i0 = 0; for ($i = 0; $i -lt $y.Count; $i++) { if ($y[$i] -match '^llm_rerank:') { $i0 = $i } }
-  $got = @($y[($i0 + 1)..($i0 + 7)])
+  $got = @($y[($i0 + 1)..($i0 + 8)])
   Assert "节内键序与插件版一致" (($got -join '|') -eq ($expect -join '|'))
   Assert "不再产出全局 llm_rerank.yaml" (-not (Test-Path (Join-Path $sandbox "Rime\llm_rerank.yaml")))
   Write-Host "  --- 方案 llm_rerank 节 ---"
-  $y[($i0)..([Math]::Min($i0 + 9, $y.Count - 1))] | ForEach-Object { Write-Host ("    " + $_) }
+  $y[($i0)..([Math]::Min($i0 + 10, $y.Count - 1))] | ForEach-Object { Write-Host ("    " + $_) }
+
+  # phase7b: 前缀自动确认（2026-11-23 用户定案）——只在整句模式勾选时显示；
+  # 值只在整句模式开启时落盘（关整句模式恒 false）
+  Write-Host "== phase7b: 前缀自动确认显隐 + 落盘（仅整句模式）=="
+  Click-Ctl $hw 1021   # IDC_TCS 勾选
+  Assert "整句模式 on → 「前缀自动确认」显示" (Visible-Ctl $hw 1022)
+  Click-Ctl $hw 1022   # IDC_PREFIX 勾选
+  Save-Raw $hw
+  $f = Get-Content $test -Encoding UTF8
+  Assert "sentence_mode: true（点击勾选）" (($f | Where-Object { $_ -match '^  sentence_mode: true$' }).Count -eq 1)
+  Assert "prefix_confirm: true（勾选后落盘）" (($f | Where-Object { $_ -match '^  prefix_confirm: true$' }).Count -eq 1)
+  Click-Ctl $hw 1021   # 关整句模式
+  Assert "整句模式 off → 「前缀自动确认」隐藏" (-not (Visible-Ctl $hw 1022))
+  Save-Raw $hw
+  $f = Get-Content $test -Encoding UTF8
+  Assert "sentence_mode: false（点击取消）" (($f | Where-Object { $_ -match '^  sentence_mode: false$' }).Count -eq 1)
+  Assert "prefix_confirm: false（整句模式关 → 恒落 false）" (($f | Where-Object { $_ -match '^  prefix_confirm: false$' }).Count -eq 1)
 
   # phase8: 旧全局 llm_rerank.yaml 的一次性迁移
   # （2026-09-30 起运行期不再读它；只有"方案节不存在"时 GUI 用它带出界面值）

@@ -35,6 +35,74 @@ void TSFDbgLog(const wchar_t* fmt, ...) {
   }
 }
 
+// ---- 按键延迟计时（2026-11-23 真机测量用）----------------------------
+// 环境变量 WEASEL_TSF_TIMING=1 才启用（进程内一次性缓存）；默认零开销。
+// 起点 = OnTestKeyDown/OnKeyDown 入口，终点 = DoEditSession 里 _UpdateUI
+// 返回（候选面板在 Refresh 内同步 RedrawWindow / UpdateLayeredWindow 完成）。
+// 输出一行一次按键（键按下路径；KeyUp 不置起点）：
+//   <pid> tick=<完成 tick64> vk=<vk> to_sess=<ms> ipc=<ms> ui=<ms> total=<ms>
+static bool TSFTimingOn() {
+  static const bool on = []() {
+    wchar_t v[8] = {0};
+    return GetEnvironmentVariableW(L"WEASEL_TSF_TIMING", v, 8) > 0 &&
+           v[0] == L'1';
+  }();
+  return on;
+}
+
+static unsigned long long g_tsf_key_qpc = 0;  // 起点 QPC
+static DWORD g_tsf_key_tick = 0;              // 起点 tick（过期保护）
+static unsigned int g_tsf_key_vk = 0;
+static bool g_tsf_key_pending = false;
+
+void TSFTimingStart(unsigned int vk) {
+  if (!TSFTimingOn())
+    return;
+  LARGE_INTEGER q;
+  QueryPerformanceCounter(&q);
+  g_tsf_key_qpc = (unsigned long long)q.QuadPart;
+  g_tsf_key_tick = GetTickCount();
+  g_tsf_key_vk = vk;
+  g_tsf_key_pending = true;
+}
+
+void TSFTimingFinishSession(unsigned long long qpc_session_start,
+                            unsigned long long qpc_after_ipc,
+                            unsigned long long qpc_after_ui) {
+  if (!TSFTimingOn() || !g_tsf_key_pending)
+    return;
+  // 过期保护：非按键路径（focus/上下文变化）的编辑会话不得吞掉本次挂起
+  if (GetTickCount() - g_tsf_key_tick > 1000) {
+    g_tsf_key_pending = false;
+    return;
+  }
+  LARGE_INTEGER f, qend;
+  QueryPerformanceFrequency(&f);
+  QueryPerformanceCounter(&qend);   // 完成时刻（QPC：GetTickCount64 仅 ~15.6ms
+                                    // 粒度，跨进程算 end-to-end 会量化成 0/15/16ms）
+  const unsigned long long freq = (unsigned long long)f.QuadPart;
+  auto ms = [freq](unsigned long long a, unsigned long long b) {
+    return (double)(b - a) * 1000.0 / (double)freq;
+  };
+  wchar_t path[MAX_PATH];
+  ExpandEnvironmentStringsW(L"%TEMP%\\weasel_tsf_timing.log", path,
+                            _countof(path));
+  FILE* fp = _wfopen(path, L"a");
+  if (fp) {
+    fwprintf(fp,
+             L"%lu tick=%llu qpc0=%llu qpc=%llu vk=%u to_sess=%.2f ipc=%.2f "
+             L"ui=%.2f total=%.2f\n",
+             GetCurrentProcessId(), (unsigned long long)GetTickCount64(),
+             g_tsf_key_qpc, (unsigned long long)qend.QuadPart, g_tsf_key_vk,
+             ms(g_tsf_key_qpc, qpc_session_start),
+             ms(qpc_session_start, qpc_after_ipc),
+             ms(qpc_after_ipc, qpc_after_ui),
+             ms(g_tsf_key_qpc, qpc_after_ui));
+    fclose(fp);
+  }
+  g_tsf_key_pending = false;
+}
+
 // {A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}
 static const GUID c_clsidTextService = {
     0xa3f4cded,

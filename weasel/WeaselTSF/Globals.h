@@ -26,6 +26,15 @@ void DllRelease();
 // 格式: [tick] [pid.tid] msg  -- 用于定位 TSF 挂起/卡死位置
 void TSFDbgLog(const wchar_t* fmt, ...);
 
+// 按键延迟计时（2026-11-23 真机测量用；环境变量 WEASEL_TSF_TIMING=1 才启用，
+// 默认零开销）：起点 = OnTestKeyDown/OnKeyDown 入口（键已交付 TSF），终点 =
+// 异步编辑会话里候选面板同步绘制完成（_UpdateUI 返回时 RedrawWindow /
+// UpdateLayeredWindow 已提交）。落盘 %TEMP%\weasel_tsf_timing.log。
+void TSFTimingStart(unsigned int vk);
+void TSFTimingFinishSession(unsigned long long qpc_session_start,
+                            unsigned long long qpc_after_ipc,
+                            unsigned long long qpc_after_ui);
+
 extern HINSTANCE g_hInst;
 
 extern LONG g_cRefDll;

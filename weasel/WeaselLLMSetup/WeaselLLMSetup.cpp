@@ -50,6 +50,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_CODE_PAT     1016   // 编码匹配正则（2026-09-30 取代 min/max_code_len）
 #define IDC_BENCH        1017   // 实测线程数（2026-10-01 用户定案：与插件版同位置）
 #define IDC_TCS          1021   // 整句模式（2026-11-22 泛化自两码整句 two_code_sentence）
+#define IDC_PREFIX       1022   // 前缀自动确认（2026-11-23；只在整句模式勾选时显示/生效）
 #define IDC_DEBUG        1023
 #define IDC_MAX_CAND     1024
 // 方案接入（2026-09-29 GUI 化，语义同 installer\schema_add.ps1）
@@ -72,6 +73,10 @@ struct Params {
   bool sentence_mode = false;      // 整句模式：满覆盖候选进评分窗（2026-11-22 泛化
                                    // 自 two_code_sentence 两码整句满长规则）
   bool has_sentence_mode = false;  // 方案节里出现过新键（旧键兜底只在新键缺席时）
+  bool prefix_confirm = false;     // 前缀自动确认（2026-11-23 实验）：只在整句
+                                   // 模式开启时显示/生效（PM 首选多字词且只覆盖
+                                   // 前缀 → 下一键自动选入组合区）
+  bool has_prefix_confirm = false; // 方案节里出现过该键
   // freq_beta 已删（2026-11-05 标定产物退出用户配置面 → β=12 内置常数，两版统一；
 // v3 2026-11-06 六维联合标定：β12/τ400；用户 bigram 项 2026-11-08 退役，
 // 融合项只剩累计 Unigram log(0.5·p1)）
@@ -85,6 +90,8 @@ static Params g_p;
 static std::wstring g_loaded_name;   // 当前已读入界面的方案文件名（切换取消时按名拨回）
 static bool g_sel_guard = false;
 static HWND g_hwnd;
+static HWND g_prefix_cb = NULL;    // 前缀自动确认复选框（2026-11-23；只在
+static HWND g_prefix_help = NULL;  // 整句模式勾选时显示，含同行「?」徽标）
 static HFONT g_font;
 static HFONT g_font_hint;  // 灰色小字（状态副行 / 底部动态注）
 static HFONT g_font_help;  // 「?」徽标里的问号（小号加粗）
@@ -233,7 +240,7 @@ static bool load_legacy_params(Params* p) {
 // %APPDATA%\Rime\llm_rerank.yaml）----
 // 节内键序与插件版 installer\install_plugin.ps1 的 Get-LlmCfgLines /
 // Update-LlmSection **逐字一致**：enabled / code_pattern / max_tokens /
-// max_candidates / cpu_cores / sentence_mode /
+// max_candidates / cpu_cores / sentence_mode / prefix_confirm /
 // debug_fusion / model_path —— 两版方案配置节相同，仅组件行不同。
 // （freq_beta 已删 2026-11-05：标定产物退出配置面；旧方案残留行读取时忽略）
 static const char* kCfgSection = "llm_rerank:";
@@ -286,6 +293,11 @@ static bool parse_llm_section(const std::vector<std::string>& lines) {
     else if (key == "two_code_sentence") {
       if (!g_p.has_sentence_mode) g_p.sentence_mode = (val == "true");
     }
+    // 前缀自动确认（2026-11-23）：配置项；只在整句模式开启时生效
+    else if (key == "prefix_confirm") {
+      g_p.prefix_confirm = (val == "true");
+      g_p.has_prefix_confirm = true;
+    }
     else if (key == "max_tokens") g_p.max_tokens = atoi(val.c_str());
     else if (key == "max_candidates") g_p.max_candidates = atoi(val.c_str());
     else if (key == "cpu_cores") g_p.cpu_cores = atoi(val.c_str());
@@ -306,6 +318,11 @@ static std::vector<std::string> build_llm_section() {
   sprintf_s(buf, "  max_candidates: %d", g_p.max_candidates); sec.push_back(buf);
   sprintf_s(buf, "  cpu_cores: %d", g_p.cpu_cores); sec.push_back(buf);
   sec.push_back(g_p.sentence_mode ? "  sentence_mode: true" : "  sentence_mode: false");
+  // 前缀自动确认（2026-11-23）：只在整句模式开启时写 true（关整句模式恒
+  // false——llm_filter 运行期同样 gate，双保险）
+  sec.push_back((g_p.sentence_mode && g_p.prefix_confirm)
+                    ? "  prefix_confirm: true"
+                    : "  prefix_confirm: false");
   sec.push_back(g_p.debug_fusion ? "  debug_fusion: true" : "  debug_fusion: false");
   if (!g_p.model_path.empty()) {
     std::string p = wide_to_utf8(g_p.model_path);
@@ -1102,6 +1119,19 @@ static void on_schema_remove() {
 // 取消 → 恢复勾选前的值可编辑（params_to_ui 读入路径显式设置框状态，
 // 不依赖本事件——BM_SETCHECK 不发 BN_CLICKED，无联动循环）
 static std::wstring g_pat_before_sent;
+// 前缀自动确认显隐（2026-11-23 用户定案）：只在整句模式勾选时显示。
+// 复选框与同行「?」徽标一起显隐；关整句模式时顺带取消勾选（落盘恒 false，
+// 界面与文件一致）。行位保留，不动其它控件几何。
+static void apply_prefix_visibility(bool sentence_on) {
+  if (g_prefix_cb) {
+    ShowWindow(g_prefix_cb, sentence_on ? SW_SHOW : SW_HIDE);
+    if (!sentence_on)
+      SendMessageW(g_prefix_cb, BM_SETCHECK, BST_UNCHECKED, 0);
+  }
+  if (g_prefix_help)
+    ShowWindow(g_prefix_help, sentence_on ? SW_SHOW : SW_HIDE);
+}
+
 static void on_sent_toggle() {
   HWND pat = GetDlgItem(g_hwnd, IDC_CODE_PAT);
   if (SendMessageW(GetDlgItem(g_hwnd, IDC_TCS), BM_GETCHECK, 0, 0) == BST_CHECKED) {
@@ -1110,11 +1140,13 @@ static void on_sent_toggle() {
     g_pat_before_sent = buf;
     SetDlgItemTextW(g_hwnd, IDC_CODE_PAT, L".{2,}");
     EnableWindow(pat, FALSE);
+    apply_prefix_visibility(true);
   } else {
     EnableWindow(pat, TRUE);
     if (!g_pat_before_sent.empty())
       SetDlgItemTextW(g_hwnd, IDC_CODE_PAT, g_pat_before_sent.c_str());
     g_pat_before_sent.clear();
+    apply_prefix_visibility(false);
   }
 }
 
@@ -1144,6 +1176,12 @@ static void ui_to_params() {
   // 整句模式锁定编码匹配（2026-11-22）：勾选时恒 '.{2,}'——即使输入框被
   // 跨进程工具改过也以锁定值为准（输入框本身已禁用，此处为兜底）
   if (g_p.sentence_mode) g_p.code_pattern = ".{2,}";
+  // 前缀自动确认（2026-11-23）：只在整句模式开启时落 true（关整句模式
+  // 恒 false——llm_filter 运行期同样 gate，双保险）
+  g_p.prefix_confirm =
+      g_p.sentence_mode &&
+      SendMessageW(GetDlgItem(g_hwnd, IDC_PREFIX), BM_GETCHECK, 0, 0) ==
+          BST_CHECKED;
   GetDlgItemTextW(g_hwnd, IDC_MODEL, buf, 512);
   std::wstring def = default_model_path();
   g_p.model_path = (wcscmp(buf, def.c_str()) == 0) ? std::wstring() : buf;
@@ -1157,6 +1195,7 @@ static std::wstring ui_signature() {
   std::wstring s;
   s += SendMessageW(GetDlgItem(g_hwnd, IDC_ENABLED), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
   s += SendMessageW(GetDlgItem(g_hwnd, IDC_TCS), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
+  s += SendMessageW(GetDlgItem(g_hwnd, IDC_PREFIX), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
   s += SendMessageW(GetDlgItem(g_hwnd, IDC_DEBUG), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
   const int ids[] = {IDC_MODEL,   IDC_CODE_PAT, IDC_MAX_TOK, IDC_MAX_CAND,
                      IDC_CORES};
@@ -1194,6 +1233,10 @@ static void params_to_ui() {
   }
   SendMessageW(GetDlgItem(g_hwnd, IDC_TCS), BM_SETCHECK,
                g_p.sentence_mode ? BST_CHECKED : BST_UNCHECKED, 0);
+  // 前缀自动确认（2026-11-23）：值照读，显隐跟随整句模式（关时顺带清勾选）
+  SendMessageW(GetDlgItem(g_hwnd, IDC_PREFIX), BM_SETCHECK,
+               g_p.prefix_confirm ? BST_CHECKED : BST_UNCHECKED, 0);
+  apply_prefix_visibility(g_p.sentence_mode);
   scan_models(GetDlgItem(g_hwnd, IDC_MODEL));
   refresh_model_status();
   g_ui_sig = ui_signature();   // 脏标记基准（打开下拉是否重读当前文件）
@@ -1333,6 +1376,11 @@ static const wchar_t* const TIP_TCS =
     L"「词长==⌊码长/2⌋」效果一致。\n"
     L"开启后编码匹配固定为 .{2,}（2 码起参与重排，输入框锁定）。\n"
     L"取代 two_code_sentence 两码整句（2026-11-22）。";
+static const wchar_t* const TIP_PREFIX =
+    L"前缀自动确认 prefix_confirm（实验，默认关闭；只在整句模式开启时显示）。\n"
+    L"开启后：子词首选满足「多字词 + 只覆盖编码前缀 + 与次选分差 ≥ 1.0」\n"
+    L"时，下一次按键自动把它选入组合区（截段重译剩余码，不上屏），\n"
+    L"用户只需选择没把握的词；误确认按退格即可回退。";
 static const wchar_t* const TIP_DEBUG =
     L"诊断日志：开启后每次重排都往用户文件夹的 llm_rerank\\<方案> 子目录写\n"
     L"rime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化；语料/账本/词码对\n"
@@ -1454,6 +1502,18 @@ static void make_ui() {
                  y + ts(2), tw(L"整句模式", g_font) + ts(26), ts(22), IDC_TCS);
     tip_add(cb, TIP_TCS);
     mk_help(HX, y + ts(4), TIP_TCS);
+    y += ts(30);
+    // 前缀自动确认（2026-11-23 用户定案）：**只在整句模式勾选时显示**
+    // （实验功能，整句模式外无意义）。行位一律保留、不重排后续控件；
+    // 显隐由 apply_prefix_visibility()（on_sent_toggle / params_to_ui）控制，
+    // 徽标随复选框一起显隐。
+    g_prefix_cb = mk(0, L"前缀自动确认", BS_AUTOCHECKBOX | WS_TABSTOP,
+                     PAD + ts(12), y + ts(2),
+                     tw(L"前缀自动确认", g_font) + ts(26), ts(22), IDC_PREFIX);
+    tip_add(g_prefix_cb, TIP_PREFIX);
+    g_prefix_help = mk_help(HX, y + ts(4), TIP_PREFIX);
+    ShowWindow(g_prefix_cb, SW_HIDE);
+    ShowWindow(g_prefix_help, SW_HIDE);
     y += ts(30);
     mk_group(L"触发条件", PAD, gy, CW, y - gy + ts(8));
   }

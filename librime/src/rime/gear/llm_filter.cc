@@ -140,8 +140,11 @@ static bool g_sentence_mode = false;  // 整句模式：满覆盖候选进评分
 //（首选与次选的融合分差，同一 ctx 下两个候选词）≥ θ、首选多字词、只覆盖
 // 前缀（end < 段末）→ 记录挂起；下一次 Apply 入口执行 ctx->Select →
 // Segment::Close 截段 → Forward + Compose 只重译剩余码（组合区内预确认，
-// 不上屏）。开关 = 环境变量 RIME_LLM_PREFIX_CONFIRM=1（测试/真机实验用）。
-static bool g_prefix_confirm = []() {
+// 不上屏）。开关 = 方案节 `llm_rerank/prefix_confirm`（2026-11-23 用户定案：
+// 由实验期环境变量改为 GUI 配置项，**只在整句模式开启时显示/生效**）；
+// 环境变量 RIME_LLM_PREFIX_CONFIRM=1 保留为真机实验的强制覆盖。
+static bool g_prefix_confirm = false;      // 生效值（llm_apply_params 计算）
+static bool g_prefix_confirm_env = []() {
   const char *e = getenv("RIME_LLM_PREFIX_CONFIRM");
   return e && std::string(e) == "1";
 }();
@@ -207,6 +210,7 @@ struct LlmParamSet {
   bool has_max_code_len = false; int max_code_len = 0;   // 旧键：解析保留、不再生效
   bool has_code_pattern = false; std::string code_pattern;  // 2026-09-30 新键
   bool has_sentence = false;     bool sentence_mode = false;
+  bool has_prefix_confirm = false; bool prefix_confirm = false;  // 2026-11-23
   // freq_beta 字段已删（2026-11-05 退出用户配置面）→ g_freq_beta 内置常数
   bool has_min_tokens = false;   int min_tokens = 1;
   bool has_max_tokens = false;   int max_tokens = 20;  // 2026-11-19: 0.6B ctx*=20
@@ -223,6 +227,12 @@ static void llm_apply_params() {
   g_enabled = s.has_enabled ? s.enabled : false;
   // 整句模式先于 code_pattern 读取（2026-11-22 锁定编码匹配要用）
   g_sentence_mode = s.has_sentence ? s.sentence_mode : false;
+  // 前缀自动确认（2026-11-23）：配置项，**只在整句模式开启时生效**（GUI
+  // 也只在整句模式勾选时显示该复选框；运行期再兜一层——手改 yaml 写 true
+  // 而 sentence_mode 关也不触发）。环境变量保留为真机实验强制覆盖。
+  g_prefix_confirm = g_prefix_confirm_env ||
+                     (g_sentence_mode && s.has_prefix_confirm &&
+                      s.prefix_confirm);
   // 触发条件：code_pattern。空串 = 不限制（总是匹配）。
   // 整句模式锁定编码匹配（2026-11-22 用户定案）：sentence_mode on 时
   // 恒 '.{2,}'（2 码起参与重排）——方案节该行读取端忽略（手改 yaml 也
@@ -2929,6 +2939,20 @@ static std::atomic<bool> g_async_started{false};
 
 static constexpr int kAsyncDebounceMs = 40;
 
+// 整句模式同步等待预算（2026-11-23 修）：原先整句模式"投递即走"，当前键
+// 只能显示层 1 序，LLM 评分只在同指纹重查时才用上（真机 100ms/键实测
+// 连续整句打字从未上屏）。改为每键最多等这么久——真机实测 6 个长词候选
+// 的 3-token 打分约 65ms，150ms 留余量；超时仍回退挂账 pending（层 1 序）。
+// 环境变量 RIME_LLM_SENTENCE_WAIT_MS 可覆盖（0 = 旧的"投递即走"语义，
+// 测试/回退用）。
+static int g_sentence_wait_ms = []() {
+  const char *e = getenv("RIME_LLM_SENTENCE_WAIT_MS");
+  if (!e)
+    return 150;
+  int v = atoi(e);
+  return v < 0 ? 150 : v;
+}();
+
 struct AsyncTask {
   bool valid = false;
   long gen = 0;                // 提交时的代次（中断判定基准）
@@ -3521,13 +3545,14 @@ void LlmRerankTranslation::Collect() {
       // ctx_short 跳过，不投递异步任务
       std::vector<llama_token> ctx_probe = tokenize(ctx.c_str());
       if ((int)ctx_probe.size() >= g_min_tokens) {
-        // ═══ 评分三路径（2026-11-22 异步基建，同步路径零 LLM）═══
+        // ═══ 评分三路径（2026-11-22 异步基建）═══
         // 指纹 = 归一化上文 \x1f 候选 \x1e 拼接（2026-11-23 再追加子词
         // 清单 \x1d——复用分与候选集同快照；与插件版同构；上下文/候选变化
         // 自然失效，无需失效链）。①缓存命中（同指纹重复 query，0 LLM）
-        // ②字词模式 submit+wait（immediate 跳去抖 + 250ms 上限——与既有
-        // 同步评分等价的延迟面，当前词重排零回归）③整句模式纯异步投递
-        //（挂账 pending，评分结果由后续 Collect 收割回填）。
+        // ②字词模式 submit+wait（immediate 跳去抖 + 250ms 上限）
+        // ③整句模式 submit+wait（immediate + 短预算 g_sentence_wait_ms，
+        //   2026-11-23 修：原"投递即走"使 LLM 结果上不了屏）；超时回落
+        //   挂账 pending，由后续 Collect 收割回填。
         std::vector<std::string> cand_texts;
         cand_texts.reserve(candidates_.size());
         for (size_t ci = 0; ci < candidates_.size(); ci++)
@@ -3542,45 +3567,47 @@ void LlmRerankTranslation::Collect() {
           have_snap = true;
         }
         if (!have_snap) {
-          std::string sfp = async_submit(ctx, cand_texts, pm_texts, !sent_on);
+          // 评测立即开跑（两模式都不走去抖）：下面短预算等待后再决定
+          // 是否挂账（2026-11-23 修，见 g_sentence_wait_ms 注释）。
+          std::string sfp = async_submit(ctx, cand_texts, pm_texts, true);
           if (sfp.empty()) {
             wstatus = "skip";
             wskip = "async_failed";  // 任务不成立（理论上文/窗已过守卫）
             live_send(std::string("S|") + now_hms() + "|async_failed|" +
                       live_esc(input_) + "|" + src_);
-          } else if (sent_on) {
-            // 整句模式：投递即走（打字流畅优先——40ms 去抖 + 可中断
-            // decode，快速连打自动作废重投）。当前轮层1 序 + 挂账
-            // pending，评分结果由后续 Collect 的收割点补写语料（W ok
-            // / flags=async + P 行）。
-            AsyncPending pend;
-            pend.wid = wid;
-            pend.code = input_;
-            pend.wctx = wctx;
-            pend.engine_vec = engine_vec;
-            pend.window_vec = window_vec;
-            pend.tick = g_user_tick;
-            pend.src = src_;
-            pend.sent_on = true;
-            g_async_pending[sfp] = pend;
-            if (g_async_pending.size() > 32)
-              g_async_pending.clear();
-            wstatus = "skip";
-            wskip = "async_pending";
-            live_send(std::string("S|") + now_hms() + "|async_pending|" +
-                      live_esc(input_) + "|" + src_);
           } else {
-            // 字词模式：同步等待评分完成（等价既有同步评分——当前词
-            // 重排零回归；wait 超时 = skip，评分线程继续跑完发布，
-            // 后续 Collect 可经收割点回收进缓存）
             AsyncRes res;
-            if (async_wait(sfp, 250, res)) {
+            const int wait_ms = sent_on ? g_sentence_wait_ms : 250;
+            if (async_wait(sfp, wait_ms, res)) {
               g_async_cache[sfp] = res;
               if (g_async_cache.size() > 16)
                 g_async_cache.clear();
               snap = res;
               have_snap = true;
+            } else if (sent_on) {
+              // 整句模式预算内未完成：回退挂账 pending（本轮层 1 序），
+              // 评分结果由后续 Collect 的收割点补写语料（W ok /
+              // flags=async + P 行），同指纹重查可命中缓存。
+              AsyncPending pend;
+              pend.wid = wid;
+              pend.code = input_;
+              pend.wctx = wctx;
+              pend.engine_vec = engine_vec;
+              pend.window_vec = window_vec;
+              pend.tick = g_user_tick;
+              pend.src = src_;
+              pend.sent_on = true;
+              g_async_pending[sfp] = pend;
+              if (g_async_pending.size() > 32)
+                g_async_pending.clear();
+              wstatus = "skip";
+              wskip = "async_pending";
+              live_send(std::string("S|") + now_hms() + "|async_pending|" +
+                        live_esc(input_) + "|" + src_);
             } else {
+              // 字词模式：同步等待评分完成（等价既有同步评分——当前词
+              // 重排零回归；wait 超时 = skip，评分线程继续跑完发布，
+              // 后续 Collect 可经收割点回收进缓存）
               wstatus = "skip";
               wskip = "async_timeout";
               live_send(std::string("S|") + now_hms() + "|async_timeout|" +
@@ -3998,6 +4025,11 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
       p.has_sentence = true; p.sentence_mode = b;
     } else if (config->GetBool("llm_rerank/two_code_sentence", &b)) {
       p.has_sentence = true; p.sentence_mode = b;
+    }
+    // 前缀自动确认（2026-11-23）：配置项；生效判定在 llm_apply_params
+    //（sentence_mode && prefix_confirm，环境变量另作强制覆盖）
+    if (config->GetBool("llm_rerank/prefix_confirm", &b)) {
+      p.has_prefix_confirm = true; p.prefix_confirm = b;
     }
     llm_apply_params();
     std::string sid;

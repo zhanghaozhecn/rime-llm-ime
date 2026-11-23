@@ -11,7 +11,14 @@ STDAPI WeaselTSF::DoEditSession(TfEditCookie ec) {
   weasel::ResponseParser parser(&commit, context.get(), &_status, &config,
                                 &_cand->style());
 
+  // 延迟计时（WEASEL_TSF_TIMING=1 才生效）：入口 t_sess、响应读完 t_ipc、
+  // _UpdateUI 返回 t_ui（候选面板在 Refresh 内同步 RedrawWindow /
+  // UpdateLayeredWindow 完成）；total = 按键回调入口→面板绘制完成
+  LARGE_INTEGER t_sess, t_ipc, t_ui;
+  QueryPerformanceCounter(&t_sess);
+
   bool ok = m_client.GetResponseData(std::ref(parser));
+  QueryPerformanceCounter(&t_ipc);
 
   _UpdateLanguageBar(_status);
 
@@ -42,6 +49,10 @@ STDAPI WeaselTSF::DoEditSession(TfEditCookie ec) {
   }
 
   _UpdateUI(*context, _status);
+  QueryPerformanceCounter(&t_ui);
+  TSFTimingFinishSession((unsigned long long)t_sess.QuadPart,
+                        (unsigned long long)t_ipc.QuadPart,
+                        (unsigned long long)t_ui.QuadPart);
 
   return TRUE;
 }
