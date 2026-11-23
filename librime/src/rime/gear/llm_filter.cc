@@ -19,6 +19,7 @@
 #include <rime/config.h>
 #include <rime/context.h>
 #include <rime/engine.h>
+#include <rime/menu.h>
 #include <rime/schema.h>
 #include <rime/service.h>
 #include <rime_api.h>
@@ -134,6 +135,34 @@ static bool g_sentence_mode = false;  // 整句模式：满覆盖候选进评分
 // 用户定案，取代 two_code_sentence 两码整句满长规则——词长==⌊码长/2⌋ 退役；
 // span 判定候选覆盖整个活动段，引擎 lattice 保证简拼/单韵母短码的合法解析
 // 共存，两码方案下与旧规则逐位等价)
+
+// 前缀软确认（2026-11-23 实验，默认关闭，与插件版同构）：PM 块里 margin
+//（首选与次选的融合分差，同一 ctx 下两个候选词）≥ θ、首选多字词、只覆盖
+// 前缀（end < 段末）→ 记录挂起；下一次 Apply 入口执行 ctx->Select →
+// Segment::Close 截段 → Forward + Compose 只重译剩余码（组合区内预确认，
+// 不上屏）。开关 = 环境变量 RIME_LLM_PREFIX_CONFIRM=1（测试/真机实验用）。
+static bool g_prefix_confirm = []() {
+  const char *e = getenv("RIME_LLM_PREFIX_CONFIRM");
+  return e && std::string(e) == "1";
+}();
+// 测试钩子（2026-11-23，仅排障）：RIME_LLM_TEST_PREFIX_CONFIRM=1 → 每键在
+// 活动段选第一个"只覆盖前缀"的候选（end < 段末），验证 Select → Close 截段
+// → Forward + Compose 在 filter 阶段的安全性（不依赖 LLM 评分）
+static bool g_test_prefix_confirm = []() {
+  const char *e = getenv("RIME_LLM_TEST_PREFIX_CONFIRM");
+  return e && std::string(e) == "1";
+}();
+static double g_prefix_confirm_theta = 1.0;
+struct PendingConfirm {
+  bool valid = false;
+  std::string input;    // 活动段切片（判定时的 code）
+  size_t seg_start = 0; // 活动段在原始 input 中的起点
+  std::string text;     // 待确认候选文本
+  size_t end_pos = 0;   // 候选覆盖到的码位置（< 段末）
+};
+static PendingConfirm g_pending_confirm;
+static std::mutex g_pending_confirm_mu;
+static bool g_in_confirm = false;  // 防重入（Select → Compose → Apply 递归）
 // 用户词频对数融合 (2026-09-02): fused = score + β·log(1+eff), β **内置常数**
 // (2026-11-05 标定产物退出用户配置面——用户没有标定能力, 与 kFreqTau 同待遇;
 //  **2026-11-14 默认模型改 Qwen2.5-0.5B 后重标定** β=14 + kCeW (1.0,1.10,
@@ -2429,6 +2458,68 @@ static double ce_target(const float *logits, int target_id, float m, double lse)
   return -((double)(logits[target_id] - m) - lse);
 }
 
+// ctx KV 就绪（调用方持 g_mutex，2026-11-23 与插件版同构）：返回 ctx 末位
+// logits（指向 g_prep_logits）与归一化量；失败返回 nullptr。三条路径：
+//   ① prep 完全命中（ctx 相同）→ 零成本
+//   ② 前缀延伸（新 ctx = 旧 prep ctx + 新增 token）→ 只 decode 增量：
+//      前缀软确认后 ctx = 上文 + P，上文部分的 KV 原样保留（§11.8 协同）
+//   ③ 否则全量重建（memory_clear + decode）
+static const float *ensure_ctx_kv(const std::vector<llama_token> &ctx_ids,
+                                  int vs, float &m, double &lse) {
+  if (g_prep_ready && ctx_ids == g_prep_ctx && g_seq0_gen == g_prep_gen) {
+    m = g_prep_m;
+    lse = g_prep_lse;
+    return g_prep_logits.data();
+  }
+  int from = 0;
+  bool extend = g_prep_ready && g_seq0_gen == g_prep_gen &&
+                ctx_ids.size() > g_prep_ctx.size() &&
+                std::equal(g_prep_ctx.begin(), g_prep_ctx.end(),
+                           ctx_ids.begin());
+  if (extend) {
+    from = (int)g_prep_ctx.size();
+  } else {
+    llama_memory_clear(llama_get_memory(g_ctx), false);
+  }
+  const int ctx_len = (int)ctx_ids.size();
+  // 增量是稀有路径（确认前缀后 / 上文短），只在此时留痕
+  if (extend)
+    log_error("ctx_kv: extend from=%d ctx=%d prep=%d gen=%ld", from, ctx_len,
+              (int)g_prep_ctx.size(), g_seq0_gen);
+  llama_batch b = llama_batch_init(ctx_len - from, 0, 1);
+  int row = 0;
+  for (int j = from; j < ctx_len; j++, row++) {
+    b.token[row] = ctx_ids[j];
+    b.pos[row] = j;
+    b.n_seq_id[row] = 1;
+    b.seq_id[row][0] = 0;
+    b.logits[row] = (j + 1 == ctx_len) ? 1 : 0;
+  }
+  b.n_tokens = row;
+  bool ok = llama_decode(g_ctx, b) == 0;
+  llama_batch_free(b);
+  if (!ok) {
+    if (extend) {
+      // 增量失败（KV 耗尽等）：置无效并回退全量重建一次（递归深度 1）
+      g_prep_ready = false;
+      return ensure_ctx_kv(ctx_ids, vs, m, lse);
+    }
+    log_error("ctx decode failed");
+    return nullptr;
+  }
+  g_seq0_gen++;
+  const float *cl = llama_get_logits_ith(g_ctx, ctx_len - from - 1);
+  if (!cl) return nullptr;
+  g_prep_logits.assign(cl, cl + vs);
+  g_prep_gen = g_seq0_gen;
+  g_prep_ctx = ctx_ids;
+  logits_normalizer(g_prep_logits.data(), vs, g_prep_m, g_prep_lse);
+  g_prep_ready = true;
+  m = g_prep_m;
+  lse = g_prep_lse;
+  return g_prep_logits.data();
+}
+
 // ============================================================
 // core scoring:
 //   Step 1: decode ctx -> save logits -> CE of cand[0] from it
@@ -2486,66 +2577,20 @@ static bool score_batch(const std::vector<llama_token> &ctx_ids,
   int M = (int)idx2.size();
   int K = (int)idx3.size();
 
-  // Step 1: decode ctx on seq 0, save logits.
-  // Pre-decode hit: ctx tokens match the async prepare() result and seq0
-  // was not overwritten since (generation match) -> reuse saved logits,
-  // skip the decode entirely. The prep state is not consumed: the same
-  // ctx keeps hitting until seq0 is covered by another decode.
+  // Step 1: ctx KV —— prep 完全命中零成本 / 前缀延伸只 decode 增量 / 否则
+  // 全量（2026-11-23 与插件版同构，见 ensure_ctx_kv）。
   bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx &&
                   g_seq0_gen == g_prep_gen;
   if (prep_hit_out)
     *prep_hit_out = use_prep;
-  const float *ctx_logits = nullptr;  // 直接指向 prep 存储，免全量 vector 拷贝
   float m0 = 0;
   double lse0 = 0;
   double ms1 = 0;
-
-  if (!use_prep) {
-    auto ts1_0 = std::chrono::high_resolution_clock::now();
-    llama_memory_clear(llama_get_memory(g_ctx), false);
-    llama_batch ctx_batch = llama_batch_init(ctx_len, 0, 1);
-    for (int j = 0; j < ctx_len; j++) {
-      ctx_batch.token[j] = ctx_ids[j];
-      ctx_batch.pos[j] = j;
-      ctx_batch.n_seq_id[j] = 1;
-      ctx_batch.seq_id[j][0] = 0;
-    }
-    ctx_batch.logits[ctx_len - 1] = 1;
-    ctx_batch.n_tokens = ctx_len;
-    bool decoded_ok = false;
-    if (llama_decode(g_ctx, ctx_batch) == 0) {
-      g_seq0_gen++;  // seq0 KV updated
-      float *cl = llama_get_logits_ith(g_ctx, ctx_len - 1);
-      if (cl) {
-        g_prep_logits.assign(cl, cl + vs);  // 直接落 prep 存储（原多一次全量拷贝）
-        decoded_ok = true;
-      }
-    }
-    llama_batch_free(ctx_batch);
-    if (!decoded_ok) {
-      log_error("ctx decode failed");
-      return true;  // prep 存储只在成功时覆写；结果全哨兵照常发布
-    }
-    // self-refresh prep: seq0 just decoded (generation bumped), KV and
-    // logits are consistent, so later scores for the same ctx (page turn,
-    // candidate window rebuild) all hit instead of cascading misses
-    g_prep_gen = g_seq0_gen;
-    g_prep_ctx = ctx_ids;
-    logits_normalizer(g_prep_logits.data(), vs, g_prep_m, g_prep_lse);  // 归一化量随 prep 缓存
-    g_prep_ready = true;
-    ctx_logits = g_prep_logits.data();
-    m0 = g_prep_m;
-    lse0 = g_prep_lse;
-    auto ts1_1 = std::chrono::high_resolution_clock::now();
-    ms1 = std::chrono::duration<double, std::milli>(ts1_1 - ts1_0).count();
-  } else {
-    // pre-decode hit: Step 1 skipped, reuse cached normalizer too
-    // (saves the O(vocab) rescan, 实测 CE1 段 2ms → ~0ms)
-    ctx_logits = g_prep_logits.data();
-    m0 = g_prep_m;
-    lse0 = g_prep_lse;
-  }
-
+  auto ts1_0 = std::chrono::high_resolution_clock::now();
+  const float *ctx_logits = ensure_ctx_kv(ctx_ids, vs, m0, lse0);
+  auto ts1_1 = std::chrono::high_resolution_clock::now();
+  ms1 = std::chrono::duration<double, std::milli>(ts1_1 - ts1_0).count();
+  if (!ctx_logits) return true;  // ctx decode failed（结果全哨兵照常发布）
   // Step 1 CE: P(cand[0] | ctx) for all candidates
   // all candidates share the same ctx logits -> one normalizer scan
   // (2026-11-06: normalizer cached with prep state, hit path skips the scan)
@@ -3697,6 +3742,32 @@ void LlmRerankTranslation::Collect() {
       sorted.reserve(pm_tail.size());
       for (size_t k : ord)
         sorted.push_back(pm_tail[k]);
+      // 前缀软确认判定（2026-11-23 实验）：有复用分的前两名、首选多字词、
+      // end < 段末、margin ≥ θ → 挂起（下一次 Apply 入口执行 ctx->Select）。
+      // 判定在 swap 前做（ord 是原下标，swap 后 pm_tail 已重排）。
+      if (g_prefix_confirm && ord.size() >= 2) {
+        size_t i1 = (size_t)-1, i2 = (size_t)-1;
+        for (size_t k : ord) {
+          if (!has[k]) break;   // 无复用分者殿后，取前两个有分的
+          if (i1 == (size_t)-1) i1 = k;
+          else { i2 = k; break; }
+        }
+        if (i1 != (size_t)-1 && i2 != (size_t)-1) {
+          const std::string &t1 = pm_tail[i1]->text();
+          size_t nch = 0;
+          for (unsigned char ch : t1)
+            if ((ch & 0xC0) != 0x80) nch++;   // UTF-8 起始字节数 = 字符数
+          if (nch >= 2 && pm_tail[i1]->end() < seg_end_ &&
+              (fused[i1] - fused[i2]) >= g_prefix_confirm_theta) {
+            std::lock_guard<std::mutex> lk(g_pending_confirm_mu);
+            g_pending_confirm.valid = true;
+            g_pending_confirm.input = input_;
+            g_pending_confirm.seg_start = seg_start_;
+            g_pending_confirm.text = t1;
+            g_pending_confirm.end_pos = pm_tail[i1]->end();
+          }
+        }
+      }
       pm_tail.swap(sorted);
     }
 
@@ -3937,6 +4008,11 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
   // hook engine commit sink: pre-decode the upcoming context after commit
   commit_conn_ = engine_->sink().connect(
       [this](const std::string &text) { OnCommit(text); });
+  // 前缀软确认执行（2026-11-23）：挂到 context update_notifier——PushInput
+  // 时 composition 仍是上一轮（menu 已填充），filter 阶段 seg.menu 恒 null
+  if (engine_ && engine_->context())
+    update_conn_ = engine_->context()->update_notifier().connect(
+        [this](Context *ctx) { OnContextUpdate(ctx); });
   // register context-change callback: pre-decode on every TSF caret text
   // delivery (covers window switch / model-load cases with no commit)
   const RimeApi *api2 = rime_get_api();
@@ -3951,7 +4027,10 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
   }
 }
 
-LlmFilter::~LlmFilter() { commit_conn_.disconnect(); }
+LlmFilter::~LlmFilter() {
+  commit_conn_.disconnect();
+  update_conn_.disconnect();
+}
 
 // ============================================================
 // request async pre-decode of a raw context text (normalize +
@@ -4311,6 +4390,84 @@ std::string LlmFilter::GetContextTextGlobal() {
   return text ? text : "";
 }
 
+// 组合区已确认段文本（status >= kSelected）按顺序拼接（2026-11-23，§11.8）：
+// 前缀软确认后这些词是确定 token，LLM 的 ctx 必须包含它们
+//（CE(整句) = CE(P|C) + CE(R|C+P)，P 是常数项）。
+static std::string ConfirmedPrefixText(Context *ctx) {
+  std::string out;
+  if (!ctx) return out;
+  for (const Segment &seg : ctx->composition()) {
+    if (seg.status < Segment::kSelected) continue;
+    if (auto cand = seg.GetSelectedCandidate()) out += cand->text();
+  }
+  return out;
+}
+
+// 执行上一轮挂起的前缀软确认（下一次 Apply 入口调用）：输入前缀/段起点
+// 未变才执行；menu 按文本找候选 → ctx->Select（Segment::Close 截段 →
+// Forward → Compose 只重译剩余）。返回 true = 执行了确认（本键 translation
+// 是确认前旧段的，调用方应跳过重排直接透传）。
+static bool RunPendingConfirm(Context *ctx) {
+  if (!ctx || g_in_confirm) return false;
+  PendingConfirm pc;
+  {
+    std::lock_guard<std::mutex> lk(g_pending_confirm_mu);
+    if (!g_pending_confirm.valid) return false;
+    pc = g_pending_confirm;
+    g_pending_confirm.valid = false;
+  }
+  const std::string &inp = ctx->input();
+  if (pc.input.empty() || inp.size() < pc.seg_start + pc.input.size())
+    return false;
+  if (inp.compare(pc.seg_start, pc.input.size(), pc.input) != 0) return false;
+  if (ctx->composition().empty()) return false;
+  Segment &seg = ctx->composition().back();
+  if (seg.start != pc.seg_start || !seg.menu) return false;
+  size_t n = seg.menu->Prepare(16);
+  for (size_t i = 0; i < n; i++) {
+    auto c = seg.menu->GetCandidateAt(i);
+    if (c && c->text() == pc.text) {
+      g_in_confirm = true;
+      ctx->Select(i);
+      g_in_confirm = false;
+      return true;
+    }
+  }
+  return false;
+}
+
+// 前缀软确认执行（2026-11-23）：在 PushInput 触发的 update_notifier 里做。
+// 此时 composition 是上一轮的、seg.menu 已由 TranslateSegments 填充，Select
+// 安全（Compose 只 set_composition，不再触发 update_notifier，无递归）。
+void LlmFilter::OnContextUpdate(Context *ctx) {
+  if (!ctx || g_in_confirm) return;
+  // 测试钩子（仅排障）：选第一个只覆盖前缀的候选，验证 Select 链路
+  if (g_test_prefix_confirm) {
+    if (ctx->composition().empty()) return;
+    Segment &seg = ctx->composition().back();
+    log_error("tc: in=%s seg=[%d,%d) st=%d menu=%d", ctx->input().c_str(),
+              (int)seg.start, (int)seg.end, (int)seg.status,
+              seg.menu ? 1 : 0);
+    if (seg.status >= Segment::kSelected || !seg.menu) return;
+    size_t n = seg.menu->Prepare(16);
+    for (size_t i = 0; i < n; i++) {
+      auto cand = seg.menu->GetCandidateAt(i);
+      if (i < 4)
+        log_error("tc: c%zu end=%d text=%.24s", i,
+                  cand ? (int)cand->end() : -1,
+                  cand ? cand->text().c_str() : "");
+      if (cand && cand->end() > seg.start && cand->end() < seg.end) {
+        g_in_confirm = true;
+        ctx->Select(i);
+        g_in_confirm = false;
+        return;
+      }
+    }
+    return;
+  }
+  if (g_prefix_confirm) RunPendingConfirm(ctx);
+}
+
 an<Translation> LlmFilter::Apply(an<Translation> translation,
                                  CandidateList *candidates) {
   if (!translation)
@@ -4394,6 +4551,13 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
 
   // context source: TSF caret text, or commit history fallback
   auto [ctx, src] = GetContextTextPair();
+  // 组合区已确认前缀追加到 ctx（2026-11-23，§11.8 协同）：已确认词是确定
+  // token，LLM 上下文必须包含；P 在末尾、截断取末 max_ctx token 时不会被
+  // 挤掉（仅 P 自身超长才会被截尾）。
+  if (g_prefix_confirm) {
+    std::string conf = ConfirmedPrefixText(engine_->context());
+    if (!conf.empty()) ctx += conf;
+  }
   if (ctx.empty()) {
     // 常开语料：满码但无上文的 skip 事件（W 行，status=skip）
     std::string wid = new_event_id("W", g_user_tick);

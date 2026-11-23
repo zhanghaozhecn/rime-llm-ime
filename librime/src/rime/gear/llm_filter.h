@@ -14,6 +14,8 @@
 
 namespace rime {
 
+class Context;  // 前缀软确认回调（context update_notifier）
+
 // Reranked candidate stream: collect all candidates at construction,
 // then yield them in reranked order.
 class LlmRerankTranslation : public Translation {
@@ -57,6 +59,12 @@ class LlmFilter : public Filter {
   // Commit history fallback: concat all committed texts of this session.
   // Engine thread only (Context is not thread-safe).
   std::string CommitHistoryText() const;
+
+  // 前缀软确认执行（2026-11-23）：context update_notifier 回调。选在
+  // PushInput 时（composition 仍是上一轮的、menu 已填充）执行 ctx->Select；
+  // filter 阶段 seg.menu 尚未 AddTranslation（恒 null），不能在那里做。
+  void OnContextUpdate(Context* ctx);
+  connection update_conn_;
 
   // Engine commit sink: fired when text is committed to the frontend.
   // Starts async pre-decode of the upcoming context (TSF context text
