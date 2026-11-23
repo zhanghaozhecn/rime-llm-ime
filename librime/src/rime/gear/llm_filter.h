@@ -15,6 +15,7 @@
 namespace rime {
 
 class Context;  // 前缀软确认回调（context update_notifier）
+class Engine;   // 组句候选注入需要 schema_id / context（前缀已确认文本）
 
 // Reranked candidate stream: collect all candidates at construction,
 // then yield them in reranked order.
@@ -24,7 +25,8 @@ class LlmRerankTranslation : public Translation {
                        const std::string& input,
                        size_t seg_start, size_t seg_end,
                        const std::string& ctx,
-                       const std::string& src);
+                       const std::string& src,
+                       Engine* engine);
   bool Next() override;
   an<Candidate> Peek() override;
 
@@ -38,6 +40,7 @@ class LlmRerankTranslation : public Translation {
   size_t seg_end_ = 0;    // （整句模式满覆盖 FM 判定用；单段 = [0, input 全长)）
   std::string ctx_;    // normalized context text (TSF or commit history)
   std::string src_;    // context source: "tsf" | "rime"
+  Engine* engine_ = nullptr;  // N-gram 组句（schema_id / 已确认前缀）
   size_t index_ = 0;
 };
 

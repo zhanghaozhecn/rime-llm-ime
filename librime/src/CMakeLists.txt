@@ -4,6 +4,11 @@ aux_source_directory(rime/algo rime_algo_src)
 aux_source_directory(rime/config rime_config_src)
 aux_source_directory(rime/dict rime_dict_src)
 aux_source_directory(rime/gear rime_gears_src)
+# LLM ngram 组句器（2026-11-23 整句模式第②段）：aux_source_directory 是
+# configure 期快照，新增文件必须显式追加（改本行后需重跑一次 cmake configure；
+# scripts\build_rime_inc.bat 直接调 rime.vcxproj，不会触发 ZERO_CHECK）。
+list(APPEND rime_gears_src
+  ${CMAKE_CURRENT_SOURCE_DIR}/rime/gear/llm_ngram.cc)
 aux_source_directory(rime/lever rime_levers_src)
 if(rime_plugins_library)
   aux_source_directory(../plugins rime_plugins_src)

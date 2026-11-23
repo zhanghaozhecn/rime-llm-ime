@@ -394,6 +394,9 @@ void WeaselTSF::_UpdateComposition(com_ptr<ITfContext> pContext) {
       _tfClientId, this, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hr);
   _async_edit = !!(hr == TF_S_ASYNC);
   _UpdateCompositionWindow(pContext);
+  // 无按键刷新定时器（2026-11-23 第②段）：每次组合更新重挂 120ms 轮询，
+  // 用户停手后由 server 侧代次门控决定是否重译；组合结束停表。
+  _EnsureRefreshTimer();
 }
 
 /* Composition State */
@@ -418,6 +421,8 @@ void WeaselTSF::_AbortComposition(bool clear) {
 
 void WeaselTSF::_FinalizeComposition() {
   _pComposition = nullptr;
+  // 无按键刷新定时器随组合结束停掉（2026-11-23 第②段）
+  _StopRefreshTimer();
 }
 
 void WeaselTSF::_SetComposition(com_ptr<ITfComposition> pComposition) {

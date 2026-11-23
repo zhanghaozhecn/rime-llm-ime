@@ -309,6 +309,10 @@ void Client::ResetContext(const char* reason) {
   m_pImpl->SendContextReset(reason);
 }
 
+void Client::Refresh() {
+  m_pImpl->SendRefresh();
+}
+
 void Client::FocusIn() {
   m_pImpl->FocusIn();
 }

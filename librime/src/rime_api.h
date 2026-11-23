@@ -542,6 +542,20 @@ RIME_API void RimeSetContextResetHook(void (*hook)(void* user_data,
                                                   const char* reason),
                                       void* user_data);
 
+//! 无按键刷新（2026-11-23 第②段）：丢弃未确认的组合段并重译当前输入。
+//! LLM 整句评分的异步结果落地后由前端（weasel server，经 IPC
+//! WEASEL_IPC_REFRESH）调用——新首选无需再按一个键即可上屏。
+//! 走 Context::RefreshNonConfirmedComposition：命中已确认段之前的部分不动，
+//! 未确认段被 pop 后 Forward + 重译。代价 = 候选高亮回第 1 页（引擎语义）。
+//! 返回 True = 确实发生了重译（存在未确认段）。
+RIME_API Bool RimeRefreshComposition(RimeSessionId session_id);
+
+//! LLM 异步整句结果代次（2026-11-23 第②段）：llm_filter 每落地一份新的
+//! 整句评分结果自增。前端刷新轮询据此门控——代次未变直接返回，避免
+//! 每 120ms 触发一次无意义的组合区重译（会把候选高亮反复打回第 1 页）。
+//! 0 = 从未有结果（方案未启用 llm_filter / 未开启组句候选）。
+RIME_API int RimeLlmAsyncRevision(void);
+
 //! API entry
 /*!
  *  Acquire the version controlled RimeApi structure.

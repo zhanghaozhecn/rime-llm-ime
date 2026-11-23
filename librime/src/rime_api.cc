@@ -105,3 +105,12 @@ void RimeSetContextResetHook(void (*hook)(void* user_data, const char* reason),
                              void* user_data) {
   RimeSetContextResetHookImpl(hook, user_data);
 }
+
+// 无按键刷新 + LLM 异步结果代次（2026-11-23 第②段）：实现见 rime_api_impl.h
+Bool RimeRefreshComposition(RimeSessionId session_id) {
+  return RimeRefreshCompositionImpl(session_id);
+}
+
+int RimeLlmAsyncRevision(void) {
+  return RimeLlmAsyncRevisionImpl();
+}

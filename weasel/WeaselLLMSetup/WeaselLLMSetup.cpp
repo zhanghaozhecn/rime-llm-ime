@@ -77,6 +77,11 @@ struct Params {
                                    // 模式开启时显示/生效（PM 首选多字词且只覆盖
                                    // 前缀 → 下一键自动选入组合区）
   bool has_prefix_confirm = false; // 方案节里出现过该键
+  // N-gram 组句候选（2026-11-23 第②段）：只在整句模式 + 方案输出简体时
+  // 生效。**本版无复选框**——只做读写透传：解析保留、保存按原值写回，
+  // 避免 GUI 保存把手工加进方案的键静默抹掉（勾选框随 P3 一起做）。
+  bool ngram_group = false;
+  bool has_ngram_group = false;
   // freq_beta 已删（2026-11-05 标定产物退出用户配置面 → β=12 内置常数，两版统一；
 // v3 2026-11-06 六维联合标定：β12/τ400；用户 bigram 项 2026-11-08 退役，
 // 融合项只剩累计 Unigram log(0.5·p1)）
@@ -298,6 +303,11 @@ static bool parse_llm_section(const std::vector<std::string>& lines) {
       g_p.prefix_confirm = (val == "true");
       g_p.has_prefix_confirm = true;
     }
+    // N-gram 组句候选（2026-11-23 第②段）：透传保留（本版无复选框）
+    else if (key == "ngram_group") {
+      g_p.ngram_group = (val == "true");
+      g_p.has_ngram_group = true;
+    }
     else if (key == "max_tokens") g_p.max_tokens = atoi(val.c_str());
     else if (key == "max_candidates") g_p.max_candidates = atoi(val.c_str());
     else if (key == "cpu_cores") g_p.cpu_cores = atoi(val.c_str());
@@ -323,6 +333,11 @@ static std::vector<std::string> build_llm_section() {
   sec.push_back((g_p.sentence_mode && g_p.prefix_confirm)
                     ? "  prefix_confirm: true"
                     : "  prefix_confirm: false");
+  // N-gram 组句候选（2026-11-23 第②段）：透传写回（无勾选框；关整句模式
+  // 恒 false，与 llm_filter 运行期 gate 双保险）
+  sec.push_back((g_p.sentence_mode && g_p.ngram_group)
+                    ? "  ngram_group: true"
+                    : "  ngram_group: false");
   sec.push_back(g_p.debug_fusion ? "  debug_fusion: true" : "  debug_fusion: false");
   if (!g_p.model_path.empty()) {
     std::string p = wide_to_utf8(g_p.model_path);

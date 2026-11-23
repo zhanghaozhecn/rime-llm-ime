@@ -414,6 +414,22 @@ DWORD ServerImpl::OnResetContext(WEASEL_IPC_COMMAND uMsg,
   return 0;
 }
 
+// 无按键刷新（2026-11-23 第②段）：客户端组合期定时器发来。响应体必须
+// 每次都写（客户端随后解析缓冲）——handler 内部按 LLM 异步代次决定是否
+// 真的重译。
+DWORD ServerImpl::OnRefresh(WEASEL_IPC_COMMAND uMsg,
+                            DWORD wParam,
+                            DWORD lParam) {
+  if (m_pRequestHandler) {
+    auto eat = [this](std::wstring& msg) -> bool {
+      *channel << msg;
+      return true;
+    };
+    m_pRequestHandler->Refresh(lParam, eat);
+  }
+  return 0;
+}
+
 DWORD ServerImpl::OnChangePage(WEASEL_IPC_COMMAND uMsg,
                                DWORD wParam,
                                DWORD lParam) {
@@ -467,6 +483,7 @@ void ServerImpl::HandlePipeMessage(PipeMessage pipe_msg, _Resp resp) {
   PIPE_MSG_HANDLE(WEASEL_IPC_CHANGE_PAGE, OnChangePage);
   PIPE_MSG_HANDLE(WEASEL_IPC_SET_CONTEXT_TEXT, OnSetContextText);
   PIPE_MSG_HANDLE(WEASEL_IPC_RESET_CONTEXT, OnResetContext);
+  PIPE_MSG_HANDLE(WEASEL_IPC_REFRESH, OnRefresh);
   PIPE_MSG_HANDLE(WEASEL_IPC_TRAY_COMMAND, OnCommand);
   END_MAP_PIPE_MSG_HANDLE(result);
 

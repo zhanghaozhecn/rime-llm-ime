@@ -15,6 +15,7 @@
 // 由 GUI 触发重新部署，部署期快照，无热重载）。
 //
 #include <rime/gear/llm_filter.h>
+#include <rime/gear/llm_ngram.h>
 #include <rime/candidate.h>
 #include <rime/config.h>
 #include <rime/context.h>
@@ -156,6 +157,31 @@ static bool g_test_prefix_confirm = []() {
   return e && std::string(e) == "1";
 }();
 static double g_prefix_confirm_theta = 1.0;
+// 单字前导词的 θ 倍数（2026-11-23 第②段实测修正：2.0 → 1.0）
+// 「今天的天气」的 detianqi 场景：整句 CE 首选 的天气(-21.41)，最佳异前导词
+// 竞争者 地天气(-22.58)，margin = 1.17 nat（≈3.2× 似然比）——整句证据比
+// 3-token 前缀证据强得多，×2.0 会让「的/地/得」这类同音单字前缀永远确认不了
+//（正是用户报的缺陷）。设 1.0 = 与多字同门槛，仍保留真实 margin 闸；且确认
+// 只发生在组合区内（不上屏），误确认可见可退格撤销。两版同值。
+static double g_prefix_confirm_single_scale = 1.0;
+
+// ── N-gram 组句候选（2026-11-23 整句模式第②段，与插件版同构）─────────
+// 组句器 = llm_ngram.{h,cc}（万象 LTS `.gram` + 万象词库词级 beam，算法与
+// 研究库 eval/tools/sentence_gen_gram.py 同构）。开关 = 方案节
+// `llm_rerank/ngram_group`，**只在整句模式 + 方案输出简体**（有
+// simplifier/option_name）时生效——组句词表是简体，纯繁体方案不启用。
+// 资产在用户目录 llm_ngram\（安装器可选下载）；缺失时 60 秒重试一次。
+static bool g_ngram_group = false;        // 生效值（llm_apply_params 计算）
+static bool g_simplified_scheme = false;  // 方案有 simplifier/option_name
+static std::mutex g_ngram_mu;
+static rime_llm_ngram::Engine *g_ngram_engine = nullptr;
+static std::string g_ngram_sig;
+static std::time_t g_ngram_retry_at = 0;
+struct NgramGenInfo {   // 组句候选的附加信息（对齐 text）
+  std::string lead;     // 前导词（beam 分词的第一词）
+  int lead_end = 0;     // 前导词覆盖到的 code 偏移
+  double score = 0.0;   // ngram 分（调试用）
+};
 struct PendingConfirm {
   bool valid = false;
   std::string input;    // 活动段切片（判定时的 code）
@@ -192,8 +218,14 @@ static void commit_stack_refund_or_clear(const char *reason);  // fwd decl
                                                               // (回撤退款)
 static std::vector<llama_token> tokenize(const char *text);  // fwd decl
 static double cross_entropy(const float *logits, int vs, int target_id);  // fwd decl
+static std::string ConfirmedPrefixText(Context *ctx);  // fwd decl（前缀确认）
 
-static int g_n_ctx = 128;          // KV: 11 seqs x (ctx 10 + cand 2) = 132, 64 overflows
+// KV 容量（2026-11-23 第②段：128 → 512，与插件版同值）。3-token 路径只需
+// 11 seq × (ctx 20 + cand 2) = 242；整句 CE 路径需 1 × ctx + n × (ctx + 48)
+// （n ≤ 6 候选、ctx ≤ 20 → ≈ 310）。512 两者都够，且整句 CE 与 3-token
+// 共用同一 context/seq0/prep（合并收益：省掉每次一条重复的 ctx forward +
+// O(vocab) 归一化）。历史 128 为 3-token 单独口径（64 时 S2 恒 ~100ms）。
+static int g_n_ctx = 512;
 static int g_n_seq_max = 12;       // template seq 0 + up to 11 worker seqs
 static int g_max_candidates = 6;   // candidates participating in scoring
                                    // (2026-11-19 随生产模型切 Qwen3-0.6B base 定案 k*=6)
@@ -211,6 +243,7 @@ struct LlmParamSet {
   bool has_code_pattern = false; std::string code_pattern;  // 2026-09-30 新键
   bool has_sentence = false;     bool sentence_mode = false;
   bool has_prefix_confirm = false; bool prefix_confirm = false;  // 2026-11-23
+  bool has_ngram_group = false;   bool ngram_group = false;     // 2026-11-23 第②段
   // freq_beta 字段已删（2026-11-05 退出用户配置面）→ g_freq_beta 内置常数
   bool has_min_tokens = false;   int min_tokens = 1;
   bool has_max_tokens = false;   int max_tokens = 20;  // 2026-11-19: 0.6B ctx*=20
@@ -233,6 +266,10 @@ static void llm_apply_params() {
   g_prefix_confirm = g_prefix_confirm_env ||
                      (g_sentence_mode && s.has_prefix_confirm &&
                       s.prefix_confirm);
+  // N-gram 组句候选（2026-11-23 第②段）：只在整句模式 + 方案输出简体时生效
+  //（组句词表 = 万象简体；繁体方案不启用，避免吐简体候选）。
+  g_ngram_group = g_sentence_mode && g_simplified_scheme &&
+                  (s.has_ngram_group ? s.ngram_group : false);
   // 触发条件：code_pattern。空串 = 不限制（总是匹配）。
   // 整句模式锁定编码匹配（2026-11-22 用户定案）：sentence_mode on 时
   // 恒 '.{2,}'（2 码起参与重排）——方案节该行读取端忽略（手改 yaml 也
@@ -276,6 +313,76 @@ static void llm_apply_params() {
 }
 
 static void unload_model();  // 定义在后（enabled 关闭/路径变更时卸载，前置声明）
+
+// ------------------------------------------------------------
+// N-gram 组句器：资产路径解析 + 进程内一次加载（engine thread）
+// ------------------------------------------------------------
+static bool ngram_ensure(const std::string &schema_id) {
+  if (g_ngram_engine && g_ngram_engine->ready())
+    return true;
+  const std::time_t now = std::time(nullptr);
+  if (now < g_ngram_retry_at)
+    return false;
+  const std::string user =
+      Service::instance().deployer().user_data_dir.u8string();
+  if (user.empty())
+    return false;
+  const char *ge = getenv("RIME_LLM_NGRAM_PATH");
+  const char *de = getenv("RIME_LLM_NGRAM_DICT");
+  const std::string gram = (ge && *ge)
+                               ? std::string(ge)
+                               : user + "/llm_ngram/wanxiang-lts-zh-hans.gram";
+  const std::string dict =
+      (de && *de) ? std::string(de) : user + "/llm_ngram/dicts";
+  const std::string cache_dir = user + "/llm_rerank/ngram_lex";
+  CreateDirectoryA(cache_dir.c_str(), nullptr);
+  const std::string cache =
+      cache_dir + "/" + (schema_id.empty() ? "unknown" : schema_id) + ".bin";
+  // 万象词库六件（zi/jichu/duoyin/diming/mingren/yiren，自带词频列）
+  const std::vector<std::string> files = {"zi",   "jichu",  "duoyin",
+                                          "diming", "mingren", "yiren"};
+  const std::string sig = gram + "\x1f" + dict + "\x1f" + cache;
+  {
+    std::lock_guard<std::mutex> lk(g_ngram_mu);
+    if (g_ngram_engine && sig == g_ngram_sig && g_ngram_engine->ready())
+      return true;
+    if (!g_ngram_engine)
+      g_ngram_engine = new rime_llm_ngram::Engine();
+    if (!g_ngram_engine->Load(gram, dict, files, "", cache)) {
+      g_ngram_sig.clear();
+      g_ngram_retry_at = now + 60;
+      log_error("ngram assets unavailable (%s) -> group candidates off",
+                g_ngram_engine->error().c_str());
+      return false;
+    }
+    g_ngram_sig = sig;
+  }
+  log_msg("ngram: %s", g_ngram_engine->status().c_str());
+  return true;
+}
+
+static std::vector<rime_llm_ngram::Sentence> ngram_generate(
+    const std::string &code,
+    const std::string &ctx,
+    const std::string &schema_id) {
+  std::vector<rime_llm_ngram::Sentence> out;
+  if (!ngram_ensure(schema_id))
+    return out;
+  rime_llm_ngram::Params p;
+  p.topk = 5;          // 生成 5 个整句候选（LLM 再从 5 里选首选）
+  p.beam = 32;         // 生产参数：研究库实测 15ms/句，hit@5 73%/61%
+  p.min_weight = 10.0;
+  p.max_edges = 8;
+  p.ctx_tail = 10;
+  rime_llm_ngram::Engine *eng = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_ngram_mu);
+    eng = g_ngram_engine;
+  }
+  if (eng)
+    out = eng->Generate(code, ctx, p);
+  return out;
+}
 
 // ============================================================
 // commit-history fallback state (engine thread only: OnCommit sink
@@ -2826,6 +2933,144 @@ static bool score_batch(const std::vector<llama_token> &ctx_ids,
 }
 
 // ============================================================
+// 整句 CE 打分（2026-11-23 第②段，插件版 score_full_batch 的源码移植）
+//
+// 「LLM 从 5 个组句候选中选 1 个」的真正依据：3-token 路径只看句首三个
+// token，对整句重排几乎无效（研究 §11.7：A 区 +6pp、B 区 +1pp，词表内
+// 甚至 −1.7pp）；整句 CE 重排 top-1 万象 64%/57%。
+//
+// 与 3-token 路径**共用 g_ctx / seq0 / prep**（2026-11-23 合并）：
+//   Step 1: ctx 就绪——prep 命中（同 ctx，seq0 的 KV+logits 已在）则零成本；
+//           否则 decode 到 seq0 并刷新 prep（判据与 score_batch 一致）
+//   Step 2: seq_cp(0→i+1) 后把 n 个候选的全部 token 放进**一个 batch**
+//           一次 forward，CE 只做查表/归一化
+// 整句跑完只清 worker seq（1..n），seq0 与 prep 保持有效——下一次
+// score_batch / score_full_batch 仍命中 prep。
+//
+// sum_out = 完整候选的条件 CE 和（正数，越小越可能）；ce3_out = 前三个
+// token 的**原始 CE**（未加权，供子词块零 decode 复用——PM 的前 k 个 token
+// 与某个 FM 候选逐位相同时，条件概率与 FM 同位置分量完全相同）。
+// 返回 false = 前置条件不成立（候选数/长度/KV 预算）或 ctx decode 失败。
+// ============================================================
+static bool score_full_batch(const std::vector<llama_token> &ctx_ids,
+                             const std::vector<std::vector<llama_token>> &cands,
+                             std::vector<double> &sum_out,
+                             std::vector<int> &ntok_out,
+                             std::vector<std::array<double, 3>> *ce3_out,
+                             int max_tokens = 48) {
+  int n = (int)cands.size();
+  sum_out.assign(n, 0.0);
+  ntok_out.assign(n, 0);
+  if (ce3_out)
+    ce3_out->assign(n, {NAN, NAN, NAN});
+  if (n == 0 || n > g_n_seq_max - 1 || ctx_ids.empty())
+    return false;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_loaded.load() || !g_ctx)
+    return false;
+  const int ctx_len = (int)ctx_ids.size();
+  const int vs = llama_vocab_n_tokens(g_vocab);
+  int max_len = 0;
+  for (const auto &c : cands)
+    max_len = (std::max)(max_len, (int)c.size());
+  // 每 seq 预算：总 KV 扣掉 ctx 后 n 条 worker 均分（每条需 ctx_len+候选长度）
+  int budget = (g_n_ctx - ctx_len) / n - ctx_len - 1;
+  max_len = (std::min)(max_len, (std::min)(max_tokens, budget));
+  if (max_len <= 0)
+    return false;
+
+  // ---- ctx KV：prep 命中零成本 / 前缀延伸只 decode 增量 / 否则全量 ----
+  float m0 = 0;
+  double lse0 = 0;
+  const float *cl = ensure_ctx_kv(ctx_ids, vs, m0, lse0);
+  if (!cl)
+    return false;  // ctx decode 失败：本轮回 nil，下次全流程兜底
+
+  // 首 token CE（共享 ctx 末位 logits，须在候选 decode 之前算完）
+  for (int i = 0; i < n; i++) {
+    if (cands[i].empty())
+      continue;
+    double c = ce_target(cl, cands[i][0], m0, lse0);
+    sum_out[i] = c;
+    ntok_out[i] = 1;
+    if (ce3_out)
+      (*ce3_out)[i][0] = c;
+  }
+  // ctx KV → 每个候选 seq（先清目的 seq：prep 命中路径不清整个 KV，
+  // 上一轮残留会让 seq_cp 叠加出脏 KV）
+  auto *mem0 = llama_get_memory(g_ctx);
+  for (int i = 0; i < n; i++) {
+    llama_memory_seq_rm(mem0, i + 1, 0, -1);
+    llama_memory_seq_cp(mem0, 0, i + 1, 0, -1);
+  }
+
+  // ---- 一次性 decode 全部候选 token（每候选一条 seq，ctx KV 已 copy）----
+  // 逐步 decode（每 token 一次 forward）在 0.6B 上每步约 20ms、15 步 ≈ 300ms；
+  // 这里把所有候选 token 放进**同一个 batch**、一次 forward 取全位置 logits，
+  // CE 只做查表/归一化——同一数学，forward 次数从 ΣN 降到 1。
+  std::vector<int> base(n, -1);
+  std::vector<int> lens(n, 0);
+  int total = 0;
+  for (int i = 0; i < n; i++) {
+    lens[i] = (std::min)((int)cands[i].size(), max_len);
+    total += lens[i];
+  }
+  if (total <= 0) {
+    for (int i = 0; i < n; i++)
+      llama_memory_seq_rm(mem0, i + 1, 0, -1);
+    return true;
+  }
+  llama_batch b = llama_batch_init(total, 0, n);
+  int row = 0;
+  for (int i = 0; i < n; i++) {
+    base[i] = row;
+    int len = lens[i];
+    for (int j = 0; j < len; j++, row++) {
+      b.token[row] = cands[i][j];
+      b.pos[row] = ctx_len + j;
+      b.n_seq_id[row] = 1;
+      b.seq_id[row][0] = i + 1;
+      // 该 token 的 logits 预测下一个 token；最后一个不用
+      b.logits[row] = (j + 1 < len) ? 1 : 0;
+    }
+  }
+  b.n_tokens = row;
+  bool ok = llama_decode(g_ctx, b) == 0;
+  if (ok) {
+    for (int i = 0; i < n; i++) {
+      int len = lens[i];
+      for (int j = 1; j < len; j++) {
+        float *l = llama_get_logits_ith(g_ctx, base[i] + j - 1);
+        if (!l) {
+          sum_out[i] = 1e10;
+          break;
+        }
+        float m;
+        double lse;
+        logits_normalizer(l, vs, m, lse);
+        double c = ce_target(l, cands[i][j], m, lse);
+        sum_out[i] += c;
+        ntok_out[i] = j + 1;
+        if (ce3_out && j < 3)
+          (*ce3_out)[i][j] = c;
+      }
+    }
+  } else {
+    // 失败自愈：prep 命中路径不清 KV，decode 失败可能是 KV 耗尽——
+    // 置无效强制下一次走全流程重建（同 score_batch Step2/3）
+    log_error("full-sentence decode failed (%d cands, %d tokens)", n, total);
+    g_prep_ready = false;
+    for (int i = 0; i < n; i++)
+      sum_out[i] = 1e10;
+  }
+  llama_batch_free(b);
+  // worker seq 清理（seq0 与 prep 保留，3-token 路径仍可命中）
+  for (int i = 0; i < n; i++)
+    llama_memory_seq_rm(mem0, i + 1, 0, -1);
+  return true;
+}
+
+// ============================================================
 // prepare: pre-decode Step 1 (ctx decode -> save logits) so the
 // next score_batch can skip Step 1 when the ctx matches.
 // Runs in the g_mutex (same as score_batch); called from a detached
@@ -2957,6 +3202,13 @@ struct AsyncTask {
   bool valid = false;
   long gen = 0;                // 提交时的代次（中断判定基准）
   bool immediate = false;      // wait 模式：跳过去抖立即开跑
+  // 整句 CE 任务（2026-11-23 第②段）：true = score_full_batch（完整候选
+  // 条件 CE），false = score_batch（3-token）。整句任务**不可中断**——
+  // 结果是 4-5ms/Σtoken、总计 ~200ms 的一次性批，中途丢弃等于白跑；且
+  // 键间隔 100ms 连打时每个键都会覆盖任务槽，可中断 = 整句分永远算不完
+  //（这正是"LLM 选不出 1 个"的原始缺陷）。故整句结果按指纹落旁路表，
+  // 任务被覆盖也不丢，由无按键刷新链收割上屏。
+  bool full = false;
   std::string fingerprint;
   std::string ctx_norm;        // normalize_ctx 后的上文（token 化源）
   std::vector<std::string> cand_texts;
@@ -2969,6 +3221,7 @@ static AsyncTask g_async_task;
 
 struct AsyncRes {
   bool valid = false;
+  bool full = false;            // 整句 CE 结果（2026-11-23 第②段）
   std::string fingerprint;
   std::vector<double> scores;   // 提交序（= Collect 的 candidates_ 序）
   std::vector<std::array<double, 3>> ce3;
@@ -2981,13 +3234,29 @@ struct AsyncRes {
 };
 static AsyncRes g_async_result;
 
+// 整句结果旁路表（2026-11-23 第②段）：整句任务在 g_mutex 内跑完整批，
+// 结果按指纹入列——即使提交它的那个键已被后续键覆盖，分数也不丢。
+// 受 g_async_mu 保护；由引擎线程的 async_harvest() 合并进 g_async_cache。
+static std::vector<AsyncRes> g_full_done;
+
+// 无按键刷新门控（2026-11-23 第②段）：每落地一份整句结果自增。weasel
+// server 在 WEASEL_IPC_REFRESH 里比对代次——未变即返回，避免 120ms 轮询
+// 把候选高亮反复打回第 1 页。经 rime_api.h 的 RimeLlmAsyncRevision()
+// 暴露给前端（rime_api_impl.h 通过 g_llm_async_revision_slot 取槽，
+// 核心不依赖 LLM 组件）。
+static std::atomic<int> g_async_revision{0};
+std::atomic<int> *g_llm_async_revision_slot() {
+  return &g_async_revision;
+}
+
 // 指纹（2026-11-22）：归一化上文 \x1f 候选 \x1e 拼接；2026-11-23 追加子词
 // 清单（\x1d 分隔，整句模式才有）——子词复用分与候选集属同一快照，指纹
 // 必须绑定，否则同 FM 不同 PM 的 query 会错命中缓存（与插件版
 // async_fingerprint 同构；字词模式 pm 为空 → 指纹格式保持不变）。
 static std::string async_fingerprint(const std::string &ctx_norm,
                                      const std::vector<std::string> &cands,
-                                     const std::vector<std::string> &pm) {
+                                     const std::vector<std::string> &pm,
+                                     bool full) {
   std::string fp = ctx_norm;
   fp.push_back('\x1f');
   for (size_t i = 0; i < cands.size(); i++) {
@@ -3003,6 +3272,11 @@ static std::string async_fingerprint(const std::string &ctx_norm,
       fp += pm[i];
     }
   }
+  // 评分口径绑定（2026-11-23 第②段）：整句 CE 与 3-token 是两种分数，
+  // 同一 (上文, 候选, 子词) 下不可互换——不同口径必须不同指纹，否则
+  // 关闭/开启组句切换时会命中错误口径的缓存（整句模式恒 full，实际
+  // 只在模式切换瞬间发生，但缓存是进程级的）。
+  fp.push_back(full ? '\x1c' : '\x1b');
   return fp;
 }
 
@@ -3203,11 +3477,31 @@ static void async_worker_loop() {
       continue;
     }
     bool done = false;
-    try {
-      done = score_batch(ctx_ids, cand_ids, res.scores, &res.ce3,
-                         &res.prep_hit, &g_async_gen, task.gen);
-    } catch (...) {
-      log_error("exception in async score_batch");
+    if (task.full) {
+      // 整句 CE（2026-11-23 第②段）：整批一次 forward，结果取负后与 3-token
+      // 同域（score = −CE，越大越优），下游融合/调试/排序零改动。
+      std::vector<double> sum_ce;
+      std::vector<int> ntok;
+      try {
+        done = score_full_batch(ctx_ids, cand_ids, sum_ce, ntok, &res.ce3);
+      } catch (...) {
+        log_error("exception in async score_full_batch");
+      }
+      if (done && sum_ce.size() == cand_ids.size()) {
+        res.scores.resize(sum_ce.size());
+        for (size_t i = 0; i < sum_ce.size(); i++)
+          res.scores[i] = (sum_ce[i] < 1e9 && ntok[i] > 0) ? -sum_ce[i] : -1e10;
+        res.full = true;
+      } else {
+        done = false;
+      }
+    } else {
+      try {
+        done = score_batch(ctx_ids, cand_ids, res.scores, &res.ce3,
+                           &res.prep_hit, &g_async_gen, task.gen);
+      } catch (...) {
+        log_error("exception in async score_batch");
+      }
     }
     // 评分线程锁已释放：补跑被延迟的 prepare（同步路径收尾动作同款）
     retry_pending_prepare();
@@ -3215,13 +3509,29 @@ static void async_worker_loop() {
     res.ev_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     if (done) {
       // 子词复用评分（2026-11-23）：只用已算好的 FM token/CE 做前缀匹配，
-      // 零 decode——必须先于发布（融合/缓存统一读快照）
+      // 零 decode——必须先于发布（融合/缓存统一读快照）。整句模式下 ce3 是
+      // 整句批的前三 token 原始 CE，语义与 3-token 路径逐位相同（同一上文
+      // + 同一前缀 → 条件概率相同）。
       if (!task.pm_texts.empty())
         reuse_pm_scores(cand_ids, res.ce3, task.pm_texts, res.pm_scores);
       res.valid = true;
-      std::lock_guard<std::mutex> lk(g_async_mu);
-      g_async_result = std::move(res);
-      g_async_cv.notify_all();
+      if (task.full) {
+        // 整句结果走旁路表（2026-11-23 第②段）：提交它的键可能已被覆盖，
+        // 结果按指纹存货、由 async_harvest 合并 + 无按键刷新链上屏。
+        // 整句任务在 g_mutex 内跑完不中断，这里不再比较 gen。
+        {
+          std::lock_guard<std::mutex> lk(g_async_mu);
+          if (g_full_done.size() >= 8)
+            g_full_done.erase(g_full_done.begin());
+          g_full_done.push_back(std::move(res));
+        }
+        g_async_revision.fetch_add(1, std::memory_order_relaxed);
+        g_async_cv.notify_all();
+      } else {
+        std::lock_guard<std::mutex> lk(g_async_mu);
+        g_async_result = std::move(res);
+        g_async_cv.notify_all();
+      }
     }
     // 中断（done=false）：不发布，结果槽留给新任务
   }
@@ -3230,8 +3540,13 @@ static void async_worker_loop() {
 static std::string async_submit(const std::string &ctx_norm,
                                 const std::vector<std::string> &cand_texts,
                                 const std::vector<std::string> &pm_texts,
-                                bool immediate) {
+                                bool immediate,
+                                bool full = false) {
   if (cand_texts.size() < 2 || ctx_norm.empty())
+    return "";
+  // 整句 CE 的候选数受 worker seq 上限约束（score_full_batch 同判据）；
+  // 超限直接不投递——上层按"评分不可用"回退层 1 序。
+  if (full && cand_texts.size() > (size_t)(g_n_seq_max - 1))
     return "";
   if (!g_async_started.load()) {
     std::lock_guard<std::mutex> lk(g_async_mu);
@@ -3241,7 +3556,7 @@ static std::string async_submit(const std::string &ctx_norm,
       g_async_started.store(true);
     }
   }
-  std::string fp = async_fingerprint(ctx_norm, cand_texts, pm_texts);
+  std::string fp = async_fingerprint(ctx_norm, cand_texts, pm_texts, full);
   {
     std::lock_guard<std::mutex> lk(g_async_mu);
     long gen = g_async_gen.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -3249,6 +3564,7 @@ static std::string async_submit(const std::string &ctx_norm,
     g_async_task.valid = true;
     g_async_task.gen = gen;
     g_async_task.immediate = immediate;
+    g_async_task.full = full;
     g_async_task.fingerprint = fp;
     g_async_task.ctx_norm = ctx_norm;
     g_async_task.cand_texts = cand_texts;
@@ -3299,14 +3615,34 @@ static void async_cancel() {
 // 都不再依赖"下一次 query"）。调用方须与 Collect 同线程（commit 通知与
 // process_key 同在 server 消息线程——语料写入无跨线程竞争）。
 static void async_harvest() {
-  AsyncRes old;
-  if (!async_poll(old))
-    return;
-  g_async_cache[old.fingerprint] = old;
-  auto pit = g_async_pending.find(old.fingerprint);
-  if (pit != g_async_pending.end()) {
-    async_write_pending(pit->second, old);
-    g_async_pending.erase(pit);
+  // ① 单槽结果（3-token 路径，以及整句模式下预算内完成的整句任务）
+  {
+    AsyncRes old;
+    if (async_poll(old)) {
+      g_async_cache[old.fingerprint] = old;
+      auto pit = g_async_pending.find(old.fingerprint);
+      if (pit != g_async_pending.end()) {
+        async_write_pending(pit->second, old);
+        g_async_pending.erase(pit);
+      }
+    }
+  }
+  // ② 整句旁路结果（2026-11-23 第②段）：超预算完成、或提交它的键已被
+  // 后续键覆盖——结果按指纹存货，这里合并进缓存并补写挂账 W ok 行。
+  // 无按键刷新链（WEASEL_IPC_REFRESH → Collect）最先走到这里，因此
+  // "LLM 选出的 1 句"就是这样上屏的。
+  std::vector<AsyncRes> done;
+  {
+    std::lock_guard<std::mutex> lk(g_async_mu);
+    done.swap(g_full_done);
+  }
+  for (auto &r : done) {
+    g_async_cache[r.fingerprint] = r;
+    auto pit = g_async_pending.find(r.fingerprint);
+    if (pit != g_async_pending.end()) {
+      async_write_pending(pit->second, r);
+      g_async_pending.erase(pit);
+    }
   }
   if (g_async_cache.size() > 16)
     g_async_cache.clear();
@@ -3320,9 +3656,10 @@ LlmRerankTranslation::LlmRerankTranslation(an<Translation> translation,
                                            const std::string &input,
                                            size_t seg_start, size_t seg_end,
                                            const std::string &ctx,
-                                           const std::string &src)
+                                           const std::string &src,
+                                           Engine *engine)
     : translation_(translation), input_(input), seg_start_(seg_start),
-      seg_end_(seg_end), ctx_(ctx), src_(src) {
+      seg_end_(seg_end), ctx_(ctx), src_(src), engine_(engine) {
   // 词码对记账（2026-11-13）: 记最近窗码供 OnCommit 用（commit 时 input
   // 已清空; 同插件版 pending_code 捕获语义。engine thread, 无竞争）
   g_last_input = input;
@@ -3381,6 +3718,52 @@ void LlmRerankTranslation::Collect() {
     allc.push_back(cand);
     translation_->Next();
   }
+  // engine_top 用引擎原序（组句注入前捕获；语料 W 的 engine_top 字段口径不变）
+  std::vector<std::string> engine_vec = texts_of(allc, 10);
+
+  // ═══ N-gram 组句候选前置注入（2026-11-23 第②段，与插件版同构）═══
+  // 生成 5 条整句候选放在候选流最前（同文本去重），后续层1/满覆盖/子词/
+  // 评分/前缀判定全部沿用既有逻辑：span == 活动段 → 满覆盖，同分保序 →
+  // ngram 序即注入序。只在整句模式 + 方案输出简体 + ≥4 码（≈2 音节）时启用。
+  std::map<std::string, NgramGenInfo> gen_info;
+  if (g_sentence_mode && g_ngram_group &&
+      (seg_end_ - seg_start_) >= 4) {
+    const std::string code_g =
+        input_.substr(seg_start_, seg_end_ - seg_start_);
+    std::string sid;
+    if (engine_ && engine_->schema())
+      sid = engine_->schema()->schema_id();
+    std::string gctx = ctx_;
+    if (g_prefix_confirm) {
+      std::string conf = ConfirmedPrefixText(engine_->context());
+      if (!conf.empty())
+        gctx += conf;
+    }
+    std::vector<rime_llm_ngram::Sentence> gen =
+        ngram_generate(code_g, gctx, sid);
+    if (!gen.empty()) {
+      std::vector<an<Candidate>> merged;
+      std::map<std::string, char> seen_t;
+      for (const auto &s : gen) {
+        if (s.text.empty() || seen_t.count(s.text))
+          continue;
+        seen_t[s.text] = 1;
+        merged.push_back(an<Candidate>(
+            new SimpleCandidate("ngram_group", seg_start_, seg_end_, s.text)));
+        NgramGenInfo gi;
+        if (!s.words.empty()) {
+          gi.lead = s.words[0].word;
+          gi.lead_end = s.words[0].code_end;
+        }
+        gi.score = s.score;
+        gen_info[s.text] = gi;
+      }
+      for (const auto &c : allc)
+        if (!seen_t.count(c->text()))
+          merged.push_back(c);
+      allc.swap(merged);
+    }
+  }
 
   // 整句模式满覆盖准入（2026-11-22 取代 two_code_sentence 满长规则）：
   // FM = 候选 start/end 恰为活动段 [seg_start_, seg_end_)（覆盖全部音节，
@@ -3413,7 +3796,6 @@ void LlmRerankTranslation::Collect() {
   // 部分输入码不会到这里，避免每键落一行。
   std::string wctx = normalize_ctx(ctx_);
   std::string wid = new_event_id("W", g_user_tick);
-  std::vector<std::string> engine_vec = texts_of(allc, 10);
   std::vector<std::string> window_vec;
   bool w_written = false;
   std::string wstatus = "ok";
@@ -3557,7 +3939,11 @@ void LlmRerankTranslation::Collect() {
         cand_texts.reserve(candidates_.size());
         for (size_t ci = 0; ci < candidates_.size(); ci++)
           cand_texts.push_back(candidates_[ci]->text());
-        std::string fp = async_fingerprint(ctx, cand_texts, pm_texts);
+        // 评分口径（2026-11-23 第②段）：整句模式 + 组句候选在场 → 整句 CE
+        // （"LLM 从 5 句里选 1 个"），否则维持 3-token。口径进指纹。
+        const bool full_mode = sent_on && g_ngram_group && !gen_info.empty();
+        std::string fp =
+            async_fingerprint(ctx, cand_texts, pm_texts, full_mode);
 
         AsyncRes snap;
         bool have_snap = false;
@@ -3566,14 +3952,38 @@ void LlmRerankTranslation::Collect() {
           snap = cit->second;
           have_snap = true;
         }
-        if (!have_snap) {
-          // 评测立即开跑（两模式都不走去抖）：下面短预算等待后再决定
-          // 是否挂账（2026-11-23 修，见 g_sentence_wait_ms 注释）。
-          std::string sfp = async_submit(ctx, cand_texts, pm_texts, true);
+        // 同指纹任务已在飞（挂账中）：不重复投递——连打时每键覆盖任务槽
+        // 会让整句分永远算不完（2026-11-23 第②段）。继续显示层 1 序，
+        // 等结果落地后由无按键刷新链/下一次 Collect 收割上屏。
+        const bool inflight = !have_snap && g_async_pending.count(fp) > 0;
+        if (!have_snap && !inflight) {
+          // 字词模式 immediate（跳去抖，与既有同步评分等价的延迟面）；
+          // 整句 CE 走去抖——连打时天然合并，只在停手后算一批
+          std::string sfp =
+              async_submit(ctx, cand_texts, pm_texts, !full_mode, full_mode);
           if (sfp.empty()) {
             wstatus = "skip";
             wskip = "async_failed";  // 任务不成立（理论上文/窗已过守卫）
             live_send(std::string("S|") + now_hms() + "|async_failed|" +
+                      live_esc(input_) + "|" + src_);
+          } else if (full_mode) {
+            // 整句 CE 必超键预算（5 句 p50 200ms / p95 355ms）→ 不等待，
+            // 直接挂账：本键显示层 1 序，结果落地后刷新链重排上屏。
+            AsyncPending pend;
+            pend.wid = wid;
+            pend.code = input_;
+            pend.wctx = wctx;
+            pend.engine_vec = engine_vec;
+            pend.window_vec = window_vec;
+            pend.tick = g_user_tick;
+            pend.src = src_;
+            pend.sent_on = true;
+            g_async_pending[sfp] = pend;
+            if (g_async_pending.size() > 32)
+              g_async_pending.clear();
+            wstatus = "skip";
+            wskip = "async_pending";
+            live_send(std::string("S|") + now_hms() + "|async_pending|" +
                       live_esc(input_) + "|" + src_);
           } else {
             AsyncRes res;
@@ -3614,6 +4024,11 @@ void LlmRerankTranslation::Collect() {
                         live_esc(input_) + "|" + src_);
             }
           }
+        } else if (inflight) {
+          wstatus = "skip";
+          wskip = "async_pending";
+          live_send(std::string("S|") + now_hms() + "|async_pending|" +
+                    live_esc(input_) + "|" + src_);
         }
 
         if (have_snap && snap.scores.size() == candidates_.size()) {
@@ -3796,6 +4211,83 @@ void LlmRerankTranslation::Collect() {
         }
       }
       pm_tail.swap(sorted);
+    }
+
+    // ═══ 句级前缀判定（2026-11-23 第②段，与插件版同构）═══
+    // 有组句候选时改用**前导词**证据：融合序前 5 条全是组句候选且前导词
+    // 一致，或最优与"前导词不同"的最佳竞争者融合分 margin ≥ θ（单字 ×2）
+    // → 挂起。旧 PM 复用路径要求「有复用分 + ≥2 字」，单字前缀（的/地/得）
+    // 永远无法确认；句级路径正是「的 + 天气」这类确定场景的入口。
+    if (g_prefix_confirm && g_sentence_mode && !gen_info.empty() &&
+        !order.empty()) {
+      const std::string &top_text = candidates_[order[0]]->text();
+      auto it_top = gen_info.find(top_text);
+      if (it_top != gen_info.end() && !it_top->second.lead.empty() &&
+          it_top->second.lead_end >= 0 &&
+          seg_start_ + (size_t)it_top->second.lead_end < seg_end_) {
+        const std::string &lead = it_top->second.lead;
+        const size_t lim = std::min<size_t>(order.size(), 5);
+        bool all_gen = true, same_lead = true;
+        int competitor = -1;
+        for (size_t k = 1; k < lim; k++) {
+          int idx = order[k];
+          auto it = gen_info.find(candidates_[idx]->text());
+          if (it == gen_info.end() || it->second.lead.empty()) {
+            all_gen = false;
+          } else if (it->second.lead != lead) {
+            same_lead = false;
+            if (competitor < 0)
+              competitor = idx;
+          }
+        }
+        bool okc = all_gen && same_lead;
+        if (!okc && competitor >= 0) {
+          double t1 = fused_of[order[0]];
+          double t2 = fused_of[competitor];
+          if (t1 > -1e307 && t2 > -1e307) {
+            size_t nch = 0;
+            for (unsigned char ch : lead)
+              if ((ch & 0xC0) != 0x80) nch++;
+            double theta = g_prefix_confirm_theta;
+            if (nch < 2)
+              theta *= g_prefix_confirm_single_scale;
+            okc = (t1 - t2) >= theta;
+          }
+        }
+        if (okc) {
+          // 在子词块里找该前缀词（码位对齐 + 字符数一致）→ 挂起确认
+          const size_t want_end = seg_start_ + (size_t)it_top->second.lead_end;
+          size_t nlead = 0;
+          for (unsigned char ch : lead)
+            if ((ch & 0xC0) != 0x80) nlead++;
+          if (g_debug_fusion)
+            log_error("pfx: okc=1 lead=%.16s nlead=%d want_end=%d pm=%d",
+                      lead.c_str(), (int)nlead, (int)want_end,
+                      (int)pm_tail.size());
+          for (const auto &c : pm_tail) {
+            if (c->start() != seg_start_ || c->end() != want_end)
+              continue;
+            size_t nch = 0;
+            for (unsigned char ch : c->text())
+              if ((ch & 0xC0) != 0x80) nch++;
+            if (nch != nlead)
+              continue;
+            std::lock_guard<std::mutex> lk(g_pending_confirm_mu);
+            g_pending_confirm.valid = true;
+            g_pending_confirm.input = input_;
+            g_pending_confirm.seg_start = seg_start_;
+            g_pending_confirm.text = c->text();
+            g_pending_confirm.end_pos = c->end();
+            if (g_debug_fusion)
+              log_error("pfx: pending='%s' end=%d", c->text().c_str(),
+                        (int)c->end());
+            break;
+          }
+        } else if (g_debug_fusion) {
+          log_error("pfx: okc=0 top=%.16s all_gen=%d same_lead=%d comp=%d",
+                    top_text.c_str(), (int)all_gen, (int)same_lead, competitor);
+        }
+      }
     }
 
     // 两码整句最终置顶块已删（2026-11-22 整句模式定案）：满覆盖候选已在
@@ -4031,6 +4523,13 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     if (config->GetBool("llm_rerank/prefix_confirm", &b)) {
       p.has_prefix_confirm = true; p.prefix_confirm = b;
     }
+    // N-gram 组句候选（2026-11-23 第②段）：开关 + 输出字形门
+    //（simplifier/option_name 非空 = 方案输出简体，组句词表为简体）
+    if (config->GetBool("llm_rerank/ngram_group", &b)) {
+      p.has_ngram_group = true; p.ngram_group = b;
+    }
+    g_simplified_scheme =
+        config->GetString("simplifier/option_name", &sv) && !sv.empty();
     llm_apply_params();
     std::string sid;
     if (engine_->schema())
@@ -4449,12 +4948,22 @@ static bool RunPendingConfirm(Context *ctx) {
     g_pending_confirm.valid = false;
   }
   const std::string &inp = ctx->input();
-  if (pc.input.empty() || inp.size() < pc.seg_start + pc.input.size())
+  if (pc.input.empty() || inp.size() < pc.seg_start + pc.input.size()) {
+    if (g_debug_fusion) log_error("pfx: exec abort input mismatch");
     return false;
-  if (inp.compare(pc.seg_start, pc.input.size(), pc.input) != 0) return false;
+  }
+  if (inp.compare(pc.seg_start, pc.input.size(), pc.input) != 0) {
+    if (g_debug_fusion) log_error("pfx: exec abort input differs");
+    return false;
+  }
   if (ctx->composition().empty()) return false;
   Segment &seg = ctx->composition().back();
-  if (seg.start != pc.seg_start || !seg.menu) return false;
+  if (seg.start != pc.seg_start || !seg.menu) {
+    if (g_debug_fusion)
+      log_error("pfx: exec abort seg_start=%d/%d menu=%d", (int)seg.start,
+                (int)pc.seg_start, seg.menu ? 1 : 0);
+    return false;
+  }
   size_t n = seg.menu->Prepare(16);
   for (size_t i = 0; i < n; i++) {
     auto c = seg.menu->GetCandidateAt(i);
@@ -4462,9 +4971,14 @@ static bool RunPendingConfirm(Context *ctx) {
       g_in_confirm = true;
       ctx->Select(i);
       g_in_confirm = false;
+      if (g_debug_fusion)
+        log_error("pfx: exec select '%s' idx=%d", pc.text.c_str(), (int)i);
       return true;
     }
   }
+  if (g_debug_fusion)
+    log_error("pfx: exec abort '%s' not in top %d", pc.text.c_str(),
+              (int)n);
   return false;
 }
 
@@ -4610,7 +5124,7 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
   }
 
   return New<LlmRerankTranslation>(translation, code, seg_start, seg_end,
-                                   ctx, src);
+                                   ctx, src, engine_);
 }
 
 }  // namespace rime

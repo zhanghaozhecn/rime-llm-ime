@@ -462,6 +462,42 @@ VOID CALLBACK WeaselTSF::EditResetCollectProc(HWND, UINT, UINT_PTR idEvent,
   ts->m_pEditResetContext = nullptr;  // 释放保活引用
 }
 
+// ── 无按键刷新（2026-11-23 第②段）───────────────────────────────────────
+// 组合期定时器：每 120ms 发一次 WEASEL_IPC_REFRESH。server 侧按 LLM 异步
+// 整句结果代次门控——代次未变只回响应体（不重译），变化时才重译未确认段
+// 并把新序写回响应体。于是「LLM 从 5 个组句候选里选 1 个」无需再按一个键：
+// 用户停手后 ~120ms 轮询发现结果、候选窗与首选自动更新。
+// SetTimer(NULL) 的消息由本线程（TSF apartment）消息循环派发，TimerProc
+// 天然回到正确线程（与 EditResetCollectProc 同一套线程安全前提）。
+static const UINT_PTR kRefreshTimerOffset = 1;
+
+void WeaselTSF::_EnsureRefreshTimer() {
+  SetTimer(nullptr, (UINT_PTR)this + kRefreshTimerOffset, 120,
+           WeaselTSF::RefreshCompositionProc);
+}
+
+void WeaselTSF::_StopRefreshTimer() {
+  KillTimer(nullptr, (UINT_PTR)this + kRefreshTimerOffset);
+}
+
+void WeaselTSF::_OnRefreshTimer() {
+  // 组合结束/中止后无可刷新对象：停表，下次按键由 _EnsureRefreshTimer 重挂
+  if (!_IsComposing() || !_pEditSessionContext) {
+    _StopRefreshTimer();
+    return;
+  }
+  m_client.Refresh();
+  // 响应体已由 Transact 读入线程缓冲，这里走常规编辑会话解析并更新界面
+  //（与翻页/高亮同款配对：请求 → _UpdateComposition）
+  _UpdateComposition(_pEditSessionContext);
+}
+
+VOID CALLBACK WeaselTSF::RefreshCompositionProc(HWND, UINT, UINT_PTR idEvent,
+                                                DWORD) {
+  WeaselTSF* ts = reinterpret_cast<WeaselTSF*>(idEvent - kRefreshTimerOffset);
+  ts->_OnRefreshTimer();
+}
+
 void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate,
                                     bool from_edit_reset) {
   m_textBeforeCaret = text;

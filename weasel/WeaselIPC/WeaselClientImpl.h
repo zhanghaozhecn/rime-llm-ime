@@ -20,6 +20,8 @@ class ClientImpl {
   bool ProcessKeyEvent(KeyEvent const& keyEvent);
   void SendContextText(const std::string& utf8_text);
   void SendContextReset(const char* reason = "");
+  // 无按键刷新（2026-11-23 第②段）
+  void SendRefresh() { _SendMessage(WEASEL_IPC_REFRESH, 0, session_id); }
   bool CommitComposition();
   bool ClearComposition();
   bool SelectCandidateOnCurrentPage(size_t index);

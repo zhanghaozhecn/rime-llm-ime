@@ -34,6 +34,10 @@ enum WEASEL_IPC_COMMAND {
   WEASEL_IPC_CHANGE_PAGE,
   WEASEL_IPC_SET_CONTEXT_TEXT,
   WEASEL_IPC_RESET_CONTEXT,
+  // 无按键刷新（2026-11-23 第②段）：丢弃未确认组合段并重译，使 LLM 整句
+  // 评分的异步结果无需按键即可上屏。server 侧按 LLM 异步代次门控——代次
+  // 未变只回响应体、不重译（重译会把候选高亮打回第 1 页）。
+  WEASEL_IPC_REFRESH,
   WEASEL_IPC_LAST_COMMAND
 };
 
@@ -83,6 +87,9 @@ struct RequestHandler {
   virtual void EndMaintenance() {}
   virtual void SetOption(DWORD session_id, const std::string& opt, bool val) {}
   virtual void UpdateColorTheme(BOOL darkMode) {}
+  // 无按键刷新（2026-11-23 第②段）：server 侧按 LLM 异步代次门控，
+  // 需要时重译未确认组合段，然后照例回响应体（eat）供客户端更新界面。
+  virtual void Refresh(DWORD session_id, EatLine eat) {}
 };
 
 // 處理server端回應之物件
@@ -141,6 +148,10 @@ class Client {
   // 编辑键/窗口切换: 重置上屏历史兜底 (librime 侧清空 + 递增 reset 代次)
   // reason: 触发场景 (editkey:backspace 等, 管道 body 传递, 仅日志用)
   void ResetContext(const char* reason = "");
+  // 无按键刷新（2026-11-23 第②段）：组合期定时器调用。server 按 LLM 异步
+  // 代次门控，无新结果时只回响应体不重译。响应体由随后的 _UpdateComposition
+  // （DoEditSession → GetResponseData）解析——与翻页/高亮同款配对模式。
+  void Refresh();
   // 输入窗口获得焦点
   void FocusIn();
   // 输入窗口失去焦点

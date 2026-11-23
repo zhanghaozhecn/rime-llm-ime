@@ -4,6 +4,7 @@
 #include "rime_api.h"
 
 #include <mutex>
+#include <atomic>
 #include <chrono>
 #include <rime/common.h>
 #include <rime/composition.h>
@@ -1101,6 +1102,34 @@ static void RimeSetContextResetHookImpl(void (*hook)(void*, const char*),
 static int RimeContextResetGeneration() {
   std::lock_guard<std::mutex> lock(g_context_text_mutex);
   return g_context_reset_gen;
+}
+
+// 无按键刷新（2026-11-23 第②段）：丢弃未确认段并重译。
+// 调用链 = weasel server 的 WEASEL_IPC_REFRESH → 本函数 → Context::
+// RefreshNonConfirmedComposition → update_notifier → Engine::Compose
+// （重分段 + 重译，filters 惰性应用）→ llm_filter::Collect 重跑。
+// 与 ProcessKeyEvent 同在 server 消息线程（g_api_mutex 内），无并发问题。
+// 必须早退的两种情形：无可刷新的未确认段（已确认/空组合）= 无事可做。
+static Bool RimeRefreshCompositionImpl(RimeSessionId session_id) {
+  an<Session> session(Service::instance().GetSession(session_id));
+  if (!session)
+    return False;
+  Context* ctx = session->context();
+  if (!ctx || !ctx->IsComposing())
+    return False;
+  return ctx->RefreshNonConfirmedComposition() ? True : False;
+}
+
+// llm_filter 提供的整句结果代次槽（同一 rime.dll 内，定义在 gear/
+// llm_filter.cc 的 rime 命名空间）。librime 核心不依赖 LLM 组件，仅通过
+// 一个取槽函数读取；组件未链接/未启用时返回 nullptr → 代次恒 0。
+namespace rime {
+std::atomic<int>* g_llm_async_revision_slot();
+}
+
+static int RimeLlmAsyncRevisionImpl() {
+  std::atomic<int>* slot = rime::g_llm_async_revision_slot();
+  return slot ? slot->load(std::memory_order_relaxed) : 0;
 }
 
 static Bool RimeChangePage(RimeSessionId session_id, Bool backward) {

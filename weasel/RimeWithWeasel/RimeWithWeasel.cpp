@@ -343,6 +343,30 @@ bool RimeWithWeaselHandler::ChangePage(bool backward,
   return res;
 }
 
+void RimeWithWeaselHandler::Refresh(WeaselSessionId ipc_id, EatLine eat) {
+  RimeSessionId session_id = to_session_id(ipc_id);
+  // 无按键刷新（2026-11-23 第②段）：组合期定时器每 120ms 来一次。
+  // 门控 = LLM 异步整句结果代次——未变只回响应体（不重译，否则候选
+  // 高亮被反复打回第 1 页）。响应体必须每次都写：客户端紧随其后的
+  // DoEditSession 会解析这段缓冲，留旧内容会复活过期候选表。
+  const int rev = RimeLlmAsyncRevision();
+  const bool changed = (rev != m_last_llm_revision);
+  m_last_llm_revision = rev;
+  if (changed && !m_disabled && session_id) {
+    bool refreshed = RimeRefreshComposition(session_id) ? true : false;
+    DLOG(INFO) << "refresh composition: ipc_id = " << ipc_id
+               << ", rev = " << rev << ", refreshed = " << refreshed;
+    if (refreshed) {
+      // 重译后菜单已重建，响应体里就是新序；服务端候选窗一并重画
+      _Respond(ipc_id, eat);
+      _UpdateUI(ipc_id);
+      m_active_session = ipc_id;
+      return;
+    }
+  }
+  _Respond(ipc_id, eat);
+}
+
 void RimeWithWeaselHandler::FocusIn(DWORD client_caps, WeaselSessionId ipc_id) {
   DLOG(INFO) << "Focus in: ipc_id = " << ipc_id
              << ", client_caps = " << client_caps;

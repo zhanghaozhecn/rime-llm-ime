@@ -349,9 +349,9 @@ engine:
   $expect = @('  enabled: true', "  code_pattern: '[abcde]{4}'", '  max_tokens: 20',
               '  max_candidates: 6', '  cpu_cores: 4',
               '  sentence_mode: false', '  prefix_confirm: false',
-              '  debug_fusion: false')
+              '  ngram_group: false', '  debug_fusion: false')
   $i0 = 0; for ($i = 0; $i -lt $y.Count; $i++) { if ($y[$i] -match '^llm_rerank:') { $i0 = $i } }
-  $got = @($y[($i0 + 1)..($i0 + 8)])
+  $got = @($y[($i0 + 1)..($i0 + 9)])
   Assert "节内键序与插件版一致" (($got -join '|') -eq ($expect -join '|'))
   Assert "不再产出全局 llm_rerank.yaml" (-not (Test-Path (Join-Path $sandbox "Rime\llm_rerank.yaml")))
   Write-Host "  --- 方案 llm_rerank 节 ---"

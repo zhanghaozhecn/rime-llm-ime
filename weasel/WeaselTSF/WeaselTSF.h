@@ -208,6 +208,15 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   static VOID CALLBACK EditResetCollectProc(HWND hwnd, UINT msg,
                                             UINT_PTR idEvent, DWORD dwTime);
   com_ptr<ITfContext> m_pEditResetContext;  // 编辑键时刻的 context (保活)
+  // 无按键刷新（2026-11-23 第②段）：组合期每 120ms 一次 WEASEL_IPC_REFRESH，
+  // server 按 LLM 异步整句结果代次门控——有结果才重译，于是 LLM 选出的
+  // 首选在用户停手后自动上屏。定时器 id = this+1（与 EditResetCollectProc
+  // 的 this 区分；对象地址 8 字节对齐，+1 不会与其他对象冲突）。
+  void _EnsureRefreshTimer();
+  void _StopRefreshTimer();
+  void _OnRefreshTimer();
+  static VOID CALLBACK RefreshCompositionProc(HWND hwnd, UINT msg,
+                                              UINT_PTR idEvent, DWORD dwTime);
   std::string _Utf8FromWide(const std::wstring& wstr) const;
   std::wstring m_textBeforeCaret;
 
