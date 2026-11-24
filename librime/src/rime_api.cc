@@ -114,3 +114,6 @@ Bool RimeRefreshComposition(RimeSessionId session_id) {
 int RimeLlmAsyncRevision(void) {
   return RimeLlmAsyncRevisionImpl();
 }
+
+// 待执行的前缀确认（2026-11-23 晚修）：实现见 rime_api_impl.h
+Bool RimeLlmPendingConfirm(void) { return RimeLlmPendingConfirmImpl(); }

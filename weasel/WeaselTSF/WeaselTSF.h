@@ -210,13 +210,17 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   com_ptr<ITfContext> m_pEditResetContext;  // 编辑键时刻的 context (保活)
   // 无按键刷新（2026-11-23 第②段）：组合期每 120ms 一次 WEASEL_IPC_REFRESH，
   // server 按 LLM 异步整句结果代次门控——有结果才重译，于是 LLM 选出的
-  // 首选在用户停手后自动上屏。定时器 id = this+1（与 EditResetCollectProc
-  // 的 this 区分；对象地址 8 字节对齐，+1 不会与其他对象冲突）。
+  // 首选在用户停手后自动上屏。
+  // 2026-11-23 深夜修：线程定时器（SetTimer(NULL) + TIMERPROC）在本机 TSF
+  // 线程上**不派发** WM_TIMER（SetTimer 成功、回调永不触发，实测见
+  // %TEMP%\weasel_tsf_timer.log）——改为隐藏窗口 + 窗口定时器：WM_TIMER 走
+  // 窗口过程，随应用自身的 DispatchMessage 派发。
   void _EnsureRefreshTimer();
   void _StopRefreshTimer();
   void _OnRefreshTimer();
-  static VOID CALLBACK RefreshCompositionProc(HWND hwnd, UINT msg,
-                                              UINT_PTR idEvent, DWORD dwTime);
+  static LRESULT CALLBACK RefreshTimerWndProc(HWND hwnd, UINT msg,
+                                              WPARAM wParam, LPARAM lParam);
+  HWND m_hRefreshWnd = nullptr;
   std::string _Utf8FromWide(const std::wstring& wstr) const;
   std::wstring m_textBeforeCaret;
 

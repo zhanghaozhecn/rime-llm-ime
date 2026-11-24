@@ -13,6 +13,11 @@
 
 namespace rime {
 
+// llm_filter 提供的"是否有挂起的前缀确认"查询（定义在 gear/llm_filter.cc，
+// 同一 rime.dll 内）。核心不依赖 LLM 组件，仅经此自由函数读取；未链接时
+// 由 gear 侧恒返回 false。
+bool g_llm_pending_confirm_query();
+
 const string kSelectedBeforeEditing = "selected_before_editing";
 
 bool Context::Commit() {
@@ -258,11 +263,15 @@ bool Context::ClearNonConfirmedComposition() {
 }
 
 bool Context::RefreshNonConfirmedComposition() {
-  if (ClearNonConfirmedComposition()) {
+  // 2026-11-24：前缀软确认只在刷新路径（update_notifier → llm_filter）里执行，
+  // 挂起的确认需要一次执行机会；但**不能无条件通知**——没有待确认时也每次
+  // 重译会带来"刷新→重译→Collect→再刷新"的持续负载（真机 2026-11-24 在
+  // 短码 yo 上卡死，须杀服务）。条件 = 真的丢弃了未确认段 **或** 有待确认。
+  // 返回值仍只表示是否真的丢弃了未确认段（调用方据此决定是否重画 UI）。
+  const bool cleared = ClearNonConfirmedComposition();
+  if (cleared || g_llm_pending_confirm_query())
     update_notifier_(this);
-    return true;
-  }
-  return false;
+  return cleared;
 }
 
 void Context::set_caret_pos(size_t caret_pos) {

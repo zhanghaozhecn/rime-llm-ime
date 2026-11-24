@@ -1110,6 +1110,23 @@ static int RimeContextResetGeneration() {
 // （重分段 + 重译，filters 惰性应用）→ llm_filter::Collect 重跑。
 // 与 ProcessKeyEvent 同在 server 消息线程（g_api_mutex 内），无并发问题。
 // 必须早退的两种情形：无可刷新的未确认段（已确认/空组合）= 无事可做。
+namespace rime {
+std::atomic<int>* g_llm_refresh_depth_slot();  // 定义在 gear/llm_filter.cc
+}
+
+// 深度守卫（2026-11-24）：刷新路径中任何异常都必须把深度还原——若泄漏成
+// "恒 >0"，前缀软确认会在 PushInput 的 notifier 里执行 ctx->Select，正是
+// 让该键异常无响应/TSF 卡死的路径。
+struct RimeRefreshDepthGuard {
+  std::atomic<int>* d;
+  explicit RimeRefreshDepthGuard(std::atomic<int>* slot) : d(slot) {
+    if (d) d->fetch_add(1, std::memory_order_relaxed);
+  }
+  ~RimeRefreshDepthGuard() {
+    if (d) d->fetch_sub(1, std::memory_order_relaxed);
+  }
+};
+
 static Bool RimeRefreshCompositionImpl(RimeSessionId session_id) {
   an<Session> session(Service::instance().GetSession(session_id));
   if (!session)
@@ -1117,7 +1134,11 @@ static Bool RimeRefreshCompositionImpl(RimeSessionId session_id) {
   Context* ctx = session->context();
   if (!ctx || !ctx->IsComposing())
     return False;
-  return ctx->RefreshNonConfirmedComposition() ? True : False;
+  // 刷新重入深度（2026-11-23 晚修）：前缀软确认的 ctx->Select 只允许在
+  // 刷新路径执行（PushInput 的 notifier 里改组合区会让该键异常无响应）。
+  RimeRefreshDepthGuard guard(rime::g_llm_refresh_depth_slot());
+  const bool ok = ctx->RefreshNonConfirmedComposition() ? true : false;
+  return ok ? True : False;
 }
 
 // llm_filter 提供的整句结果代次槽（同一 rime.dll 内，定义在 gear/
@@ -1125,11 +1146,19 @@ static Bool RimeRefreshCompositionImpl(RimeSessionId session_id) {
 // 一个取槽函数读取；组件未链接/未启用时返回 nullptr → 代次恒 0。
 namespace rime {
 std::atomic<int>* g_llm_async_revision_slot();
+std::atomic<int>* g_llm_refresh_depth_slot();
+bool g_llm_pending_confirm_query();
 }
 
 static int RimeLlmAsyncRevisionImpl() {
   std::atomic<int>* slot = rime::g_llm_async_revision_slot();
   return slot ? slot->load(std::memory_order_relaxed) : 0;
+}
+
+// 待执行的前缀确认（2026-11-23 晚修）：weasel 侧 Refresh 在代次未变时据此
+// 放行一次重译——否则挂起的确认要等下一个 LLM 结果落地才生效。
+static Bool RimeLlmPendingConfirmImpl() {
+  return rime::g_llm_pending_confirm_query() ? True : False;
 }
 
 static Bool RimeChangePage(RimeSessionId session_id, Bool backward) {

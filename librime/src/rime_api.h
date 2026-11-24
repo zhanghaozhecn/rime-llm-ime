@@ -556,6 +556,12 @@ RIME_API Bool RimeRefreshComposition(RimeSessionId session_id);
 //! 0 = 从未有结果（方案未启用 llm_filter / 未开启组句候选）。
 RIME_API int RimeLlmAsyncRevision(void);
 
+//! 是否有待执行的前缀确认（2026-11-23 晚修）：llm_filter 判定通过后挂起
+//! 一个前缀确认，由刷新路径执行（PushInput 的 notifier 里执行会让该键
+//! 异常无响应）。前端刷新轮询在代次未变时也据此放行一次重译，否则挂起
+//! 的确认要等下一个 LLM 结果落地才生效。
+RIME_API Bool RimeLlmPendingConfirm(void);
+
 //! API entry
 /*!
  *  Acquire the version controlled RimeApi structure.

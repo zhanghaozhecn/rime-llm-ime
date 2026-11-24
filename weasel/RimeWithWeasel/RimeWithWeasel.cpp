@@ -349,8 +349,11 @@ void RimeWithWeaselHandler::Refresh(WeaselSessionId ipc_id, EatLine eat) {
   // 门控 = LLM 异步整句结果代次——未变只回响应体（不重译，否则候选
   // 高亮被反复打回第 1 页）。响应体必须每次都写：客户端紧随其后的
   // DoEditSession 会解析这段缓冲，留旧内容会复活过期候选表。
+  // 2026-11-23 晚修：有挂起的前缀确认时也放行一次重译——确认只能在刷新
+  // 路径执行（按键路径执行会让该键异常无响应），代次未变时若不重译，
+  // 确认要等下一个 LLM 结果落地才生效。
   const int rev = RimeLlmAsyncRevision();
-  const bool changed = (rev != m_last_llm_revision);
+  const bool changed = (rev != m_last_llm_revision) || RimeLlmPendingConfirm();
   m_last_llm_revision = rev;
   if (changed && !m_disabled && session_id) {
     bool refreshed = RimeRefreshComposition(session_id) ? true : false;

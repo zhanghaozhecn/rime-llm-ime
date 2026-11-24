@@ -3,6 +3,9 @@
 #include <WeaselIPCData.h>
 #include <thread>
 #include <vector>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include "WeaselTSF.h"
@@ -41,6 +44,10 @@ WeaselTSF::WeaselTSF() {
 }
 
 WeaselTSF::~WeaselTSF() {
+  if (m_hRefreshWnd) {
+    DestroyWindow(m_hRefreshWnd);
+    m_hRefreshWnd = nullptr;
+  }
   DllRelease();
 }
 
@@ -469,33 +476,93 @@ VOID CALLBACK WeaselTSF::EditResetCollectProc(HWND, UINT, UINT_PTR idEvent,
 // 用户停手后 ~120ms 轮询发现结果、候选窗与首选自动更新。
 // SetTimer(NULL) 的消息由本线程（TSF apartment）消息循环派发，TimerProc
 // 天然回到正确线程（与 EditResetCollectProc 同一套线程安全前提）。
-static const UINT_PTR kRefreshTimerOffset = 1;
+// 2026-11-23 深夜修：实测**线程定时器在本机 TSF 线程上不派发 WM_TIMER**
+//（SetTimer 成功 ret≠0、err=0，回调永不触发 → 停手后永不发 REFRESH，真机
+// 表现为"LLM 结果不上屏/前缀不确认"）。改用**隐藏消息窗口 + 窗口定时器**：
+// WM_TIMER 投给该窗口，随应用自身的 DispatchMessage 派发（与普通窗口消息
+// 同一路径，可靠性由应用消息循环保证，不再依赖线程定时器语义）。
+static const wchar_t kRefreshWndClass[] = L"WeaselRefreshTimerWnd";
+static const UINT_PTR kRefreshTimerId = 1;
+
+// 诊断（2026-11-23 深夜，排查"定时器不发 REFRESH"）：仅在
+// WEASEL_TSF_DBG=1 时写（每个进程最多 40 行），生产默认零开销。
+static void tsf_timer_log(const char* fmt, ...) {
+  static const bool enabled = getenv("WEASEL_TSF_DBG") != nullptr;
+  static int n = 0;
+  if (!enabled || n >= 40)
+    return;
+  ++n;
+  char msg[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  char path[MAX_PATH] = {0};
+  if (!GetTempPathA(MAX_PATH, path))
+    return;
+  strcat_s(path, "weasel_tsf_timer.log");
+  if (FILE* f = nullptr; fopen_s(&f, path, "ab") == 0 && f) {
+    fprintf(f, "tid=%lu %s\n", (unsigned long)GetCurrentThreadId(), msg);
+    fclose(f);
+  }
+}
+
+LRESULT CALLBACK WeaselTSF::RefreshTimerWndProc(HWND hwnd, UINT msg,
+                                                WPARAM wParam, LPARAM lParam) {
+  if (msg == WM_NCCREATE) {
+    auto cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+  } else if (msg == WM_TIMER && wParam == kRefreshTimerId) {
+    WeaselTSF* ts =
+        reinterpret_cast<WeaselTSF*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (ts)
+      ts->_OnRefreshTimer();
+    return 0;
+  }
+  return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
 
 void WeaselTSF::_EnsureRefreshTimer() {
-  SetTimer(nullptr, (UINT_PTR)this + kRefreshTimerOffset, 120,
-           WeaselTSF::RefreshCompositionProc);
+  if (!m_hRefreshWnd) {
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = &WeaselTSF::RefreshTimerWndProc;
+    wc.hInstance = g_hInst;
+    wc.lpszClassName = kRefreshWndClass;
+    RegisterClassExW(&wc);  // 已注册时失败无害（类已存在）
+    m_hRefreshWnd =
+        CreateWindowExW(0, kRefreshWndClass, L"", 0, 0, 0, 0, 0,
+                        HWND_MESSAGE, nullptr, g_hInst, this);
+    tsf_timer_log("wnd hwnd=%p err=%lu", (void*)m_hRefreshWnd,
+                  (unsigned long)GetLastError());
+  }
+  if (m_hRefreshWnd) {
+    SetTimer(m_hRefreshWnd, kRefreshTimerId, 120, nullptr);
+    tsf_timer_log("ensure hwnd=%p composing=%d ctx=%p",
+                  (void*)m_hRefreshWnd, (int)_IsComposing(),
+                  (void*)_pEditSessionContext.p);
+  }
 }
 
 void WeaselTSF::_StopRefreshTimer() {
-  KillTimer(nullptr, (UINT_PTR)this + kRefreshTimerOffset);
+  if (m_hRefreshWnd)
+    KillTimer(m_hRefreshWnd, kRefreshTimerId);
+  tsf_timer_log("stop hwnd=%p", (void*)m_hRefreshWnd);
 }
 
 void WeaselTSF::_OnRefreshTimer() {
   // 组合结束/中止后无可刷新对象：停表，下次按键由 _EnsureRefreshTimer 重挂
   if (!_IsComposing() || !_pEditSessionContext) {
+    tsf_timer_log("tick SKIP composing=%d ctx=%p", (int)_IsComposing(),
+                  (void*)_pEditSessionContext.p);
     _StopRefreshTimer();
     return;
   }
+  tsf_timer_log("tick send REFRESH");
   m_client.Refresh();
   // 响应体已由 Transact 读入线程缓冲，这里走常规编辑会话解析并更新界面
   //（与翻页/高亮同款配对：请求 → _UpdateComposition）
   _UpdateComposition(_pEditSessionContext);
-}
-
-VOID CALLBACK WeaselTSF::RefreshCompositionProc(HWND, UINT, UINT_PTR idEvent,
-                                                DWORD) {
-  WeaselTSF* ts = reinterpret_cast<WeaselTSF*>(idEvent - kRefreshTimerOffset);
-  ts->_OnRefreshTimer();
 }
 
 void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate,
