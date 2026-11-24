@@ -34,6 +34,7 @@
 //                                                    修正分无专属列（2026-11-21
 //                                                    v7：命中时折进 CE 格）
 //   S|HH:MM:SS|reason|input|src                     跳过原因
+//                                                   （freq_only = 无上文，非跳过）
 //   E|HH:MM:SS|word|eff0|eff1|tick0|tick1           commit 落账
 //   R|HH:MM:SS|reason                               上文重置
 //
@@ -649,9 +650,17 @@ static void handle_line(const std::string &line) {
   }
   wchar_t tmp[512];
   if (f[0] == "S" && f.size() >= 3) {
-    swprintf(tmp, 512, L"%s 跳过 %s（输入 %s 来源 %s）", u8w(f[1]).c_str(),
-             u8w(f[2]).c_str(), f.size() > 3 ? u8w(f[3]).c_str() : L"",
-             f.size() > 4 ? u8w(f[4]).c_str() : L"-");
+    // 无上文（2026-11-24）：freq_only 不是"跳过"——本窗照常融合/前缀确认，
+    // 只是不含 CE。用中性措辞，避免被读成"没触发重排"。
+    if (u8w(f[2]) == L"freq_only") {
+      swprintf(tmp, 512, L"%s 无上文：按词频融合（无 CE）（输入 %s 来源 %s）",
+               u8w(f[1]).c_str(), f.size() > 3 ? u8w(f[3]).c_str() : L"",
+               f.size() > 4 ? u8w(f[4]).c_str() : L"-");
+    } else {
+      swprintf(tmp, 512, L"%s 跳过 %s（输入 %s 来源 %s）", u8w(f[1]).c_str(),
+               u8w(f[2]).c_str(), f.size() > 3 ? u8w(f[3]).c_str() : L"",
+               f.size() > 4 ? u8w(f[4]).c_str() : L"-");
+    }
     stream_add(false, tmp, 0);
     return;
   }

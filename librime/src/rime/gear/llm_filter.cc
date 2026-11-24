@@ -3375,7 +3375,8 @@ static void async_write_pending(const AsyncPending &pend,
     if (s > -1e9)
       fused[i] = s + s1 + pf;
     else  // 无 CE 分（哨兵/缺失）：层1 分 + 窗内最低 LLM 分（压制窗底）
-      fused[i] = s1 + (have_min ? min_valid : 0.0) + pf;
+          // ——不叠词码对修正（2026-11-24：pairfix 只修 CE 系统性偏差）
+      fused[i] = s1 + (have_min ? min_valid : 0.0);
   }
   std::stable_sort(ord.begin(), ord.end(), [&fused](size_t a, size_t b) {
     return fused[a] > fused[b];  // stable = 同分保提交序（层1 序）
@@ -3400,7 +3401,8 @@ static void async_write_pending(const AsyncPending &pend,
     const std::string &t = pend.window_vec[i];
     double eff = user_freq_eff(t, pend.code);
     double u1 = user_unigram_term(t, pend.code);
-    double pf = pf_on ? pairfix_delta(pf_tbl, t, pend.code) : 0.0;
+    double pf = (pf_on && ce > -1e9)
+                    ? pairfix_delta(pf_tbl, t, pend.code) : 0.0;
     debug_write_d(pend.wid, (int)r + 1, ce, c3[0], c3[1], c3[2], eff,
                   g_freq_beta * std::log(1.0 + eff), u1, 1, fused[i], pf,
                   (int)i + 1, (int)r + 1);
@@ -3784,6 +3786,13 @@ void LlmRerankTranslation::Collect() {
   std::string wstatus = "ok";
   std::string wskip;
   bool prep_hit = false;  // 上文 KV 预解码命中（调试 L 行"预解"列）
+  // 无上文（2026-11-24 用户定案）：CE 不可算，但整句模式下前缀确认照常
+  // ——融合分按剩余项（β·log1p(eff) + log(uni+1) + 词码对修正）计算。
+  // Apply 已保证：只有整句模式 + 前缀确认 + 组句都开且 code≥4 码时才放行
+  // 到这里的空 ctx；ctx 里已含组合区已确认前缀（上一条 phrase 就是"临时
+  // 上文"，确认后 ctx 非空、自动回到完整 CE 融合）。函数级作用域（末尾
+  // W flags 写 nofreq 要用）。
+  bool freq_only = false;
 
   // 异步基建收割点（2026-11-22）：每次 Collect 先收割最近完成的异步评分
   //（回填缓存 + 挂账补写）——同指纹重复 query（翻页/候选窗重建）即命中
@@ -3865,6 +3874,7 @@ void LlmRerankTranslation::Collect() {
     // rerank with LLM (ctx_ computed by LlmFilter::Apply: TSF context
     // text, or commit history fallback when TSF is unavailable)
     std::string ctx = normalize_ctx(ctx_);
+    freq_only = ctx.empty();
 
     // reset 代次（编辑键/切窗）：只用于调试事件（插件版由 processor 在编辑键
     // 回调记 reset 行；源码版无 lua 层，在下次 Collect 见到代次变化时补记，
@@ -3901,7 +3911,15 @@ void LlmRerankTranslation::Collect() {
       // 上文 token 数检查（与同步版同语义，skip 原因语料兼容）：不足即
       // ctx_short 跳过，不投递异步任务
       std::vector<llama_token> ctx_probe = tokenize(ctx.c_str());
-      if ((int)ctx_probe.size() >= g_min_tokens) {
+      if (freq_only) {
+        // 无上文：CE 不可算 → 融合只剩词频剩余项（β·log1p(eff) +
+        // log(uni+1) + 词码对修正）。order 先置层1 序（identity），下方
+        // 融合块按 fused 重排；W 记 flags=nofreq（status=ok）。
+        order.resize(candidates_.size());
+        for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;
+        live_send(std::string("S|") + now_hms() + "|freq_only|" +
+                  live_esc(input_) + "|" + src_);
+      } else if ((int)ctx_probe.size() >= g_min_tokens) {
         // ═══ 评分三路径（2026-11-22 异步基建）═══
         // 指纹 = 归一化上文 \x1f 候选 \x1e 拼接（2026-11-23 再追加子词
         // 清单 \x1d——复用分与候选集同快照；与插件版同构；上下文/候选变化
@@ -4085,8 +4103,11 @@ void LlmRerankTranslation::Collect() {
           double s1v = i < s1_head.size() ? s1_head[i] : -1e308;
           t = s1v + (min_valid < 1e308 ? min_valid : 0.0);
         }
-        // 词码对分数修正（有符号；正分不受 fade，负分保留 fade）
-        if (pf_on) {
+        // 词码对分数修正（有符号；正分不受 fade，负分保留 fade）。
+        // **只对已算 CE 的候选生效**（2026-11-24 用户定案）：pairfix 修的是
+        // CE 的系统性偏差，无 CE 分（评分失败/无上文 freq_only）时无从修，
+        // 加了反而凭空改词频序。
+        if (pf_on && has_score[i]) {
           double d = pairfix_delta(pf_tbl, candidates_[i]->text(), input_);
           if (d != 0.0)
             t += d;
@@ -4200,16 +4221,21 @@ void LlmRerankTranslation::Collect() {
     if (g_debug_fusion && !order.empty()) {
       for (size_t k = 0; k < order.size(); k++) {
         int i = order[k];
-        double eff = has_score[i]
+        // 无上文（freq_only）时融合不含 CE、只含词频剩余项 → 也要显示真实
+        // eff/fb/u1（2026-11-24：旧代码 !has_score 一律写 0，验算对不上）
+        const bool has_terms = has_score[i] || freq_only;
+        double eff = has_terms
                          ? user_freq_eff(candidates_[i]->text(), input_)
                          : 0;
-        double fb = has_score[i] ? g_freq_beta * std::log1p(eff) : 0;
-        double u1 = has_score[i]
+        double fb = has_terms ? g_freq_beta * std::log1p(eff) : 0;
+        double u1 = has_terms
                         ? user_unigram_term(candidates_[i]->text(), input_)
                         : 0;
-        double sdelta = pf_on ? pairfix_delta(pf_tbl,
-                                              candidates_[i]->text(), input_)
-                              : 0.0;
+        // 词码对修正只随 CE 分生效（无 CE 时融合里没有它，行尾也写 0）
+        double sdelta = (pf_on && has_score[i])
+                            ? pairfix_delta(pf_tbl,
+                                            candidates_[i]->text(), input_)
+                            : 0.0;
         double ce = has_score[i] ? score_of[i] : -1e308;
         double ce1 = -1e308, ce2 = -1e308, ce3v = -1e308;
         if (has_score[i] && i < (int)ce3_of.size()) {
@@ -4364,7 +4390,7 @@ void LlmRerankTranslation::Collect() {
   if (!w_written) {
     write_w(wid, src_, input_, wctx, engine_vec, window_vec,
             texts_of(candidates_, 20), g_user_tick, wstatus, wskip, prep_hit,
-            "");
+            freq_only ? "nofreq" : "");
     w_written = true;
   }
 }
@@ -5094,13 +5120,23 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
     if (!conf.empty()) ctx += conf;
   }
   if (ctx.empty()) {
-    // 常开语料：满码但无上文的 skip 事件（W 行，status=skip）
-    std::string wid = new_event_id("W", g_user_tick);
-    write_w(wid, src, code, "", {}, {}, {}, g_user_tick, "skip", "ctx_empty",
-            false, "");
-    live_send(std::string("S|") + now_hms() + "|ctx_empty|" +
-              live_esc(code) + "|" + src);
-    return translation;  // no context, keep original order
+    // 无上文（2026-11-24 用户定案）：CE 不可算，但整句模式下前缀确认仍要跑
+    // ——融合分按剩余项（β·log1p(eff) + log(uni+1) + 词码对修正）计算，
+    // 组句 lead 仍与窗口融合序第 1 比较（Collect 内 freq_only 分支）。
+    // 组合区已确认前缀已在上面追加进 ctx：确认过 1 个 phrase 后 ctx 非空，
+    // 下一键自动回到完整 CE 融合（"选一次 phrase 就有了临时上文"）。
+    // 其余开关组合保持旧行为（skip ctx_empty）。
+    const bool freq_only_ok = g_sentence_mode && g_prefix_confirm &&
+                              g_ngram_group && code.size() >= 4;
+    if (!freq_only_ok) {
+      // 常开语料：满码但无上文的 skip 事件（W 行，status=skip）
+      std::string wid = new_event_id("W", g_user_tick);
+      write_w(wid, src, code, "", {}, {}, {}, g_user_tick, "skip", "ctx_empty",
+              false, "");
+      live_send(std::string("S|") + now_hms() + "|ctx_empty|" +
+                live_esc(code) + "|" + src);
+      return translation;  // no context, keep original order
+    }
   }
 
   if (!g_loaded.load()) {

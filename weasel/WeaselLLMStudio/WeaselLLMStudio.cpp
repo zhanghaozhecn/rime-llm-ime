@@ -72,6 +72,7 @@ static int g_cfg_y = 0;   // 左列 y 起点（ts(8)，顶对齐）
 #define IDC_BENCH        1017   // 实测线程数（2026-10-01 用户定案：与插件版同位置）
 #define IDC_TCS          1021   // 整句模式（2026-11-22 泛化自两码整句 two_code_sentence）
 #define IDC_PREFIX       1022   // 前缀自动确认（2026-11-23；只在整句模式勾选时显示/生效）
+#define IDC_NGRAM        1025   // N-gram 组句候选（2026-11-24；只在整句模式勾选时显示/生效）
 #define IDC_DEBUG        1023
 #define IDC_MAX_CAND     1024
 // 方案接入（2026-09-29 GUI 化，语义同 installer\schema_add.ps1）
@@ -99,8 +100,7 @@ struct Params {
                                    // 前缀 → 下一键自动选入组合区）
   bool has_prefix_confirm = false; // 方案节里出现过该键
   // N-gram 组句候选（2026-11-23 第②段）：只在整句模式 + 方案输出简体时
-  // 生效。**本版无复选框**——只做读写透传：解析保留、保存按原值写回，
-  // 避免 GUI 保存把手工加进方案的键静默抹掉（勾选框随 P3 一起做）。
+  // 生效；2026-11-24 起有复选框（勾选/保存时检测万象资产并给安装提示）。
   bool ngram_group = false;
   bool has_ngram_group = false;
   // freq_beta 已删（2026-11-05 标定产物退出用户配置面 → β=12 内置常数，两版统一；
@@ -118,6 +118,8 @@ static bool g_sel_guard = false;
 static HWND g_hwnd;
 static HWND g_prefix_cb = NULL;    // 前缀自动确认复选框（2026-11-23；只在
 static HWND g_prefix_help = NULL;  // 整句模式勾选时显示，含同行「?」徽标）
+static HWND g_ngram_cb = NULL;     // N-gram 组句候选复选框（2026-11-24；同上）
+static HWND g_ngram_help = NULL;
 static HFONT g_font;
 static HFONT g_font_hint;  // 灰色小字（状态副行 / 底部动态注）
 static HFONT g_font_help;  // 「?」徽标里的问号（小号加粗）
@@ -396,6 +398,87 @@ static bool file_size(const std::wstring& p, unsigned long long* sz) {
     return false;
   *sz = ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
   return true;
+}
+
+// ── N-gram 组句资产检测（2026-11-24 用户定案：开关/保存时检测并提示安装）──
+// 与运行期 ngram_ensure 同口径：gram 完整（约 391MB）+ dicts 六个词库齐；
+// env RIME_LLM_NGRAM_PATH / RIME_LLM_NGRAM_DICT 可覆盖（与运行期一致）。
+// 测试钩子 LLM_INSTALLER_FAKE_NGRAM_FILE：文件内容 "ok" = 齐；其它非空 =
+// 缺失原因原文（沙箱测试准备不了 391MB 真资产，提示分支需要确定性）。
+// 真实检测（不看测试钩子）：下载完成后的校验必须用这一份。
+static bool ngram_assets_state_real(std::wstring* why) {
+  std::wstring base = rime_user_dir();
+  const wchar_t* gp = _wgetenv(L"RIME_LLM_NGRAM_PATH");
+  const wchar_t* dp = _wgetenv(L"RIME_LLM_NGRAM_DICT");
+  std::wstring gram = (gp && *gp)
+                          ? gp
+                          : (base + L"\\llm_ngram\\wanxiang-lts-zh-hans.gram");
+  std::wstring ddir = (dp && *dp) ? dp : (base + L"\\llm_ngram\\dicts");
+  unsigned long long sz = 0;
+  if (!file_size(gram, &sz)) {
+    if (why) *why = L"缺少组句模型：" + gram + L"（约 391 MB）";
+    return false;
+  }
+  if (sz < 300000000ULL) {
+    wchar_t mb[32];
+    swprintf_s(mb, L"%llu", sz / 1000000ULL);
+    if (why)
+      *why = std::wstring(L"组句模型不完整（") + mb +
+             L" MB，应为约 391 MB）：" + gram;
+    return false;
+  }
+  const wchar_t* names[] = {L"zi",   L"jichu",  L"duoyin",
+                            L"diming", L"mingren", L"yiren"};
+  int have = 0;
+  std::wstring miss;
+  for (const wchar_t* n : names) {
+    unsigned long long s2 = 0;
+    if (file_size(ddir + L"\\" + n + L".dict.yaml", &s2)) {
+      have++;
+    } else {
+      if (!miss.empty()) miss += L", ";
+      miss += n;
+      miss += L".dict.yaml";
+    }
+  }
+  if (have < 6) {
+    wchar_t cnt[16];
+    swprintf_s(cnt, L"%d", have);
+    if (why)
+      *why = std::wstring(L"缺少词库（") + cnt + L"/6）：" + ddir + L"\\" + miss;
+    return false;
+  }
+  return true;
+}
+
+// 检测入口（带测试钩子）：LLM_INSTALLER_FAKE_NGRAM_FILE 内容 "ok" = 齐；
+// 其它非空 = 缺失原因原文。生产不设该变量 → 走真实检测。
+static bool ngram_assets_state(std::wstring* why) {
+  const wchar_t* ff = _wgetenv(L"LLM_INSTALLER_FAKE_NGRAM_FILE");
+  if (ff && *ff) {
+    FILE* f = _wfopen(ff, L"rb");
+    if (f) {
+      std::string s;
+      char buf[1024];
+      size_t n;
+      while ((n = fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
+      fclose(f);
+      s = trim(s);
+      if (s == "ok") return true;
+      if (!s.empty()) {
+        if (why) *why = utf8_to_wide(s);
+        return false;
+      }
+    }
+  }
+  return ngram_assets_state_real(why);
+}
+static std::wstring ngram_prompt(const std::wstring& why,
+                                 const std::wstring& tail) {
+  return why +
+         L"\n\n缺失时 N-gram 组句会自动关闭（60 秒后重试），不影响其它功能。\n"
+         L"可自动下载安装（万象 LTS 语言模型 + 词库），或把上面两项手动放到该目录。\n\n" +
+         tail;
 }
 
 static void set_status(HWND ctrl, const wchar_t* fmt, ...) {
@@ -1052,6 +1135,20 @@ static void save_schema_params() {
       }
     }
   }
+  // N-gram 组句（2026-11-24）：开启但万象资产缺失 → 保存前确认（同模型口径，
+  // 避免"勾了但没生效"静默）。开关时的提示在 on_ngram_toggle。
+  if (g_p.sentence_mode && g_p.ngram_group) {
+    std::wstring ngwhy;
+    if (!ngram_assets_state(&ngwhy)) {
+      std::wstring q = ngram_prompt(ngwhy, L"仍要保存吗？");
+      if (MessageBoxW(g_hwnd, q.c_str(), L"N-gram 组句资产未就绪",
+                      MB_YESNO | MB_ICONWARNING) != IDYES) {
+        set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+                   L"已取消保存——先安装万象 N-gram 组句资产（模型 + 词库），再保存");
+        return;
+      }
+    }
+  }
   wchar_t why[128] = L"";
   bool need_rebuild = schema_needs_rebuild(lines, why);
   if (need_rebuild) {
@@ -1168,6 +1265,46 @@ static void apply_prefix_visibility(bool sentence_on) {
     ShowWindow(g_prefix_help, sentence_on ? SW_SHOW : SW_HIDE);
 }
 
+// N-gram 组句候选显隐（2026-11-24）：同前缀确认（只在整句模式勾选时显示，
+// 关整句模式顺带取消勾选、行位保留）。
+static void apply_ngram_visibility(bool sentence_on) {
+  if (g_ngram_cb) {
+    ShowWindow(g_ngram_cb, sentence_on ? SW_SHOW : SW_HIDE);
+    if (!sentence_on)
+      SendMessageW(g_ngram_cb, BM_SETCHECK, BST_UNCHECKED, 0);
+  }
+  if (g_ngram_help)
+    ShowWindow(g_ngram_help, sentence_on ? SW_SHOW : SW_HIDE);
+}
+
+static void start_ngram_download();   // 定义在下载区（g_dl_* 之后）
+static bool dl_busy();
+
+// 勾选 N-gram 组句时检测万象资产（2026-11-24 用户定案）：缺失 → 询问是否
+// 现在下载安装；**开关先回关**，只有下载/解压/校验全部成功才显示为开
+// （成功分支在 download_finish 的 DL_JOB_UNZIP 收尾里）。
+static void on_ngram_toggle() {
+  if (SendMessageW(GetDlgItem(g_hwnd, IDC_NGRAM), BM_GETCHECK, 0, 0) !=
+      BST_CHECKED)
+    return;
+  std::wstring why;
+  if (ngram_assets_state(&why)) return;   // 已就绪
+  std::wstring q = ngram_prompt(
+      why, L"是否现在下载安装（约 421 MB，来源 GitHub）？下载成功后开关才会显示为开。");
+  int ans = MessageBoxW(g_hwnd, q.c_str(), L"N-gram 组句资产未就绪",
+                        MB_YESNO | MB_ICONQUESTION);
+  // 无论选是选否，开关先回关（只有安装成功才显示开）
+  SendMessageW(GetDlgItem(g_hwnd, IDC_NGRAM), BM_SETCHECK, BST_UNCHECKED, 0);
+  if (ans != IDYES) return;
+  if (dl_busy()) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"已有下载在进行中，请等它完成后再装 N-gram 资产");
+    return;
+  }
+  EnableWindow(GetDlgItem(g_hwnd, IDC_NGRAM), FALSE);
+  start_ngram_download();
+}
+
 static void on_sent_toggle() {
   HWND pat = GetDlgItem(g_hwnd, IDC_CODE_PAT);
   if (SendMessageW(GetDlgItem(g_hwnd, IDC_TCS), BM_GETCHECK, 0, 0) == BST_CHECKED) {
@@ -1177,12 +1314,14 @@ static void on_sent_toggle() {
     SetDlgItemTextW(g_hwnd, IDC_CODE_PAT, L".{2,}");
     EnableWindow(pat, FALSE);
     apply_prefix_visibility(true);
+    apply_ngram_visibility(true);
   } else {
     EnableWindow(pat, TRUE);
     if (!g_pat_before_sent.empty())
       SetDlgItemTextW(g_hwnd, IDC_CODE_PAT, g_pat_before_sent.c_str());
     g_pat_before_sent.clear();
     apply_prefix_visibility(false);
+    apply_ngram_visibility(false);
   }
 }
 
@@ -1218,6 +1357,11 @@ static void ui_to_params() {
       g_p.sentence_mode &&
       SendMessageW(GetDlgItem(g_hwnd, IDC_PREFIX), BM_GETCHECK, 0, 0) ==
           BST_CHECKED;
+  // N-gram 组句候选（2026-11-24）：同样只在整句模式开启时落 true
+  g_p.ngram_group =
+      g_p.sentence_mode &&
+      SendMessageW(GetDlgItem(g_hwnd, IDC_NGRAM), BM_GETCHECK, 0, 0) ==
+          BST_CHECKED;
   GetDlgItemTextW(g_hwnd, IDC_MODEL, buf, 512);
   std::wstring def = default_model_path();
   g_p.model_path = (wcscmp(buf, def.c_str()) == 0) ? std::wstring() : buf;
@@ -1232,6 +1376,7 @@ static std::wstring ui_signature() {
   s += SendMessageW(GetDlgItem(g_hwnd, IDC_ENABLED), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
   s += SendMessageW(GetDlgItem(g_hwnd, IDC_TCS), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
   s += SendMessageW(GetDlgItem(g_hwnd, IDC_PREFIX), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
+  s += SendMessageW(GetDlgItem(g_hwnd, IDC_NGRAM), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
   s += SendMessageW(GetDlgItem(g_hwnd, IDC_DEBUG), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
   const int ids[] = {IDC_MODEL,   IDC_CODE_PAT, IDC_MAX_TOK, IDC_MAX_CAND,
                      IDC_CORES};
@@ -1273,6 +1418,10 @@ static void params_to_ui() {
   SendMessageW(GetDlgItem(g_hwnd, IDC_PREFIX), BM_SETCHECK,
                g_p.prefix_confirm ? BST_CHECKED : BST_UNCHECKED, 0);
   apply_prefix_visibility(g_p.sentence_mode);
+  // N-gram 组句候选（2026-11-24）：同款显隐
+  SendMessageW(GetDlgItem(g_hwnd, IDC_NGRAM), BM_SETCHECK,
+               g_p.ngram_group ? BST_CHECKED : BST_UNCHECKED, 0);
+  apply_ngram_visibility(g_p.sentence_mode);
   scan_models(GetDlgItem(g_hwnd, IDC_MODEL));
   refresh_model_status();
   g_ui_sig = ui_signature();   // 脏标记基准（打开下拉是否重读当前文件）
@@ -1413,10 +1562,17 @@ static const wchar_t* const TIP_TCS =
     L"开启后编码匹配固定为 .{2,}（2 码起参与重排，输入框锁定）。\n"
     L"取代 two_code_sentence 两码整句（2026-11-22）。";
 static const wchar_t* const TIP_PREFIX =
-    L"前缀自动确认 prefix_confirm（实验，默认关闭；只在整句模式开启时显示）。\n"
-    L"开启后：子词首选满足「多字词 + 只覆盖编码前缀 + 与次选分差 ≥ 1.0」\n"
-    L"时，下一次按键自动把它选入组合区（截段重译剩余码，不上屏），\n"
-    L"用户只需选择没把握的词；误确认按退格即可回退。";
+    L"前缀自动确认 prefix_confirm（默认关闭；只在整句模式开启时显示）。\n"
+    L"开启后：组句 top-20 的前导词概率 ≥0.95、且该词就是窗口融合序第 1 名\n"
+    L"（span/文本一致；确认后剩余 ≥2 音节，单字前导词例外 ≥1）时，\n"
+    L"下一次按键/刷新自动把它选入组合区（截段重译剩余码，不上屏）；\n"
+    L"误确认按退格即可回退。无上文时按词频序判同一条规则。";
+static const wchar_t* const TIP_NGRAM =
+    L"N-gram 组句候选 ngram_group（默认关闭；只在整句模式开启、方案输出简体时生效）。\n"
+    L"用万象 LTS 语言模型 + 词库生成整句候选（top-20），候选窗只显示首选 1 条，\n"
+    L"其前导词概率用于「前缀自动确认」。\n"
+    L"需要资产：用户文件夹\\llm_ngram\\wanxiang-lts-zh-hans.gram（约 391 MB）\n"
+    L"+ llm_ngram\\dicts\\（六个词库）；缺失时自动关闭（60 秒后重试），不影响其它功能。";
 static const wchar_t* const TIP_DEBUG =
     L"诊断日志：开启后每次重排都往用户文件夹的 llm_rerank\\<方案> 子目录写\n"
     L"rime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化；语料/账本/词码对\n"
@@ -1548,13 +1704,26 @@ static void cfg_make_ui() {
     // （实验功能，整句模式外无意义）。行位一律保留、不重排后续控件；
     // 显隐由 apply_prefix_visibility()（on_sent_toggle / params_to_ui）控制，
     // 徽标随复选框一起显隐。
-    g_prefix_cb = mk(0, L"前缀自动确认", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     PAD + ts(12), y + ts(2),
-                     tw(L"前缀自动确认", g_font) + ts(26), ts(22), IDC_PREFIX);
+    // 2026-11-24：N-gram 组句候选**同行并排**（两者都只在整句模式显示；
+    // 并排避免新增一行把下面各组坐标整体下移、窗口总高超屏）。徽标紧跟在
+    // 各自复选框右侧——右列徽标位只有一个，两个都要挂说明只能内联。
+    const int cbRowY = y + ts(2);
+    const int pfxX = PAD + ts(12);
+    const int pfxW = tw(L"前缀自动确认", g_font) + ts(26);
+    g_prefix_cb = mk(0, L"前缀自动确认", BS_AUTOCHECKBOX | WS_TABSTOP, pfxX,
+                     cbRowY, pfxW, ts(22), IDC_PREFIX);
     tip_add(g_prefix_cb, TIP_PREFIX);
-    g_prefix_help = mk_help(HX, y + ts(4), TIP_PREFIX);
+    g_prefix_help = mk_help(pfxX + pfxW + ts(4), y + ts(4), TIP_PREFIX);
+    const int ngX = pfxX + pfxW + ts(4) + ts(18) + ts(16);
+    const int ngW = tw(L"N-gram 组句候选", g_font) + ts(26);
+    g_ngram_cb = mk(0, L"N-gram 组句候选", BS_AUTOCHECKBOX | WS_TABSTOP, ngX,
+                    cbRowY, ngW, ts(22), IDC_NGRAM);
+    tip_add(g_ngram_cb, TIP_NGRAM);
+    g_ngram_help = mk_help(ngX + ngW + ts(4), y + ts(4), TIP_NGRAM);
     ShowWindow(g_prefix_cb, SW_HIDE);
     ShowWindow(g_prefix_help, SW_HIDE);
+    ShowWindow(g_ngram_cb, SW_HIDE);
+    ShowWindow(g_ngram_help, SW_HIDE);
     y += ts(30);
     mk_group(L"触发条件", PAD, gy, CW, y - gy + ts(8));
   }
@@ -1858,8 +2027,26 @@ static void draw_button(const DRAWITEMSTRUCT* d) {
 // 轮询分片大小打进度；完成后剥掉 .download 后缀转正；失败保留分片可重试续传。
 static const wchar_t* const kModelUrl =
     L"https://www.modelscope.cn/models/zhanghaozhecn/Qwen3-0.6B-Base-GGUF/resolve/master/Qwen3-0.6B-Base-Q4_K_M.gguf";
+// 万象 N-gram 组句资产（2026-11-24 用户定案：开关里确认后直接下载安装）：
+// 官方 release —— LTS 语法模型 + nightly 词库包。env 覆盖镜像/测试：
+// RIME_LLM_NGRAM_URL / RIME_LLM_NGRAM_DICTS_URL。
+static const wchar_t* const kGramUrl =
+    L"https://github.com/amzxyz/RIME-LMDG/releases/download/LTS/wanxiang-lts-zh-hans.gram";
+static const wchar_t* const kDictsUrl =
+    L"https://github.com/amzxyz/RIME-LMDG/releases/download/dict-nightly/dicts.zip";
+static const unsigned long long kGramBytes = 390786092ULL;   // LTS 资产精确体量
+static const unsigned long long kDictsMinBytes = 10000000ULL;  // nightly 体量浮动，只设下限
+// 词库包下限可被测试/镜像覆盖（生产 10MB；沙箱测试用小 zip）
+static unsigned long long dicts_min_bytes() {
+  const wchar_t* v = _wgetenv(L"RIME_LLM_NGRAM_DICTS_MIN_BYTES");
+  return (v && *v) ? _wcstoui64(v, NULL, 10) : kDictsMinBytes;
+}
 static HANDLE g_dl_proc = NULL;
 static std::wstring g_dl_tmp, g_dl_target;
+// 下载任务类型（2026-11-24）：模型 = 单步；N-gram = gram → dicts.zip → 解压 → 校验
+enum DlJob { DL_JOB_MODEL = 0, DL_JOB_GRAM, DL_JOB_DICTS, DL_JOB_UNZIP };
+static DlJob g_dl_job = DL_JOB_MODEL;
+static std::wstring g_ngram_base, g_ngram_gram, g_ngram_ddir, g_ngram_zip;
 // 点下载时路径框为空 = 落默认路径——完成后把实际落点回填到框里（2026-11-17
 // 用户反馈：下载完成后路径框仍是空的，不知道模型下到了哪；状态行说"下载完成"
 // 而模型状态区却因空框显示"文件不存在"，自相矛盾）
@@ -1911,10 +2098,72 @@ static void write_dl_pid(DWORD pid) {
   fclose(f);
 }
 
-static void download_finish(bool ok, DWORD code) {
-  if (g_dl_proc) { CloseHandle(g_dl_proc); g_dl_proc = NULL; }
-  KillTimer(g_hwnd, DL_TIMER_ID);
-  if (!g_dl_tmp.empty()) DeleteFileW((g_dl_tmp + L".pid").c_str());
+// ---- N-gram 资产路径与校验（2026-11-24：开关里下载安装）----
+static std::wstring ngram_env_or(const wchar_t* name, const wchar_t* def) {
+  const wchar_t* v = _wgetenv(name);
+  return (v && *v) ? std::wstring(v) : std::wstring(def);
+}
+static std::wstring ngram_base_dir() {
+  const wchar_t* p = _wgetenv(L"RIME_LLM_NGRAM_PATH");
+  if (p && *p) {
+    std::wstring g = p;
+    size_t s = g.find_last_of(L"\\/");
+    return s == std::wstring::npos ? std::wstring(L".") : g.substr(0, s);
+  }
+  std::wstring u = rime_user_dir();
+  return u.empty() ? std::wstring(L"llm_ngram") : (u + L"\\llm_ngram");
+}
+static std::wstring ngram_gram_path() {
+  const wchar_t* p = _wgetenv(L"RIME_LLM_NGRAM_PATH");
+  if (p && *p) return std::wstring(p);
+  return ngram_base_dir() + L"\\wanxiang-lts-zh-hans.gram";
+}
+static std::wstring ngram_dict_dir() {
+  const wchar_t* p = _wgetenv(L"RIME_LLM_NGRAM_DICT");
+  if (p && *p) return std::wstring(p);
+  return ngram_base_dir() + L"\\dicts";
+}
+static bool ngram_dicts_ok(const std::wstring& ddir) {
+  const wchar_t* names[] = {L"zi",    L"jichu",  L"duoyin",
+                            L"diming", L"mingren", L"yiren"};
+  for (const wchar_t* n : names) {
+    unsigned long long sz = 0;
+    if (!file_size(ddir + L"\\" + n + L".dict.yaml", &sz) || sz == 0) return false;
+  }
+  return true;
+}
+// 词库包若带一层子目录（dicts\zi.dict.yaml），把该子目录的文件平移到根——
+// 运行期只认 <dicts>\zi.dict.yaml 这一层。
+static void flatten_ngram_dicts(const std::wstring& ddir) {
+  if (ngram_dicts_ok(ddir)) return;
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((ddir + L"\\*").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  do {
+    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+    if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+      continue;
+    std::wstring sub = ddir + L"\\" + fd.cFileName;
+    unsigned long long dummy = 0;
+    if (!file_size(sub + L"\\zi.dict.yaml", &dummy)) continue;
+    WIN32_FIND_DATAW f2;
+    HANDLE h2 = FindFirstFileW((sub + L"\\*").c_str(), &f2);
+    if (h2 != INVALID_HANDLE_VALUE) {
+      do {
+        if (f2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        MoveFileExW((sub + L"\\" + f2.cFileName).c_str(),
+                    (ddir + L"\\" + f2.cFileName).c_str(),
+                    MOVEFILE_REPLACE_EXISTING);
+      } while (FindNextFileW(h2, &f2));
+      FindClose(h2);
+    }
+    break;
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+}
+static void start_ngram_step(DlJob job);   // 定义在下方（launch_child 之后）
+
+static void model_download_finish(bool ok, DWORD code) {
   if (ok) {
     // A4（2026-11-21）：转正判据 = 精确字节 kModelExpectedBytes。curl 成功但体量
     // 不符（截断/服务端变更）→ 不转正、保留分片提示续传——此前 >100MB 即转正，
@@ -1948,6 +2197,82 @@ static void download_finish(bool ok, DWORD code) {
     log_error(L"[下载] curl 退出码 %lu；分片保留：%s", code, g_dl_tmp.c_str());
   }
   refresh_model_status();
+}
+
+static void download_finish(bool ok, DWORD code) {
+  if (g_dl_proc) { CloseHandle(g_dl_proc); g_dl_proc = NULL; }
+  KillTimer(g_hwnd, DL_TIMER_ID);
+  if (!g_dl_tmp.empty()) DeleteFileW((g_dl_tmp + L".pid").c_str());
+  if (g_dl_job == DL_JOB_MODEL) {
+    model_download_finish(ok, code);
+    return;
+  }
+  // N-gram 资产（多步）：任何一步失败 → 保持开关关、恢复可点、提示原因
+  auto fail = [&](const std::wstring& why) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"[失败] %s", why.c_str());
+    log_error(L"[N-gram 下载] %s", why.c_str());
+    g_dl_job = DL_JOB_MODEL;
+    if (g_ngram_cb) EnableWindow(g_ngram_cb, TRUE);
+  };
+  if (g_dl_job == DL_JOB_UNZIP) {
+    if (!ok) {
+      fail(L"词库包解压失败（退出码 " + std::to_wstring(code) + L"）——可手动解压到 " +
+           g_ngram_ddir);
+      return;
+    }
+    flatten_ngram_dicts(g_ngram_ddir);
+    DeleteFileW(g_ngram_zip.c_str());
+    g_dl_job = DL_JOB_MODEL;
+    if (g_ngram_cb) EnableWindow(g_ngram_cb, TRUE);
+    std::wstring why2;
+    if (ngram_assets_state_real(&why2)) {
+      // 2026-11-24 用户定案：只有安装 + 校验都成功，开关才显示为开
+      if (g_ngram_cb)
+        SendMessageW(g_ngram_cb, BM_SETCHECK, BST_CHECKED, 0);
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+                 L"N-gram 组句资产安装完成——开关已打开，点『保存并生效』启用");
+      log_error(L"[N-gram 下载] 完成：%s / %s", g_ngram_gram.c_str(),
+                g_ngram_ddir.c_str());
+    } else {
+      fail(L"N-gram 资产安装后校验未通过：" + why2);
+    }
+    return;
+  }
+  if (!ok) {
+    fail(L"下载失败（curl 退出码 " + std::to_wstring(code) +
+         L"）——分片已保留，重试可续传");
+    return;
+  }
+  unsigned long long sz = file_size_ull(g_dl_tmp);
+  if (g_dl_job == DL_JOB_GRAM) {
+    if (sz != kGramBytes) {
+      fail(L"语法模型体量不符（" + std::to_wstring(sz / 1000000ULL) +
+           L" MB，应为 391 MB）——分片已保留，重试可续传");
+      return;
+    }
+    if (!MoveFileExW(g_dl_tmp.c_str(), g_dl_target.c_str(),
+                     MOVEFILE_REPLACE_EXISTING)) {
+      fail(L"语法模型转正失败（可能被占用），分片保留可重试");
+      return;
+    }
+    log_error(L"[N-gram 下载] 语法模型完成：%s（%llu 字节）", g_dl_target.c_str(), sz);
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"语法模型下载完成——继续下载词库包…");
+    start_ngram_step(DL_JOB_DICTS);
+  } else if (g_dl_job == DL_JOB_DICTS) {
+    if (sz < dicts_min_bytes()) {
+      fail(L"词库包体量异常（" + std::to_wstring(sz / 1000000ULL) +
+           L" MB）——分片已保留，重试可续传");
+      return;
+    }
+    if (!MoveFileExW(g_dl_tmp.c_str(), g_dl_target.c_str(),
+                     MOVEFILE_REPLACE_EXISTING)) {
+      fail(L"词库包转正失败（可能被占用），分片保留可重试");
+      return;
+    }
+    log_error(L"[N-gram 下载] 词库包完成：%s（%llu 字节）", g_dl_target.c_str(), sz);
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"词库包下载完成——正在解压…");
+    start_ngram_step(DL_JOB_UNZIP);
+  }
 }
 
 static void on_download_model() {
@@ -2006,6 +2331,7 @@ static void on_download_model() {
   if (slash != std::wstring::npos) CreateDirectoryW(target.substr(0, slash).c_str(), NULL);
   g_dl_target = target;
   g_dl_tmp = target + L".download";
+  g_dl_job = DL_JOB_MODEL;   // 2026-11-24：N-gram 多步任务后回到模型单步
   // ② 同目标还有上次遗留的 curl（关窗时旧版没杀干净 / 异常退出）→ 结束它再接管，
   //    否则同一分片会有两个写入者（断点续传也救不了）
   if (kill_stale_curl(g_dl_tmp))
@@ -2041,11 +2367,127 @@ static void on_download_tick() {
     download_finish(code == 0, code);
     return;
   }
+  if (g_dl_job == DL_JOB_UNZIP) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"正在解压词库包…");
+    return;
+  }
+  unsigned long long expected = (g_dl_job == DL_JOB_GRAM)  ? kGramBytes
+                                : (g_dl_job == DL_JOB_DICTS) ? 30000000ULL
+                                                             : kModelExpectedBytes;
   unsigned long long got = file_size_ull(g_dl_tmp);
-  int pct = (int)((got * 100) / kModelExpectedBytes);
+  int pct = expected ? (int)((got * 100) / expected) : 0;
   if (pct > 99) pct = 99;
-  set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"下载中… %llu MB / 397 MB（%d%%）——目标 %s",
-             mb_of(got), pct, g_dl_target.c_str());
+  if (g_dl_job == DL_JOB_MODEL) {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"下载中… %llu MB / 397 MB（%d%%）——目标 %s", mb_of(got), pct,
+               g_dl_target.c_str());
+  } else {
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"下载中… %llu MB / %llu MB（%d%%）——目标 %s", mb_of(got),
+               mb_of(expected), pct, g_dl_target.c_str());
+  }
+}
+
+// ---- N-gram 资产下载执行（2026-11-24）：gram → dicts.zip → tar 解压 ----
+static bool dl_busy() { return g_dl_proc != NULL; }
+
+static bool launch_child(const std::wstring& cmd, DlJob job) {
+  std::vector<wchar_t> cl(cmd.begin(), cmd.end());
+  cl.push_back(0);
+  STARTUPINFOW si = {sizeof(si)};
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_HIDE;
+  PROCESS_INFORMATION pi;
+  if (!CreateProcessW(NULL, cl.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL,
+                      NULL, &si, &pi))
+    return false;
+  CloseHandle(pi.hThread);
+  g_dl_proc = pi.hProcess;
+  g_dl_job = job;
+  write_dl_pid(pi.dwProcessId);
+  SetTimer(g_hwnd, DL_TIMER_ID, 700, NULL);
+  return true;
+}
+
+static void start_ngram_step(DlJob job) {
+  if (job == DL_JOB_DICTS) {
+    std::wstring durl = ngram_env_or(L"RIME_LLM_NGRAM_DICTS_URL", kDictsUrl);
+    g_dl_target = g_ngram_zip;
+    g_dl_tmp = g_ngram_zip + L".download";
+    kill_stale_curl(g_dl_tmp);
+    std::wstring cmd = L"curl.exe -L -C - -s -S --retry 3 --retry-delay 2 -o \"" +
+                       g_dl_tmp + L"\" \"" + durl + L"\"";
+    if (!launch_child(cmd, DL_JOB_DICTS)) {
+      g_dl_job = DL_JOB_MODEL;
+      if (g_ngram_cb) EnableWindow(g_ngram_cb, TRUE);
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+                 L"[失败] 无法启动 curl.exe——可手动下载：%s", kDictsUrl);
+      return;
+    }
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"开始下载词库包 → %s（断点续传）", g_dl_target.c_str());
+    return;
+  }
+  if (job == DL_JOB_UNZIP) {
+    wchar_t sys[MAX_PATH] = L"";
+    GetSystemDirectoryW(sys, MAX_PATH);
+    std::wstring tar = std::wstring(sys) + L"\\tar.exe";
+    if (file_size_ull(tar) == 0) {
+      g_dl_job = DL_JOB_MODEL;
+      if (g_ngram_cb) EnableWindow(g_ngram_cb, TRUE);
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+                 L"[失败] 系统缺少 tar.exe（Win10 1803+ 自带）——请手动把 %s 解压到 %s",
+                 g_ngram_zip.c_str(), g_ngram_ddir.c_str());
+      return;
+    }
+    g_dl_tmp.clear();   // 解压无分片
+    std::wstring cmd = L"\"" + tar + L"\" -xf \"" + g_ngram_zip + L"\" -C \"" +
+                       g_ngram_ddir + L"\"";
+    if (!launch_child(cmd, DL_JOB_UNZIP)) {
+      g_dl_job = DL_JOB_MODEL;
+      if (g_ngram_cb) EnableWindow(g_ngram_cb, TRUE);
+      set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+                 L"[失败] 无法启动解压（tar.exe）——可手动解压 %s 到 %s",
+                 g_ngram_zip.c_str(), g_ngram_ddir.c_str());
+      return;
+    }
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"正在解压词库包…");
+  }
+}
+
+static void start_ngram_download() {
+  g_ngram_base = ngram_base_dir();
+  g_ngram_gram = ngram_gram_path();
+  g_ngram_ddir = ngram_dict_dir();
+  g_ngram_zip = g_ngram_base + L"\\dicts.zip";
+  CreateDirectoryW(g_ngram_base.c_str(), NULL);
+  CreateDirectoryW(g_ngram_ddir.c_str(), NULL);
+  unsigned long long sz = 0;
+  if (file_size(g_ngram_gram, &sz) && sz == kGramBytes) {
+    // 语法模型已就绪 → 从词库步开始（zip 已有 ≥ 下限则直接解压）
+    unsigned long long zsz = 0;
+    if (file_size(g_ngram_zip, &zsz) && zsz >= dicts_min_bytes())
+      start_ngram_step(DL_JOB_UNZIP);
+    else
+      start_ngram_step(DL_JOB_DICTS);
+    return;
+  }
+  std::wstring gurl = ngram_env_or(L"RIME_LLM_NGRAM_URL", kGramUrl);
+  g_dl_target = g_ngram_gram;
+  g_dl_tmp = g_ngram_gram + L".download";
+  kill_stale_curl(g_dl_tmp);
+  std::wstring cmd = L"curl.exe -L -C - -s -S --retry 3 --retry-delay 2 -o \"" +
+                     g_dl_tmp + L"\" \"" + gurl + L"\"";
+  if (!launch_child(cmd, DL_JOB_GRAM)) {
+    g_dl_job = DL_JOB_MODEL;
+    if (g_ngram_cb) EnableWindow(g_ngram_cb, TRUE);
+    set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+               L"[失败] 无法启动 curl.exe（Win10 1803+ 自带）——可手动下载：%s",
+               kGramUrl);
+    return;
+  }
+  set_status(GetDlgItem(g_hwnd, IDC_STATUS),
+             L"开始下载 N-gram 语法模型（约 391 MB）→ %s", g_dl_target.c_str());
 }
 
 // ── 线程数实测（2026-10-01 用户定案：起点 4 / 终点 8；2026-11-19 口径改 t_cand）
@@ -2930,9 +3372,17 @@ static void handle_line(const std::string &line) {
   }
   wchar_t tmp[512];
   if (f[0] == "S" && f.size() >= 3) {
-    swprintf(tmp, 512, L"%s 跳过 %s（输入 %s 来源 %s）", u8w(f[1]).c_str(),
-             u8w(f[2]).c_str(), f.size() > 3 ? u8w(f[3]).c_str() : L"",
-             f.size() > 4 ? u8w(f[4]).c_str() : L"-");
+    // 无上文（2026-11-24）：freq_only 不是"跳过"——本窗照常融合/前缀确认，
+    // 只是不含 CE。用中性措辞，避免被读成"没触发重排"。
+    if (u8w(f[2]) == L"freq_only") {
+      swprintf(tmp, 512, L"%s 无上文：按词频融合（无 CE）（输入 %s 来源 %s）",
+               u8w(f[1]).c_str(), f.size() > 3 ? u8w(f[3]).c_str() : L"",
+               f.size() > 4 ? u8w(f[4]).c_str() : L"-");
+    } else {
+      swprintf(tmp, 512, L"%s 跳过 %s（输入 %s 来源 %s）", u8w(f[1]).c_str(),
+               u8w(f[2]).c_str(), f.size() > 3 ? u8w(f[3]).c_str() : L"",
+               f.size() > 4 ? u8w(f[4]).c_str() : L"-");
+    }
     stream_add(false, tmp, 0);
     return;
   }

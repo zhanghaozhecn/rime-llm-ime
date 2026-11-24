@@ -203,6 +203,30 @@ New-Item -ItemType Directory -Path (Join-Path $sandbox "Rime") -Force | Out-Null
 $env:APPDATA = $sandbox                       # 子进程 GUI 继承 → 读写全落沙箱
 $env:WEASEL_LLM_SETUP_NO_REDEPLOY = "1"       # 静默跳过重新部署（测试开关）
 $env:RIME_LLM_USER_DIR = Join-Path $sandbox "Rime"   # 用户目录钉在沙箱（GUI 优先注册表 RimeUserDir）
+# N-gram 组句资产（2026-11-24）：沙箱准备不了 391MB 真资产 → 用 GUI 内置
+# 测试钩子 LLM_INSTALLER_FAKE_NGRAM_FILE（内容 "ok" = 资产齐；其它非空 =
+# 缺失原因原文）。phase7c 临时改写它验证"缺失 → 提示安装"分支。
+$env:LLM_INSTALLER_FAKE_NGRAM_FILE = Join-Path $sandbox "ngram_fake.txt"
+Set-Content -LiteralPath $env:LLM_INSTALLER_FAKE_NGRAM_FILE -Value "ok" -Encoding ascii
+# 开关里下载安装（2026-11-24）：沙箱用 file:// 源替代 GitHub（本机到 release CDN
+# 实测只有几 KB/s）——phase7d 走完整链路（curl 断点 → 精确体量 → tar 解压 →
+# 六库校验）。路径钉在沙箱，URL 由测试覆盖。
+$ngsrc = Join-Path $sandbox "ngsrc"
+New-Item -ItemType Directory -Path $ngsrc -Force | Out-Null
+$fakeGram = Join-Path $ngsrc "wanxiang-lts-zh-hans.gram"
+$fsng = [IO.File]::Create($fakeGram); $fsng.SetLength(390786092); $fsng.Close()
+$dsrc = Join-Path $ngsrc "dictsrc"
+New-Item -ItemType Directory -Path $dsrc -Force | Out-Null
+foreach ($n in @("zi", "jichu", "duoyin", "diming", "mingren", "yiren")) {
+  Set-Content -LiteralPath (Join-Path $dsrc "$n.dict.yaml") -Value "name: $n" -Encoding utf8
+}
+$fakeZip = Join-Path $ngsrc "dicts.zip"
+Compress-Archive -Path (Join-Path $dsrc '*') -DestinationPath $fakeZip -Force
+$env:RIME_LLM_NGRAM_PATH = Join-Path $sandbox "Rime\llm_ngram\wanxiang-lts-zh-hans.gram"
+$env:RIME_LLM_NGRAM_DICT = Join-Path $sandbox "Rime\llm_ngram\dicts"
+$env:RIME_LLM_NGRAM_URL = "file:///" + ($fakeGram -replace '\\', '/')
+$env:RIME_LLM_NGRAM_DICTS_URL = "file:///" + ($fakeZip -replace '\\', '/')
+$env:RIME_LLM_NGRAM_DICTS_MIN_BYTES = "1"
 # 线程数实测：GUI 相位全程伪装成 3 逻辑核（<5 → 不实测、直接取最大线程数）。
 # 本机没法真的变成 3 核，这条分支只能靠该钩子验证（bench_threads.exe 读同一个变量）。
 $env:RIME_LLM_FAKE_CORES = "3"
@@ -362,17 +386,70 @@ engine:
   Write-Host "== phase7b: 前缀自动确认显隐 + 落盘（仅整句模式）=="
   Click-Ctl $hw 1021   # IDC_TCS 勾选
   Assert "整句模式 on → 「前缀自动确认」显示" (Visible-Ctl $hw 1022)
+  Assert "整句模式 on → 「N-gram 组句候选」显示" (Visible-Ctl $hw 1025)
   Click-Ctl $hw 1022   # IDC_PREFIX 勾选
   Save-Raw $hw
   $f = Get-Content $test -Encoding UTF8
   Assert "sentence_mode: true（点击勾选）" (($f | Where-Object { $_ -match '^  sentence_mode: true$' }).Count -eq 1)
   Assert "prefix_confirm: true（勾选后落盘）" (($f | Where-Object { $_ -match '^  prefix_confirm: true$' }).Count -eq 1)
+  Assert "ngram_group: false（未勾选默认 false）" (($f | Where-Object { $_ -match '^  ngram_group: false$' }).Count -eq 1)
   Click-Ctl $hw 1021   # 关整句模式
   Assert "整句模式 off → 「前缀自动确认」隐藏" (-not (Visible-Ctl $hw 1022))
+  Assert "整句模式 off → 「N-gram 组句候选」隐藏" (-not (Visible-Ctl $hw 1025))
   Save-Raw $hw
   $f = Get-Content $test -Encoding UTF8
   Assert "sentence_mode: false（点击取消）" (($f | Where-Object { $_ -match '^  sentence_mode: false$' }).Count -eq 1)
   Assert "prefix_confirm: false（整句模式关 → 恒落 false）" (($f | Where-Object { $_ -match '^  prefix_confirm: false$' }).Count -eq 1)
+  Assert "ngram_group: false（整句模式关 → 恒落 false）" (($f | Where-Object { $_ -match '^  ngram_group: false$' }).Count -eq 1)
+
+  # phase7c: N-gram 组句资产检测（2026-11-24 用户定案）——勾选时缺资产会询问
+  # 是否现在下载安装；选"否" → 开关回关、不产生资产。
+  # 测试钩子：LLM_INSTALLER_FAKE_NGRAM_FILE 内容即检测结果（"ok" = 齐）。
+  Write-Host "== phase7c: N-gram 检测 → 选否不安装 =="
+  function Get-Check([IntPtr]$h, [int]$id) {
+    return ([W]::SendMessage([W]::GetDlgItem($h, $id), 0x00F0,
+            [IntPtr]::Zero, [IntPtr]::Zero).ToInt64() -eq 1)
+  }
+  Set-Content -LiteralPath $env:LLM_INSTALLER_FAKE_NGRAM_FILE `
+               -Value "MISSING: C:\fake\llm_ngram\wanxiang-lts-zh-hans.gram" `
+               -Encoding ascii
+  Click-Ctl $hw 1021   # 整句模式 on
+  Click-Ctl $hw 1025 "否"   # 勾选 N-gram → 询问下载 → 选"否"
+  Assert "选『否』→ 开关回关" (-not (Get-Check $hw 1025))
+  Assert "选『否』→ 未产生资产" (-not (Test-Path -LiteralPath $env:RIME_LLM_NGRAM_PATH))
+
+  # phase7d: 选"是" → 真下载安装（file:// 源，见顶部 env 段）→ 解压 + 校验
+  # 全成功后才把开关显示为开；保存落 ngram_group: true。
+  Write-Host "== phase7d: 开关里下载安装 → 成功后开关才开 =="
+  Click-Ctl $hw 1025 "是"
+  $ngOk = $false
+  for ($i = 0; $i -lt 80; $i++) {
+    Start-Sleep -Milliseconds 500
+    if (Get-Check $hw 1025) { $ngOk = $true; break }
+  }
+  Assert "下载完成后开关自动显示为开" $ngOk
+  Assert "语法模型落位（沙箱）" (Test-Path -LiteralPath $env:RIME_LLM_NGRAM_PATH)
+  $nmiss2 = @(@("zi", "jichu", "duoyin", "diming", "mingren", "yiren") |
+              Where-Object { -not (Test-Path (Join-Path $env:RIME_LLM_NGRAM_DICT "$_.dict.yaml")) })
+  Assert "六库解压就位" ($nmiss2.Count -eq 0)
+  Set-Content -LiteralPath $env:LLM_INSTALLER_FAKE_NGRAM_FILE -Value "ok" -Encoding ascii
+  Save-Raw $hw
+  $f = Get-Content $test -Encoding UTF8
+  Assert "ngram_group: true（安装后保存落盘）" (($f | Where-Object { $_ -match '^  ngram_group: true$' }).Count -eq 1)
+  # 保存时检测（同模型口径）：检测缺失 → 确认框选"否" → 取消保存
+  $hSnap = (Get-FileHash $test -Algorithm MD5).Hash
+  Set-Content -LiteralPath $env:LLM_INSTALLER_FAKE_NGRAM_FILE -Value "MISSING: fake" -Encoding ascii
+  [void][W]::PostMessage([W]::GetDlgItem($hw, 1101), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+  [void](Dismiss-Prompt $hw "是")   # 模型未就绪
+  [void](Dismiss-Prompt $hw "否")   # N-gram 资产未就绪 → 取消保存
+  Start-Sleep -Milliseconds 900
+  Assert "缺资产保存选『否』→ 文件未改动" ((Get-FileHash $test -Algorithm MD5).Hash -eq $hSnap)
+  Set-Content -LiteralPath $env:LLM_INSTALLER_FAKE_NGRAM_FILE -Value "ok" -Encoding ascii
+  Click-Ctl $hw 1025        # 取消勾选
+  Save-Raw $hw
+  $f = Get-Content $test -Encoding UTF8
+  Assert "ngram_group: false（取消勾选后落盘）" (($f | Where-Object { $_ -match '^  ngram_group: false$' }).Count -eq 1)
+  Click-Ctl $hw 1021        # 整句模式 off（后续相位起点与旧版一致）
 
   # phase8: 旧全局 llm_rerank.yaml 的一次性迁移
   # （2026-09-30 起运行期不再读它；只有"方案节不存在"时 GUI 用它带出界面值）
