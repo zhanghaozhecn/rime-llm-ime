@@ -149,7 +149,8 @@ static bool g_sentence_mode = false;  // 整句模式：满覆盖候选进评分
 //      码数与音节数无固定关系（旧「≥6 码 / 余 ≥4 码」是拍的，已退役）。
 // 挂起后在下一次刷新路径执行 ctx->Select → Segment::Close 截段 → Forward +
 // Compose 只重译剩余码（组合区内预确认，不上屏）。开关 = 方案节
-// `llm_rerank/prefix_confirm`（GUI「前缀自动确认」，只在整句模式显示/生效）；
+// `llm_rerank/ngram_group`（GUI「N-gram 组句候选（含前缀自动确认）」，
+// 2026-11-24 用户定案：确认信号只有组句 lead，独立键 prefix_confirm 退役）；
 // 环境变量 RIME_LLM_PREFIX_CONFIRM=1 保留为真机实验的强制覆盖。
 // θ 与单字倍数已退役（位次门不需要 θ）；组句返回空的窗不再自动确认
 //（研究库：该档窗口路径 A 精度仅 56.8%）。
@@ -256,7 +257,6 @@ struct LlmParamSet {
   bool has_max_code_len = false; int max_code_len = 0;   // 旧键：解析保留、不再生效
   bool has_code_pattern = false; std::string code_pattern;  // 2026-09-30 新键
   bool has_sentence = false;     bool sentence_mode = false;
-  bool has_prefix_confirm = false; bool prefix_confirm = false;  // 2026-11-23
   bool has_ngram_group = false;   bool ngram_group = false;     // 2026-11-23 第②段
   // freq_beta 字段已删（2026-11-05 退出用户配置面）→ g_freq_beta 内置常数
   bool has_min_tokens = false;   int min_tokens = 1;
@@ -274,16 +274,15 @@ static void llm_apply_params() {
   g_enabled = s.has_enabled ? s.enabled : false;
   // 整句模式先于 code_pattern 读取（2026-11-22 锁定编码匹配要用）
   g_sentence_mode = s.has_sentence ? s.sentence_mode : false;
-  // 前缀自动确认（2026-11-23）：配置项，**只在整句模式开启时生效**（GUI
-  // 也只在整句模式勾选时显示该复选框；运行期再兜一层——手改 yaml 写 true
-  // 而 sentence_mode 关也不触发）。环境变量保留为真机实验强制覆盖。
-  g_prefix_confirm = g_prefix_confirm_env ||
-                     (g_sentence_mode && s.has_prefix_confirm &&
-                      s.prefix_confirm);
   // N-gram 组句候选（2026-11-23 第②段）：只在整句模式 + 方案输出简体时生效
   //（组句词表 = 万象简体；繁体方案不启用，避免吐简体候选）。
   g_ngram_group = g_sentence_mode && g_simplified_scheme &&
                   (s.has_ngram_group ? s.ngram_group : false);
+  // 前缀自动确认（2026-11-24 用户定案：并入 ngram_group 单开关）：确认信号
+  // 只有组句 lead 一条来源，要前缀确认就必须有万象资产，故不再有独立配置键
+  //（旧键 `llm_rerank/prefix_confirm` 读取端忽略、GUI 保存/重建节时剥除）。
+  // 环境变量保留为真机实验强制覆盖。
+  g_prefix_confirm = g_prefix_confirm_env || g_ngram_group;
   // 触发条件：code_pattern。空串 = 不限制（总是匹配）。
   // 整句模式锁定编码匹配（2026-11-22 用户定案）：sentence_mode on 时
   // 恒 '.{2,}'（2 码起参与重排）——方案节该行读取端忽略（手改 yaml 也
@@ -3716,10 +3715,12 @@ void LlmRerankTranslation::Collect() {
         ngram_generate(code_g, gctx, sid);
     if (!gen.empty()) {
       std::vector<an<Candidate>> merged;
-      std::map<std::string, char> seen_t;
+      std::map<std::string, char> seen_t;   // 只装"注入/去重"的显示那 1 条
+      std::map<std::string, char> gen_seen; // 组句内部去重（概率表用）
       for (const auto &s : gen) {
-        if (s.text.empty() || seen_t.count(s.text))
+        if (s.text.empty() || gen_seen.count(s.text))
           continue;
+        gen_seen[s.text] = 1;
         // 2026-11-24 修（真机报障"部分候选不正常"）：组句必须**从码位 0 起
         // 连续覆盖到码末**才允许注入——多段组合/切片异常时，生成器可能给出
         // 只覆盖尾部的句子（如 code='ozhengchang' → 哦正常），这些句子被
@@ -3738,9 +3739,15 @@ void LlmRerankTranslation::Collect() {
                   prev_end, (int)code_g.size());
           continue;
         }
-        seen_t[s.text] = 1;
-        merged.push_back(an<Candidate>(
-            new SimpleCandidate("ngram_group", seg_start_, seg_end_, s.text)));
+        // 2026-11-24 用户报障「象/向/想 等整字从候选里消失」：只把**显示
+        // 置顶的那 1 条**（ngram 序第 1，phrase-only 显示）注入并登记去重；
+        // 其余 19 条只进 gen_info 供前缀概率。旧实现把 top-20 全部文本都塞进
+        // seen_t/去重表，与组句同名的引擎候选被整条丢弃且无替代。
+        if (gen_texts.empty()) {
+          seen_t[s.text] = 1;
+          merged.push_back(an<Candidate>(new SimpleCandidate(
+              "ngram_group", seg_start_, seg_end_, s.text)));
+        }
         NgramGenInfo gi;
         if (!s.words.empty()) {
           gi.lead = s.words[0].word;
@@ -3816,13 +3823,16 @@ void LlmRerankTranslation::Collect() {
     size_t nk = (std::min)(kMaxRerank, allc.size());
     // 窗口准入（2026-11-24 统一口径）：层1 词频在等长词+子词里统一取前
     // nk 进窗（与字词模式一致）。组句不占窗席、不评分，也不进 tail——
-    // 它们由显示端单独置顶。正分固定候选仍不占位（归 pin_filter）。
+    // 它们由显示端单独置顶。**只排除显示置顶的那 1 条**（2026-11-24 真机
+    // 报障：旧实现按 top-20 全部文本排除，与组句同名的引擎候选整条消失）。
+    const std::string gen_show =
+        gen_texts.empty() ? std::string() : gen_texts[0];
     {
       std::vector<bool> in_win(allc.size(), false);
       size_t taken = 0;
       for (size_t k = 0; k < idx.size() && taken < nk; k++) {
         size_t c = idx[k];
-        if (!gen_info.empty() && gen_info.count(allc[c]->text()))
+        if (!gen_show.empty() && allc[c]->text() == gen_show)
           continue;
         in_win[c] = true;
         ++taken;
@@ -3833,8 +3843,7 @@ void LlmRerankTranslation::Collect() {
           candidates_.push_back(allc[c]);
           s1_head.push_back(s1[c]);
           win_fm.push_back(sent_on ? is_fm[c] : (char)0);
-        } else if (gen_info.empty() ||
-                   !gen_info.count(allc[c]->text())) {
+        } else if (gen_show.empty() || allc[c]->text() != gen_show) {
           tail.push_back(allc[c]);   // 窗外候选：层1 序透传
         }
       }
@@ -4131,9 +4140,10 @@ void LlmRerankTranslation::Collect() {
     // 句级 CE 序分支退役：融合序位次本身就是 CE(+词频) 的全序比较，再叠
     // margin 净收益反降（研究库）；θ 与单字倍数不需要。组句返回空（码切在
     // 音节中间，占 39.5%）的窗不再自动确认。**守卫 = 音节单位**（2026-11-24
-    // 标定）：确认后剩余 ≥2 音节；单音节 lead 例外（≥1）——组句句子字数 =
-    // 音节数，码数在简拼/双拼/混拼下不是通用单位。链式确认逐次重新判门
-    // （下一次刷新/Collect 在更短的码上重算，不沿用旧 pending）。
+    // 标定 + 真机定案）：确认后**剩余 ≥2 音节**（单字 lead 的"余 1 例外"
+    // 已退役——`xiazai` 在 xia 确认「下」会把 2 字词拆成单字+单字）——组句
+    // 句子字数 = 音节数，码数在简拼/双拼/混拼下不是通用单位。链式确认逐次
+    // 重新判门（下一次刷新/Collect 在更短的码上重算，不沿用旧 pending）。
     if (g_prefix_confirm && g_sentence_mode && !gen_texts.empty() &&
         !order.empty()) {
       // ① lead 概率质量（top-20 softmax，按 lead 分组）
@@ -4169,12 +4179,15 @@ void LlmRerankTranslation::Collect() {
         if (lead && tot > 0.0 && best / tot >= g_prefix_confirm_p) {
           int le = le_of[*lead];
           size_t want_end = seg_start_ + (size_t)le;
-          // ② 音节守卫：句子字数 = 音节数；剩余 ≥2（单音节 lead ≥1）
+          // ② 音节守卫：句子字数 = 音节数；**剩余必须 ≥2 音节**
+          //（2026-11-24 真机定案：单字 lead 的"余 1 例外"退役——`xiazai`
+          // 想在 xia 就确认「下」，剩 zai 只能出单字，「下载」这个 2 字词
+          // 被拆开；标定：该例外仅 +112 触发，去掉后精度 95.48%/召回
+          // 40.23%/K=5 1935，几乎无损）
           size_t sl = utf8_len(*lead);
           size_t st = utf8_len(txt_of[*lead]);
           size_t sr = st >= sl ? st - sl : 0;
-          size_t need = (sl == 1) ? 1 : 2;
-          if (le >= 0 && want_end < seg_end_ && st >= sl && sr >= need) {
+          if (le >= 0 && want_end < seg_end_ && st >= sl && sr >= 2) {
             // ③ 窗口融合序第 1 ∧ span/文本一致（文本一致铁律）
             size_t i1 = (size_t)order[0];
             const auto &c1 = candidates_[i1];
@@ -4196,8 +4209,8 @@ void LlmRerankTranslation::Collect() {
                         c1->text().c_str(), lead->c_str(), best / tot);
             }
           } else if (g_debug_fusion) {
-            log_error("pfx: guard lead='%.16s' syll=%zu+%zu need=%zu",
-                      lead->c_str(), sl, sr, need);
+            log_error("pfx: guard lead='%.16s' syll=%zu+%zu need=2",
+                      lead->c_str(), sl, sr);
           }
         }
       }
@@ -4451,11 +4464,9 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     } else if (config->GetBool("llm_rerank/two_code_sentence", &b)) {
       p.has_sentence = true; p.sentence_mode = b;
     }
-    // 前缀自动确认（2026-11-23）：配置项；生效判定在 llm_apply_params
-    //（sentence_mode && prefix_confirm，环境变量另作强制覆盖）
-    if (config->GetBool("llm_rerank/prefix_confirm", &b)) {
-      p.has_prefix_confirm = true; p.prefix_confirm = b;
-    }
+    // 前缀自动确认已并入 ngram_group（2026-11-24 用户定案）：旧键
+    // `llm_rerank/prefix_confirm` 读取端忽略（真机方案里的残留行在 GUI
+    // 保存/重建节时剥除）；生效判定见 llm_apply_params。
     // N-gram 组句候选（2026-11-23 第②段）：开关 + 输出字形门
     if (config->GetBool("llm_rerank/ngram_group", &b)) {
       p.has_ngram_group = true; p.ngram_group = b;
@@ -4492,17 +4503,17 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     {
       // 门控诊断（2026-11-23 晚，真机排查）：每个 session 构造一行，确认
       // 服务进程里读到的配置与 filters 列表。debug_fusion 关时不写。
-      bool raw_sent = false, raw_ng = false, raw_pfx = false;
+      // rawpfx 已删（2026-11-24：prefix_confirm 并入 ngram_group，pfx 恒随 ng）
+      bool raw_sent = false, raw_ng = false;
       config->GetBool("llm_rerank/sentence_mode", &raw_sent);
       config->GetBool("llm_rerank/ngram_group", &raw_ng);
-      config->GetBool("llm_rerank/prefix_confirm", &raw_pfx);
       an<ConfigList> fl = config->GetList("engine/filters");
       an<ConfigValue> fv0 = fl ? As<ConfigValue>(fl->GetAt(0)) : nullptr;
       log_msg("gate: sent=%d pfx=%d ngram=%d simp=%d rawsent=%d rawng=%d "
-              "rawpfx=%d nfilters=%d f0='%s' opt='%s'",
+              "nfilters=%d f0='%s' opt='%s'",
               (int)g_sentence_mode, (int)g_prefix_confirm, (int)g_ngram_group,
               (int)g_simplified_scheme, (int)raw_sent, (int)raw_ng,
-              (int)raw_pfx, fl ? (int)fl->size() : -1,
+              fl ? (int)fl->size() : -1,
               fv0 ? fv0->str().c_str() : "", g_simplifier_option.c_str());
     }
     std::string sid;

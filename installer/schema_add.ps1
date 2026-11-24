@@ -101,10 +101,10 @@ function Edit-SchemaSource([string]$schemaPath) {
 # llm_rerank 配置节模板 —— 与插件版 rime-llm-rerank\installer\install_plugin.ps1
 # 的 Get-LlmCfgLines **逐字一致**（2026-09-30 用户定案：两版方案配置节相同，
 # 仅组件行不同）：enabled / code_pattern / max_tokens / max_candidates /
-# cpu_cores / sentence_mode / prefix_confirm / ngram_group / debug_fusion / model_path
+# cpu_cores / sentence_mode / ngram_group / debug_fusion / model_path
 # （freq_beta/elw 退役 2026-11-05/07；two_code_sentence → sentence_mode
-#   整句模式改名 2026-11-22；prefix_confirm 2026-11-23 加入——只在整句
-#   模式开启时生效；ngram_group 2026-11-23 第②段加入——整句模式 + 方案
+#   整句模式改名 2026-11-22；prefix_confirm 2026-11-24 并入 ngram_group
+#   （单开关，旧键不再写入）；ngram_group 2026-11-23 第②段加入——整句模式 + 方案
 #   输出简体时生效，本版无 GUI 勾选框、只做键位透传；默认 20/6 为
 #   2026-11-19 0.6B 时代值——本次顺手修正陈旧模板 10/5 与 Qwen3.5-0.8B 默认模型名）
 function Get-LlmCfgLines([string]$modelPath) {
@@ -116,7 +116,6 @@ function Get-LlmCfgLines([string]$modelPath) {
     "  max_candidates: 6",
     "  cpu_cores: 4",
     "  sentence_mode: false",
-    "  prefix_confirm: false",
     "  ngram_group: false",
     "  debug_fusion: false"
   )

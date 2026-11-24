@@ -71,8 +71,7 @@ static int g_cfg_y = 0;   // 左列 y 起点（ts(8)，顶对齐）
 #define IDC_CODE_PAT     1016   // 编码匹配正则（2026-09-30 取代 min/max_code_len）
 #define IDC_BENCH        1017   // 实测线程数（2026-10-01 用户定案：与插件版同位置）
 #define IDC_TCS          1021   // 整句模式（2026-11-22 泛化自两码整句 two_code_sentence）
-#define IDC_PREFIX       1022   // 前缀自动确认（2026-11-23；只在整句模式勾选时显示/生效）
-#define IDC_NGRAM        1025   // N-gram 组句候选（2026-11-24；只在整句模式勾选时显示/生效）
+#define IDC_NGRAM        1025   // N-gram 组句候选（含前缀自动确认；2026-11-24 单开关）
 #define IDC_DEBUG        1023
 #define IDC_MAX_CAND     1024
 // 方案接入（2026-09-29 GUI 化，语义同 installer\schema_add.ps1）
@@ -95,10 +94,8 @@ struct Params {
   bool sentence_mode = false;      // 整句模式：满覆盖候选进评分窗（2026-11-22 泛化
                                    // 自 two_code_sentence 两码整句满长规则）
   bool has_sentence_mode = false;  // 方案节里出现过新键（旧键兜底只在新键缺席时）
-  bool prefix_confirm = false;     // 前缀自动确认（2026-11-23 实验）：只在整句
                                    // 模式开启时显示/生效（PM 首选多字词且只覆盖
                                    // 前缀 → 下一键自动选入组合区）
-  bool has_prefix_confirm = false; // 方案节里出现过该键
   // N-gram 组句候选（2026-11-23 第②段）：只在整句模式 + 方案输出简体时
   // 生效；2026-11-24 起有复选框（勾选/保存时检测万象资产并给安装提示）。
   bool ngram_group = false;
@@ -116,8 +113,6 @@ static Params g_p;
 static std::wstring g_loaded_name;   // 当前已读入界面的方案文件名（切换取消时按名拨回）
 static bool g_sel_guard = false;
 static HWND g_hwnd;
-static HWND g_prefix_cb = NULL;    // 前缀自动确认复选框（2026-11-23；只在
-static HWND g_prefix_help = NULL;  // 整句模式勾选时显示，含同行「?」徽标）
 static HWND g_ngram_cb = NULL;     // N-gram 组句候选复选框（2026-11-24；同上）
 static HWND g_ngram_help = NULL;
 static HFONT g_font;
@@ -268,7 +263,7 @@ static bool load_legacy_params(Params* p) {
 // %APPDATA%\Rime\llm_rerank.yaml）----
 // 节内键序与插件版 installer\install_plugin.ps1 的 Get-LlmCfgLines /
 // Update-LlmSection **逐字一致**：enabled / code_pattern / max_tokens /
-// max_candidates / cpu_cores / sentence_mode / prefix_confirm /
+// max_candidates / cpu_cores / sentence_mode / ngram_group /
 // debug_fusion / model_path —— 两版方案配置节相同，仅组件行不同。
 // （freq_beta 已删 2026-11-05：标定产物退出配置面；旧方案残留行读取时忽略）
 static const char* kCfgSection = "llm_rerank:";
@@ -321,12 +316,8 @@ static bool parse_llm_section(const std::vector<std::string>& lines) {
     else if (key == "two_code_sentence") {
       if (!g_p.has_sentence_mode) g_p.sentence_mode = (val == "true");
     }
-    // 前缀自动确认（2026-11-23）：配置项；只在整句模式开启时生效
-    else if (key == "prefix_confirm") {
-      g_p.prefix_confirm = (val == "true");
-      g_p.has_prefix_confirm = true;
-    }
-    // N-gram 组句候选（2026-11-23 第②段）：透传保留（本版无复选框）
+    // N-gram 组句候选（2026-11-24 起含前缀自动确认）：只在整句模式 +
+    // 方案输出简体时生效。旧键 prefix_confirm 读取端忽略（2026-11-24）。
     else if (key == "ngram_group") {
       g_p.ngram_group = (val == "true");
       g_p.has_ngram_group = true;
@@ -351,13 +342,8 @@ static std::vector<std::string> build_llm_section() {
   sprintf_s(buf, "  max_candidates: %d", g_p.max_candidates); sec.push_back(buf);
   sprintf_s(buf, "  cpu_cores: %d", g_p.cpu_cores); sec.push_back(buf);
   sec.push_back(g_p.sentence_mode ? "  sentence_mode: true" : "  sentence_mode: false");
-  // 前缀自动确认（2026-11-23）：只在整句模式开启时写 true（关整句模式恒
-  // false——llm_filter 运行期同样 gate，双保险）
-  sec.push_back((g_p.sentence_mode && g_p.prefix_confirm)
-                    ? "  prefix_confirm: true"
-                    : "  prefix_confirm: false");
-  // N-gram 组句候选（2026-11-23 第②段）：透传写回（无勾选框；关整句模式
-  // 恒 false，与 llm_filter 运行期 gate 双保险）
+  // N-gram 组句候选（2026-11-24 起含前缀自动确认）：关整句模式恒 false，
+  // 与 llm_filter 运行期 gate 双保险；旧键 prefix_confirm 不再写出。
   sec.push_back((g_p.sentence_mode && g_p.ngram_group)
                     ? "  ngram_group: true"
                     : "  ngram_group: false");
@@ -1252,20 +1238,7 @@ static void on_schema_remove() {
 // 取消 → 恢复勾选前的值可编辑（params_to_ui 读入路径显式设置框状态，
 // 不依赖本事件——BM_SETCHECK 不发 BN_CLICKED，无联动循环）
 static std::wstring g_pat_before_sent;
-// 前缀自动确认显隐（2026-11-23 用户定案）：只在整句模式勾选时显示。
-// 复选框与同行「?」徽标一起显隐；关整句模式时顺带取消勾选（落盘恒 false，
-// 界面与文件一致）。行位保留，不动其它控件几何。
-static void apply_prefix_visibility(bool sentence_on) {
-  if (g_prefix_cb) {
-    ShowWindow(g_prefix_cb, sentence_on ? SW_SHOW : SW_HIDE);
-    if (!sentence_on)
-      SendMessageW(g_prefix_cb, BM_SETCHECK, BST_UNCHECKED, 0);
-  }
-  if (g_prefix_help)
-    ShowWindow(g_prefix_help, sentence_on ? SW_SHOW : SW_HIDE);
-}
-
-// N-gram 组句候选显隐（2026-11-24）：同前缀确认（只在整句模式勾选时显示，
+// N-gram 组句候选显隐（2026-11-24，含前缀自动确认）：只在整句模式勾选时显示，
 // 关整句模式顺带取消勾选、行位保留）。
 static void apply_ngram_visibility(bool sentence_on) {
   if (g_ngram_cb) {
@@ -1313,14 +1286,12 @@ static void on_sent_toggle() {
     g_pat_before_sent = buf;
     SetDlgItemTextW(g_hwnd, IDC_CODE_PAT, L".{2,}");
     EnableWindow(pat, FALSE);
-    apply_prefix_visibility(true);
     apply_ngram_visibility(true);
   } else {
     EnableWindow(pat, TRUE);
     if (!g_pat_before_sent.empty())
       SetDlgItemTextW(g_hwnd, IDC_CODE_PAT, g_pat_before_sent.c_str());
     g_pat_before_sent.clear();
-    apply_prefix_visibility(false);
     apply_ngram_visibility(false);
   }
 }
@@ -1351,13 +1322,9 @@ static void ui_to_params() {
   // 整句模式锁定编码匹配（2026-11-22）：勾选时恒 '.{2,}'——即使输入框被
   // 跨进程工具改过也以锁定值为准（输入框本身已禁用，此处为兜底）
   if (g_p.sentence_mode) g_p.code_pattern = ".{2,}";
-  // 前缀自动确认（2026-11-23）：只在整句模式开启时落 true（关整句模式
-  // 恒 false——llm_filter 运行期同样 gate，双保险）
-  g_p.prefix_confirm =
-      g_p.sentence_mode &&
-      SendMessageW(GetDlgItem(g_hwnd, IDC_PREFIX), BM_GETCHECK, 0, 0) ==
-          BST_CHECKED;
-  // N-gram 组句候选（2026-11-24）：同样只在整句模式开启时落 true
+  // 前缀自动确认已并入 N-gram 单开关（2026-11-24 用户定案）：确认信号只有
+  // 组句 lead，旧键 prefix_confirm 不读也不写（重建节即剥除）。
+  // N-gram 组句候选（2026-11-24）：只在整句模式开启时落 true
   g_p.ngram_group =
       g_p.sentence_mode &&
       SendMessageW(GetDlgItem(g_hwnd, IDC_NGRAM), BM_GETCHECK, 0, 0) ==
@@ -1375,7 +1342,6 @@ static std::wstring ui_signature() {
   std::wstring s;
   s += SendMessageW(GetDlgItem(g_hwnd, IDC_ENABLED), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
   s += SendMessageW(GetDlgItem(g_hwnd, IDC_TCS), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
-  s += SendMessageW(GetDlgItem(g_hwnd, IDC_PREFIX), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
   s += SendMessageW(GetDlgItem(g_hwnd, IDC_NGRAM), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
   s += SendMessageW(GetDlgItem(g_hwnd, IDC_DEBUG), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
   const int ids[] = {IDC_MODEL,   IDC_CODE_PAT, IDC_MAX_TOK, IDC_MAX_CAND,
@@ -1414,11 +1380,7 @@ static void params_to_ui() {
   }
   SendMessageW(GetDlgItem(g_hwnd, IDC_TCS), BM_SETCHECK,
                g_p.sentence_mode ? BST_CHECKED : BST_UNCHECKED, 0);
-  // 前缀自动确认（2026-11-23）：值照读，显隐跟随整句模式（关时顺带清勾选）
-  SendMessageW(GetDlgItem(g_hwnd, IDC_PREFIX), BM_SETCHECK,
-               g_p.prefix_confirm ? BST_CHECKED : BST_UNCHECKED, 0);
-  apply_prefix_visibility(g_p.sentence_mode);
-  // N-gram 组句候选（2026-11-24）：同款显隐
+  // N-gram 组句候选（2026-11-24，含前缀自动确认）：值照读，显隐跟随整句模式
   SendMessageW(GetDlgItem(g_hwnd, IDC_NGRAM), BM_SETCHECK,
                g_p.ngram_group ? BST_CHECKED : BST_UNCHECKED, 0);
   apply_ngram_visibility(g_p.sentence_mode);
@@ -1561,16 +1523,13 @@ static const wchar_t* const TIP_TCS =
     L"「词长==⌊码长/2⌋」效果一致。\n"
     L"开启后编码匹配固定为 .{2,}（2 码起参与重排，输入框锁定）。\n"
     L"取代 two_code_sentence 两码整句（2026-11-22）。";
-static const wchar_t* const TIP_PREFIX =
-    L"前缀自动确认 prefix_confirm（默认关闭；只在整句模式开启时显示）。\n"
-    L"开启后：组句 top-20 的前导词概率 ≥0.95、且该词就是窗口融合序第 1 名\n"
-    L"（span/文本一致；确认后剩余 ≥2 音节，单字前导词例外 ≥1）时，\n"
-    L"下一次按键/刷新自动把它选入组合区（截段重译剩余码，不上屏）；\n"
-    L"误确认按退格即可回退。无上文时按词频序判同一条规则。";
 static const wchar_t* const TIP_NGRAM =
     L"N-gram 组句候选 ngram_group（默认关闭；只在整句模式开启、方案输出简体时生效）。\n"
-    L"用万象 LTS 语言模型 + 词库生成整句候选（top-20），候选窗只显示首选 1 条，\n"
-    L"其前导词概率用于「前缀自动确认」。\n"
+    L"用万象 LTS 语言模型 + 词库生成整句候选（top-20），候选窗只显示首选 1 条。\n"
+    L"**本开关同时包含「前缀自动确认」**（2026-11-24 合并：确认信号只有组句前导词一条来源）：\n"
+    L"组句前导词概率 ≥0.95、且该词就是窗口融合序第 1 名（span/文本一致；确认后剩余 ≥2 音节，\n"
+    L"单字前导词例外 ≥1）时，下一次按键/刷新自动把它选入组合区（截段重译剩余码，不上屏）；\n"
+    L"误确认按退格即可回退。无上文时按词频序判同一条规则。\n"
     L"需要资产：用户文件夹\\llm_ngram\\wanxiang-lts-zh-hans.gram（约 391 MB）\n"
     L"+ llm_ngram\\dicts\\（六个词库）；缺失时自动关闭（60 秒后重试），不影响其它功能。";
 static const wchar_t* const TIP_DEBUG =
@@ -1700,28 +1659,20 @@ static void cfg_make_ui() {
     tip_add(cb, TIP_TCS);
     mk_help(HX, y + ts(4), TIP_TCS);
     y += ts(30);
-    // 前缀自动确认（2026-11-23 用户定案）：**只在整句模式勾选时显示**
-    // （实验功能，整句模式外无意义）。行位一律保留、不重排后续控件；
-    // 显隐由 apply_prefix_visibility()（on_sent_toggle / params_to_ui）控制，
+    // N-gram 组句候选（2026-11-24 用户定案：前缀自动确认并入本开关——
+    // 确认信号只有组句 lead 一条来源，要前缀确认就必须有万象资产）：
+    // **只在整句模式勾选时显示**。行位一律保留、不重排后续控件；
+    // 显隐由 apply_ngram_visibility()（on_sent_toggle / params_to_ui）控制，
     // 徽标随复选框一起显隐。
-    // 2026-11-24：N-gram 组句候选**同行并排**（两者都只在整句模式显示；
-    // 并排避免新增一行把下面各组坐标整体下移、窗口总高超屏）。徽标紧跟在
-    // 各自复选框右侧——右列徽标位只有一个，两个都要挂说明只能内联。
     const int cbRowY = y + ts(2);
-    const int pfxX = PAD + ts(12);
-    const int pfxW = tw(L"前缀自动确认", g_font) + ts(26);
-    g_prefix_cb = mk(0, L"前缀自动确认", BS_AUTOCHECKBOX | WS_TABSTOP, pfxX,
-                     cbRowY, pfxW, ts(22), IDC_PREFIX);
-    tip_add(g_prefix_cb, TIP_PREFIX);
-    g_prefix_help = mk_help(pfxX + pfxW + ts(4), y + ts(4), TIP_PREFIX);
-    const int ngX = pfxX + pfxW + ts(4) + ts(18) + ts(16);
-    const int ngW = tw(L"N-gram 组句候选", g_font) + ts(26);
-    g_ngram_cb = mk(0, L"N-gram 组句候选", BS_AUTOCHECKBOX | WS_TABSTOP, ngX,
-                    cbRowY, ngW, ts(22), IDC_NGRAM);
+    const int ngX = PAD + ts(12);
+    const int ngW = tw(L"N-gram 组句候选（含前缀自动确认）", g_font) + ts(26);
+    g_ngram_cb = mk(0, L"N-gram 组句候选（含前缀自动确认）",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, ngX, cbRowY, ngW, ts(22),
+                    IDC_NGRAM);
     tip_add(g_ngram_cb, TIP_NGRAM);
     g_ngram_help = mk_help(ngX + ngW + ts(4), y + ts(4), TIP_NGRAM);
-    ShowWindow(g_prefix_cb, SW_HIDE);
-    ShowWindow(g_prefix_help, SW_HIDE);
+    ShowWindow(g_ngram_cb, SW_HIDE);
     ShowWindow(g_ngram_cb, SW_HIDE);
     ShowWindow(g_ngram_help, SW_HIDE);
     y += ts(30);

@@ -358,9 +358,9 @@ engine:
   Assert "cpu_cores: 4" (($y | Where-Object { $_ -match '^  cpu_cores: 4$' }).Count -eq 1)
   Assert "无 freq_beta（标定产物退出配置面 2026-11-05）" (($y | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
   Assert "sentence_mode: false（默认关闭，2026-11-22 取代 two_code_sentence）" (($y | Where-Object { $_ -match '^  sentence_mode: false$' }).Count -eq 1)
-  Assert "prefix_confirm: false（前缀自动确认默认关闭，仅整句模式生效）" (($y | Where-Object { $_ -match '^  prefix_confirm: false$' }).Count -eq 1)
-  # 前缀自动确认复选框（2026-11-23）：整句模式关 → 隐藏（只在整句模式显示）
-  Assert "「前缀自动确认」隐藏（整句模式关）" (-not (Visible-Ctl $hw 1022))
+  Assert "无 prefix_confirm 行（2026-11-24 并入 ngram_group）" (($y | Where-Object { $_ -match 'prefix_confirm' }).Count -eq 0)
+  # N-gram 单开关（含前缀自动确认）：整句模式关 → 隐藏
+  Assert "「N-gram 组句候选」隐藏（整句模式关）" (-not (Visible-Ctl $hw 1025))
   Assert "无 expected_length_weight（elw 退役 2026-11-07）" (($y | Where-Object { $_ -match 'expected_length_weight' }).Count -eq 0)
   Assert "debug_fusion: false" (($y | Where-Object { $_ -match '^  debug_fusion: false$' }).Count -eq 1)
   Assert "model_path 未配置 → 注释占位（与插件版同款）" (($y | Where-Object { $_ -match '^  # model_path:' }).Count -eq 1)
@@ -372,34 +372,32 @@ engine:
   # 键序与插件版 Get-LlmCfgLines 逐字一致（两版配置节相同，仅组件行不同）
   $expect = @('  enabled: true', "  code_pattern: '[abcde]{4}'", '  max_tokens: 20',
               '  max_candidates: 6', '  cpu_cores: 4',
-              '  sentence_mode: false', '  prefix_confirm: false',
+              '  sentence_mode: false',
               '  ngram_group: false', '  debug_fusion: false')
   $i0 = 0; for ($i = 0; $i -lt $y.Count; $i++) { if ($y[$i] -match '^llm_rerank:') { $i0 = $i } }
-  $got = @($y[($i0 + 1)..($i0 + 9)])
+  $got = @($y[($i0 + 1)..($i0 + 8)])
   Assert "节内键序与插件版一致" (($got -join '|') -eq ($expect -join '|'))
   Assert "不再产出全局 llm_rerank.yaml" (-not (Test-Path (Join-Path $sandbox "Rime\llm_rerank.yaml")))
   Write-Host "  --- 方案 llm_rerank 节 ---"
   $y[($i0)..([Math]::Min($i0 + 10, $y.Count - 1))] | ForEach-Object { Write-Host ("    " + $_) }
 
-  # phase7b: 前缀自动确认（2026-11-23 用户定案）——只在整句模式勾选时显示；
-  # 值只在整句模式开启时落盘（关整句模式恒 false）
-  Write-Host "== phase7b: 前缀自动确认显隐 + 落盘（仅整句模式）=="
+  # phase7b: N-gram 单开关（2026-11-24 用户定案：前缀自动确认并入）
+  # ——只在整句模式勾选时显示；值只在整句模式开启时落盘；旧键不再出现。
+  Write-Host "== phase7b: N-gram 单开关（含前缀自动确认）显隐 + 落盘 =="
+  Set-Content -LiteralPath $env:LLM_INSTALLER_FAKE_NGRAM_FILE -Value "ok" -Encoding ascii
   Click-Ctl $hw 1021   # IDC_TCS 勾选
-  Assert "整句模式 on → 「前缀自动确认」显示" (Visible-Ctl $hw 1022)
   Assert "整句模式 on → 「N-gram 组句候选」显示" (Visible-Ctl $hw 1025)
-  Click-Ctl $hw 1022   # IDC_PREFIX 勾选
+  Click-Ctl $hw 1025   # IDC_NGRAM 勾选（含前缀自动确认）
   Save-Raw $hw
   $f = Get-Content $test -Encoding UTF8
   Assert "sentence_mode: true（点击勾选）" (($f | Where-Object { $_ -match '^  sentence_mode: true$' }).Count -eq 1)
-  Assert "prefix_confirm: true（勾选后落盘）" (($f | Where-Object { $_ -match '^  prefix_confirm: true$' }).Count -eq 1)
-  Assert "ngram_group: false（未勾选默认 false）" (($f | Where-Object { $_ -match '^  ngram_group: false$' }).Count -eq 1)
+  Assert "ngram_group: true（勾选后落盘，含前缀自动确认）" (($f | Where-Object { $_ -match '^  ngram_group: true$' }).Count -eq 1)
+  Assert "无 prefix_confirm 行（旧键退役，不写）" (($f | Where-Object { $_ -match 'prefix_confirm' }).Count -eq 0)
   Click-Ctl $hw 1021   # 关整句模式
-  Assert "整句模式 off → 「前缀自动确认」隐藏" (-not (Visible-Ctl $hw 1022))
   Assert "整句模式 off → 「N-gram 组句候选」隐藏" (-not (Visible-Ctl $hw 1025))
   Save-Raw $hw
   $f = Get-Content $test -Encoding UTF8
   Assert "sentence_mode: false（点击取消）" (($f | Where-Object { $_ -match '^  sentence_mode: false$' }).Count -eq 1)
-  Assert "prefix_confirm: false（整句模式关 → 恒落 false）" (($f | Where-Object { $_ -match '^  prefix_confirm: false$' }).Count -eq 1)
   Assert "ngram_group: false（整句模式关 → 恒落 false）" (($f | Where-Object { $_ -match '^  ngram_group: false$' }).Count -eq 1)
 
   # phase7c: N-gram 组句资产检测（2026-11-24 用户定案）——勾选时缺资产会询问
