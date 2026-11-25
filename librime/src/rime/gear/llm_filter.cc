@@ -186,12 +186,6 @@ static double g_prefix_ce1 = []() {
   double v = atof(e);
   return (v >= 0.0 && v <= 1e6) ? v : 11.0;
 }();
-static double g_prefix_d = []() {
-  const char *e = getenv("RIME_LLM_PREFIX_D");
-  if (!e || !*e) return 10.0;
-  double v = atof(e);
-  return (v >= 0.0 && v <= 1e6) ? v : 10.0;
-}();
 
 // ═══ 前缀确认门：LightGBM 模型（2026-11-25 用户定案落地）═══
 // 41 个可部署特征（顺序见研究库 eval/calib/export_prefix_gate.py）→
@@ -4230,10 +4224,11 @@ void LlmRerankTranslation::Collect() {
     // 已退役——`xiazai` 在 xia 确认「下」会把 2 字词拆成单字+单字）——组句
     // 句子字数 = 音节数，码数在简拼/双拼/混拼下不是通用单位。链式确认逐次
     // 重新判门（下一次刷新/Collect 在更短的码上重算，不沿用旧 pending）。
-    // **绝对置信度门（2026-11-25 研究定案）**：有效上文 0 字（新文档句首）
-    // → ngram 句分差 d≥g_prefix_d；有效上文 ≤1 字 → 不确认；≥2 字 →
-    // 窗口第 1 候选的首 token CE ≤ g_prefix_ce1；CE 未就绪 → 不确认。
-    // g_prefix_ce1=0 关闭新门（回到 2026-11-24 行为；环境变量 A/B）。
+    // **绝对置信度门（2026-11-25 研究定案）**：**有效上文 <4 字 → 一律
+    // 不确认**（12,000 句实测：0/1/2/3 字精度 90.9/98.2/99.0/99.3%，显著
+    // 低于 ≥4 字的 99.8%）；≥4 字 → 窗口第 1 候选的首 token CE ≤
+    // g_prefix_ce1；CE 未就绪 → 不确认。g_prefix_ce1=0 关闭整块
+    // （回到 2026-11-24 行为；环境变量 A/B）。
     if (g_debug_fusion && !gen_texts.empty())
       log_error("pfx: enter gen=%zu order=%zu", gen_texts.size(),
                 order.size());
@@ -4295,9 +4290,10 @@ void LlmRerankTranslation::Collect() {
           size_t sr = st >= sl ? st - sl : 0;
           if (le >= 0 && want_end < seg_end_ && st >= sl && sr >= 2) {
             // ②b 绝对置信度门（2026-11-25 研究定案）：窗口融合序第 1 的
-            // 首 token CE（原始正 CE）≤ g_prefix_ce1；空上文无 CE → ngram
-            // 句分差 d ≥ g_prefix_d；有效上文 ≤1 字不确认。
-            // 0 = 关闭（回到 2026-11-24 行为）。
+            // 首 token CE（原始正 CE）≤ g_prefix_ce1；**有效上文 <4 字一律
+            // 不确认**（2026-11-25 实测：0/1/2/3 字精度 90.9/98.2/99.0/99.3%，
+            // 显著低于 ≥4 字的 99.8%；空上文无 CE、只靠 ngram 一条腿，随该
+            // 下限一并关闭）。g_prefix_ce1 = 0 时关闭整块（回到 2026-11-24）。
             bool conf_ok = true;
             double ce1_v = NAN, d_v = NAN, model_p = NAN;
             size_t eff_chars = 0;
@@ -4309,26 +4305,8 @@ void LlmRerankTranslation::Collect() {
               }
               eff_chars = utf8_len(eff_ctx);
               size_t i1 = (size_t)order[0];
-              if (eff_chars == 0) {
-                // 空上文：该 lead 的最高分句 vs 最佳不同 lead 句
-                double top_s = -1e308;
-                auto ti = txt_of.find(*lead);
-                if (ti != txt_of.end()) {
-                  auto gi = gen_info.find(ti->second);
-                  if (gi != gen_info.end()) top_s = gi->second.score;
-                }
-                double best_other = -1e308;
-                for (const auto &t : gen_texts) {
-                  auto it = gen_info.find(t);
-                  if (it != gen_info.end() &&
-                      it->second.lead != *lead &&
-                      it->second.score > best_other)
-                    best_other = it->second.score;
-                }
-                d_v = (best_other > -1e307) ? top_s - best_other : 1e9;
-                conf_ok = top_s > -1e307 && d_v >= g_prefix_d;
-              } else if (eff_chars < 2) {
-                conf_ok = false;
+              if (eff_chars < 4) {
+                conf_ok = false;   // 短上文（含空上文）不自动确认
               } else if (g_prefix_model_on) {
                 // ── 模型门（2026-11-25）：41 特征 → 分数 ≥ τ ──
                 if (!(has_score[i1] && i1 < ce3_of.size())) {
