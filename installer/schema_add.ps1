@@ -113,7 +113,7 @@ function Get-LlmCfgLines([string]$modelPath) {
     "  enabled: true",
     "  code_pattern: '.{4}'",
     "  max_tokens: 20",
-    "  max_candidates: 6",
+    "  ce_budget: 12",
     "  cpu_cores: 4",
     "  sentence_mode: false",
     "  ngram_group: false",

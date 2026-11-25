@@ -82,7 +82,7 @@ struct Params {
   // freq_beta 已删（2026-11-05 标定产物退出用户配置面 → β=12 内置常数，两版统一；
 // v3 2026-11-06 六维联合标定：β12/τ400；用户 bigram 项 2026-11-08 退役，
 // 融合项只剩累计 Unigram log(0.5·p1)）
-  int max_candidates = 6;
+  int max_candidates = 12;   // 语义 = CE 预算 ce_budget（2026-11-26）
   bool debug_fusion = false;
   std::wstring model_path;  // 显示值（空 = 默认路径）
 };
@@ -224,7 +224,8 @@ static bool load_legacy_params(Params* p) {
     else if (key == "code_pattern") p->code_pattern = val;
     // expected_length_weight 已退役（2026-11-07 → 布尔开关），不迁移
     else if (key == "max_tokens") p->max_tokens = atoi(val.c_str());
-    else if (key == "max_candidates") p->max_candidates = atoi(val.c_str());
+    else if (key == "ce_budget") p->max_candidates = atoi(val.c_str());
+    else if (key == "max_candidates") p->max_candidates = 2 * atoi(val.c_str());
     else if (key == "cpu_cores") p->cpu_cores = atoi(val.c_str());
     else if (key == "debug_fusion") p->debug_fusion = (val == "true");
     else if (key == "model_path") {
@@ -302,7 +303,8 @@ static bool parse_llm_section(const std::vector<std::string>& lines) {
       g_p.has_ngram_group = true;
     }
     else if (key == "max_tokens") g_p.max_tokens = atoi(val.c_str());
-    else if (key == "max_candidates") g_p.max_candidates = atoi(val.c_str());
+    else if (key == "ce_budget") g_p.max_candidates = atoi(val.c_str());
+    else if (key == "max_candidates") g_p.max_candidates = 2 * atoi(val.c_str());
     else if (key == "cpu_cores") g_p.cpu_cores = atoi(val.c_str());
     else if (key == "debug_fusion") g_p.debug_fusion = (val == "true");
     else if (key == "model_path") g_p.model_path = utf8_to_wide(val);
@@ -318,7 +320,7 @@ static std::vector<std::string> build_llm_section() {
   sec.push_back(g_p.enabled ? "  enabled: true" : "  enabled: false");
   sec.push_back("  code_pattern: " + yaml_scalar(g_p.code_pattern));
   sprintf_s(buf, "  max_tokens: %d", g_p.max_tokens); sec.push_back(buf);
-  sprintf_s(buf, "  max_candidates: %d", g_p.max_candidates); sec.push_back(buf);
+  sprintf_s(buf, "  ce_budget: %d", g_p.max_candidates); sec.push_back(buf);
   sprintf_s(buf, "  cpu_cores: %d", g_p.cpu_cores); sec.push_back(buf);
   sec.push_back(g_p.sentence_mode ? "  sentence_mode: true" : "  sentence_mode: false");
   // N-gram 组句候选（2026-11-24 起含前缀自动确认）：关整句模式恒 false，
@@ -1662,7 +1664,7 @@ static void make_ui() {
   {
     struct { const wchar_t* label; int id; const wchar_t* tip; } rows[] = {
         {L"上文 token 上限:", IDC_MAX_TOK, TIP_MAX_TOK},
-        {L"参与打分的候选数:", IDC_MAX_CAND, TIP_MAX_CAND},
+        {L"CE 预算:", IDC_MAX_CAND, TIP_MAX_CAND},
         {L"CPU 线程数:", IDC_CORES, TIP_CORES}};
     int lw = 0;
     for (int i = 0; i < 3; ++i) {
@@ -2629,11 +2631,14 @@ static void on_bench_threads() {
     set_status(GetDlgItem(g_hwnd, IDC_STATUS), L"已结束上次遗留的实测进程，由本次接管…");
   DeleteFileW(g_bench_out.c_str());
   // 候选数 = 界面上「参与打分的候选数」当前值（= max_candidates）：
-  // 实测的 t_cand 与用户即将保存的推理规模一致（非法/空回退默认 6，上限同工具）
+  // 实测的 t_cand 与用户即将保存的推理规模一致（预算→候选数 = ⌊预算/2⌋；
+  // 非法/空回退 12 → 6）
   wchar_t cbuf[32] = L"";
   GetDlgItemTextW(g_hwnd, IDC_MAX_CAND, cbuf, 32);
-  int ncands = _wtoi(cbuf);
-  if (ncands < 1) ncands = 6;
+  int nb = _wtoi(cbuf);
+  if (nb < 1) nb = 12;
+  int ncands = nb / 2;
+  if (ncands < 1) ncands = 1;
   if (ncands > 32) ncands = 32;
   std::wstring cmd = L"\"" + exe + L"\" --out \"" + g_bench_out + L"\" --trials " +
                      std::to_wstring(kBenchTrials) + L" --cands " +

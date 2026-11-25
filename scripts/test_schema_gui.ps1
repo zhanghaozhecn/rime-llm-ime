@@ -354,7 +354,7 @@ engine:
   Assert "code_pattern 单引号写出 [abcde]{4}" (($y | Where-Object { $_ -match "^  code_pattern: '\[abcde\]\{4\}'$" }).Count -eq 1)
   Assert "enabled: true" (($y | Where-Object { $_ -match '^  enabled: true$' }).Count -eq 1)
   Assert "max_tokens: 20" (($y | Where-Object { $_ -match '^  max_tokens: 20$' }).Count -eq 1)
-  Assert "max_candidates: 6" (($y | Where-Object { $_ -match '^  max_candidates: 6$' }).Count -eq 1)
+  Assert "ce_budget: 12" (($y | Where-Object { $_ -match '^  ce_budget: 12$' }).Count -eq 1)
   Assert "cpu_cores: 4" (($y | Where-Object { $_ -match '^  cpu_cores: 4$' }).Count -eq 1)
   Assert "无 freq_beta（标定产物退出配置面 2026-11-05）" (($y | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
   Assert "sentence_mode: false（默认关闭，2026-11-22 取代 two_code_sentence）" (($y | Where-Object { $_ -match '^  sentence_mode: false$' }).Count -eq 1)
@@ -371,7 +371,7 @@ engine:
   Assert "llm_filter 组件仍恰 1 行" ((($y | Select-String 'llm_filter').Count) -eq 1)
   # 键序与插件版 Get-LlmCfgLines 逐字一致（两版配置节相同，仅组件行不同）
   $expect = @('  enabled: true', "  code_pattern: '[abcde]{4}'", '  max_tokens: 20',
-              '  max_candidates: 6', '  cpu_cores: 4',
+              '  ce_budget: 12', '  cpu_cores: 4',
               '  sentence_mode: false',
               '  ngram_group: false', '  debug_fusion: false')
   $i0 = 0; for ($i = 0; $i -lt $y.Count; $i++) { if ($y[$i] -match '^llm_rerank:') { $i0 = $i } }
@@ -466,7 +466,7 @@ code_pattern: '.{3,4}'
 expected_length_weight: 0.35
 freq_beta: 2.25
 max_tokens: 12
-max_candidates: 6
+ce_budget: 12
 cpu_cores: 7
 debug_fusion: true
 model_path: d:/gguf_models/legacy.gguf
