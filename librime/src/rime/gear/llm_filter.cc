@@ -322,9 +322,10 @@ static std::string ConfirmedPrefixText(Context *ctx);  // fwd decl（前缀确�
 // 共用同一 context/seq0/prep（合并收益：省掉每次一条重复的 ctx forward +
 // O(vocab) 归一化）。历史 128 为 3-token 单独口径（64 时 S2 恒 ~100ms）。
 static int g_n_ctx = 512;
-static int g_n_seq_max = 12;       // template seq 0 + up to 11 worker seqs
-static int g_max_candidates = 6;   // candidates participating in scoring
-                                   // (2026-11-19 随生产模型切 Qwen3-0.6B base 定案 k*=6)
+static int g_n_seq_max = 20;       // template seq 0 + worker seqs（2026-11-26:
+                                   //   CE 预算 12 → 行数 ≤12，留余量）
+static int g_ce_budget = 12;       // CE2+CE3 的总 token 预算（2026-11-26 由「候选数」
+                                   // 改口径；1-token 候选免费；12 = 旧 6 候选等价成本）
 
 // ==== 参数来源（2026-09-30 用户定案：两版统一回归 Rime 原生做法）====
 // **只读方案 schema.yaml 的 llm_rerank: 配置节**（部署期快照 Apply/Initialize）。
@@ -397,7 +398,7 @@ static void llm_apply_params() {
   // 保持定义处 true，排障改代码重编
   g_min_tokens = s.has_min_tokens ? s.min_tokens : 1;
   g_max_ctx_tokens = s.has_max_tokens ? s.max_tokens : 20;
-  g_max_candidates = s.has_max_cand ? s.max_cand : 6;
+  g_ce_budget = s.has_max_cand ? s.max_cand : 12;
   g_n_threads = s.has_cpu_cores ? s.cpu_cores : 4;
   // cap threads at hardware cores: 低核机器不应超订（变慢 + 每线程额外内存）
   unsigned hw = std::thread::hardware_concurrency();
@@ -2169,7 +2170,7 @@ static void write_h(const std::string &schema, const std::string &model) {
   std::string line = "H\t" + id + "\t" + now_stamp() + "\tsource\t" +
                      tsv_escape(schema) + "\t" + tsv_escape(path_base(model)) +
                      "\t" + tsv_escape(g_code_pattern) + "\t" +
-                     std::to_string(g_max_candidates) + "\t" +
+                     std::to_string(g_ce_budget) + "\t" +
                      std::to_string(g_max_ctx_tokens) + "\t" +
                      (g_sentence_mode ? "1" : "0") + "\t" + beta + "\t400";
   corpus_write_raw(line);
@@ -3741,7 +3742,6 @@ void LlmRerankTranslation::Collect() {
   // 在下方融合块）, 其余按层1 序透传。目标在层1 前 k 外 → 必然不在首位
   // （评测 sweep_2layer 同语义, 全窗参评）。文件序无关性: 引擎调频与否仅
   // 影响冷词同分打破（目标卷入 ≤0.05pp 窗, 研究库 §三十三·附 6）。
-  const size_t kMaxRerank = (size_t)(g_max_candidates > 0 ? g_max_candidates : 6);
   std::vector<an<Candidate>> tail;      // 窗外候选（层1 序透传，FM+子词混排）
   std::vector<double> s1_head;   // 层1 分（对齐 candidates_; 无 CE 分回退用）
   std::vector<char> win_fm;      // 窗内候选 FM 标志（对齐 candidates_，整句模式）
@@ -3914,50 +3914,30 @@ void LlmRerankTranslation::Collect() {
     }
     std::stable_sort(idx.begin(), idx.end(),
                      [&s1](size_t a, size_t b) { return s1[a] > s1[b]; });
-    size_t nk = (std::min)(kMaxRerank, allc.size());
+    // 2026-11-26 用户定案：准入改为 **CE 预算**（CE2+CE3 的 token 数）。
+    // 层1 序扫描：1-token 候选免费全收；多 token 花 min(ntok,3)−1 预算
+    // （2-token 花 1、3+ 花 2），预算不足的进 tail（不评分、不竞争首位）。
+    // 依据（wiki 字词重放 8k）：B=9 起贴全池上限，B=12 = 旧 6 候选等价成本。
+    size_t budget = (size_t)(g_ce_budget > 0 ? g_ce_budget : 12);
     // 窗口准入（2026-11-24 统一口径）：层1 词频在等长词+子词里统一取前
-    // nk 进窗（与字词模式一致）。组句不占窗席、不评分，也不进 tail——
+    // 预算进窗（与字词模式一致）。组句不占窗席、不评分，也不进 tail——
     // 它们由显示端单独置顶。**只排除显示置顶的那 1 条**（2026-11-24 真机
     // 报障：旧实现按 top-20 全部文本排除，与组句同名的引擎候选整条消失）。
     const std::string gen_show =
         gen_texts.empty() ? std::string() : gen_texts[0];
     {
       std::vector<bool> in_win(allc.size(), false);
-      size_t taken = 0;
-      // 覆盖档位配额（2026-11-25 用户定案）：收集池按候选**词长**分两档
-      // （1 字 / ≥2 字），每档先各留 2 条，余量再按层1 序填满。依据（luna
-      // 混合窗 399 窗、万象词典、3-token CE、窗 6）：CE 错 48.9%→37.1%、
-      // 有正确 60.2%→72.7%；三档（再分 3 字+）零增益 → 只分两档。
-      // 码长 >16 不做配额（该档覆盖已 97%，瓶颈在 CE 判别力）。
-      const bool use_quota = input_.size() <= 16 && nk >= 6;
-      if (use_quota) {
-        size_t got1 = 0, got2 = 0;
-        for (size_t k = 0; k < idx.size() && taken < nk; k++) {
-          size_t c = idx[k];
-          if (!gen_show.empty() && allc[c]->text() == gen_show)
-            continue;
-          if (in_win[c])
-            continue;
-          size_t n = utf8_len(allc[c]->text());
-          if (n == 1 && got1 < 2) {
-            in_win[c] = true;
-            ++taken;
-            ++got1;
-          } else if (n >= 2 && got2 < 2) {
-            in_win[c] = true;
-            ++taken;
-            ++got2;
-          }
-        }
-      }
-      for (size_t k = 0; k < idx.size() && taken < nk; k++) {
+      for (size_t k = 0; k < idx.size(); k++) {
         size_t c = idx[k];
         if (!gen_show.empty() && allc[c]->text() == gen_show)
           continue;
-        if (in_win[c])
-          continue;
-        in_win[c] = true;
-        ++taken;
+        auto ids = tokenize(allc[c]->text().c_str());
+        int nt = (int)ids.size();
+        size_t cost = nt <= 1 ? 0 : (size_t)((std::min)(nt, 3) - 1);
+        if (cost <= budget) {
+          in_win[c] = true;
+          budget -= cost;
+        }
       }
       for (size_t k = 0; k < idx.size(); k++) {
         size_t c = idx[k];
@@ -3978,7 +3958,7 @@ void LlmRerankTranslation::Collect() {
               (allc.size() < 2 ? "few_candidates" : "model_loading") + "|" +
               live_esc(input_) + "|" + src_);
     for (size_t i = 0; i < allc.size(); i++) {
-      if (i < kMaxRerank)
+      if (i < (size_t)(g_ce_budget > 0 ? g_ce_budget : 12))
         candidates_.push_back(allc[i]);
       else
         tail.push_back(allc[i]);
@@ -4346,7 +4326,28 @@ void LlmRerankTranslation::Collect() {
                 if (!conf.empty()) eff_ctx += conf;
               }
               eff_chars = utf8_len(eff_ctx);
-              size_t i1 = (size_t)order[0];
+              // 2026-11-26 用户定案：整句显示序恢复「先长后短」后，结构证据
+              // 不再要求融合序第 1，而是「lead 的同字数档首选」（1 字档 /
+              // 多字档）——树模型仍吃完整窗口特征，信息不减少。
+              size_t cf_i = (size_t)order[0];
+              {
+                size_t lead_chars = utf8_len(*lead);
+                for (int oi : order) {
+                  size_t nc = utf8_len(candidates_[(size_t)oi]->text());
+                  if ((nc == 1) == (lead_chars == 1)) {
+                    cf_i = (size_t)oi;
+                    break;
+                  }
+                }
+              }
+              // 特征锚点 = lead 本身（不是同档首选）：模型特征在训练侧就是
+              // 以 lead 为中心算的；结构证据另用 cf_i。
+              size_t i1 = cf_i;
+              for (int oi : order)
+                if (candidates_[(size_t)oi]->text() == *lead) {
+                  i1 = (size_t)oi;
+                  break;
+                }
               if (eff_chars < 4) {
                 conf_ok = false;   // 短上文（含空上文）不自动确认
               } else if (g_prefix_model_on) {
@@ -4618,8 +4619,19 @@ void LlmRerankTranslation::Collect() {
                 conf_ok = false;   // CE 未就绪 → 不确认（比按层1 序确认安全）
               }
             }
-            // ③ 窗口融合序第 1 ∧ span/文本一致（文本一致铁律）
+            // ③ 同字数档首选（1 字档 / 多字档）∧ span/文本一致（文本一致铁律）
+            // 2026-11-26：整句显示序恢复「先长后短」，不能再用融合序第 1。
             size_t i1 = (size_t)order[0];
+            {
+              size_t lead_chars = utf8_len(*lead);
+              for (int oi : order) {
+                size_t nc = utf8_len(candidates_[(size_t)oi]->text());
+                if ((nc == 1) == (lead_chars == 1)) {
+                  i1 = (size_t)oi;
+                  break;
+                }
+              }
+            }
             const auto &c1 = candidates_[i1];
             if (c1->text() == *lead && c1->start() == seg_start_ &&
                 c1->end() == want_end && conf_ok) {
@@ -4830,8 +4842,22 @@ void LlmRerankTranslation::Collect() {
     out.reserve(candidates_.size() + tail.size() + 1);
     if (best_gen)
       out.push_back(best_gen);
-    for (auto &c : candidates_)
-      out.push_back(c);
+    if (g_sentence_mode) {
+      // 2026-11-26 用户定案：整句模式恢复「先长后短」显示序（同字数保持
+      // 融合序；融合/准入/前缀判定仍用融合序，不受显示序影响）。
+      std::vector<size_t> di(candidates_.size());
+      for (size_t i = 0; i < di.size(); i++)
+        di[i] = i;
+      std::stable_sort(di.begin(), di.end(), [&](size_t a, size_t b) {
+        return utf8_len(candidates_[a]->text()) >
+               utf8_len(candidates_[b]->text());
+      });
+      for (size_t i : di)
+        out.push_back(candidates_[i]);
+    } else {
+      for (auto &c : candidates_)
+        out.push_back(c);
+    }
     for (auto &c : tail)
       out.push_back(c);
     candidates_.swap(out);
@@ -4892,7 +4918,13 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
     // 方案残留旧行忽略，保存时由 GUI 剥除）。freq_beta 同（2026-11-05）。
     if (config->GetInt("llm_rerank/min_tokens", &v)) { p.has_min_tokens = true; p.min_tokens = v; }
     if (config->GetInt("llm_rerank/max_tokens", &v)) { p.has_max_tokens = true; p.max_tokens = v; }
-    if (config->GetInt("llm_rerank/max_candidates", &v)) { p.has_max_cand = true; p.max_cand = v; }
+    // 2026-11-26：配置项由「候选数」改为「CE 预算」（CE2+CE3 token 数）。
+    // 旧键 max_candidates 兜底映射（预算 = 2×候选数，旧机行为不变）。
+    if (config->GetInt("llm_rerank/ce_budget", &v)) {
+      p.has_max_cand = true; p.max_cand = v;
+    } else if (config->GetInt("llm_rerank/max_candidates", &v)) {
+      p.has_max_cand = true; p.max_cand = 2 * v;
+    }
     if (config->GetInt("llm_rerank/cpu_cores", &v)) { p.has_cpu_cores = true; p.cpu_cores = v; }
     // bool b 复用上方 enabled/debug_fusion 的声明（同作用域）
     // 整句模式（2026-11-22 取代 two_code_sentence）：新键优先；旧键只在新键
