@@ -15,6 +15,7 @@
 // 由 GUI 触发重新部署，部署期快照，无热重载）。
 //
 #include <rime/gear/llm_filter.h>
+#include <rime/gear/prefix_gate_model.h>   // 2026-11-25 前缀确认门模型（生成）
 #include <rime/gear/llm_ngram.h>
 #include <rime/candidate.h>
 #include <rime/config.h>
@@ -38,6 +39,8 @@
 #include <ctime>
 #include <map>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <thread>
 #include <vector>
 #include <boost/regex.hpp>  // code_pattern：与 speller/auto_select_pattern 同引擎同语义
@@ -173,6 +176,85 @@ static double g_prefix_confirm_p = []() {
   double v = e ? atof(e) : 0.95;
   return (v >= 0.0 && v <= 1.0) ? v : 0.95;
 }();
+// 前缀确认绝对置信度门（2026-11-25 研究定案）：窗口融合序第 1 候选的
+// **首 token CE**（原始正 CE，小 = 模型认为该词很可能）≤ 阈值；空上文
+// （无 CE）用 ngram 句分差 d≥阈值；有效上文 ≤1 字不确认（1 字前缀精度
+// 仅 82%）。0 = 关闭（回到 2026-11-24 行为）。环境变量供真机 A/B。
+static double g_prefix_ce1 = []() {
+  const char *e = getenv("RIME_LLM_PREFIX_CE1");
+  if (!e || !*e) return 11.0;
+  double v = atof(e);
+  return (v >= 0.0 && v <= 1e6) ? v : 11.0;
+}();
+static double g_prefix_d = []() {
+  const char *e = getenv("RIME_LLM_PREFIX_D");
+  if (!e || !*e) return 10.0;
+  double v = atof(e);
+  return (v >= 0.0 && v <= 1e6) ? v : 10.0;
+}();
+
+// ═══ 前缀确认门：LightGBM 模型（2026-11-25 用户定案落地）═══
+// 41 个可部署特征（顺序见研究库 eval/calib/export_prefix_gate.py）→
+// LightGBM 300 树 / 15 叶 → p̂ ≥ τ 才确认；取代 `P≥0.95 ∧ ce1≤11` 两道
+// 手调门（P 仍是特征之一；训练域下界 p≥0.5 保留）。模型表随源码编译内嵌
+// （prefix_gate_model.h，研究库 export 子命令生成）。
+// A/B：RIME_LLM_PREFIX_MODEL=0 禁用模型（回退 ce1 门）、
+// RIME_LLM_PREFIX_TAU 覆盖 τ、RIME_LLM_PREFIX_TABLOCK=0 关 ta 族黑名单。
+static bool g_prefix_model_on = []() {
+  const char *e = getenv("RIME_LLM_PREFIX_MODEL");
+  if (e && *e && atof(e) == 0.0) return false;
+  return true;
+}();
+static double g_prefix_tau = []() {
+  const char *e = getenv("RIME_LLM_PREFIX_TAU");
+  if (!e || !*e) return kPrefixTau;
+  double v = atof(e);
+  return (v >= 0.0 && v <= 1.0) ? v : kPrefixTau;
+}();
+static bool g_prefix_tablock_on = []() {
+  const char *e = getenv("RIME_LLM_PREFIX_TABLOCK");
+  return !(e && *e && atof(e) == 0.0);
+}();
+
+// ta 族（先验可论证的结构性同音歧义；研究库 2026-11-25：40 触发 13 错，
+// 真实用户域 8/10 = 80%；禁用后整体 +0.07~0.08pp、user 域 +0.55pp）
+static bool PrefixTaBlocked(const std::string &lead) {
+  static const char *kTa[] = {"他", "它", "她", "他们", "它们", "她们"};
+  for (const char *t : kTa)
+    if (lead == t) return true;
+  return false;
+}
+
+// 字频表（模型文件自带；8421 字 → 首次访问建 unordered_map，一次 ~1ms）
+static float PrefixCharFreq(const std::string &ch) {
+  static const std::unordered_map<std::string, float> m = []() {
+    std::unordered_map<std::string, float> t;
+    t.reserve((size_t)kPrefixFreqN * 2);
+    for (int i = 0; i < kPrefixFreqN; i++)
+      t.emplace(kPrefixFreqChar[i], kPrefixFreqLog[i]);
+    return t;
+  }();
+  auto it = m.find(ch);
+  return it == m.end() ? -13.0f : it->second;
+}
+
+// 树推理（平坦数组，节点下标 1-based/树内；全局 = off + local−1）
+static double PrefixModelScore(const double *x) {
+  double s = 0.0;
+  for (int t = 0; t < kPrefixTreeN; t++) {
+    const int off = kPrefixTreeOff[t];
+    int node = off;                        // 0-based 全局下标（local 1）
+    while (kPrefixF[node] != 0) {
+      const int f = kPrefixF[node] - 1;
+      node = off +
+             (x[f] <= kPrefixT[node] ? kPrefixL[node] : kPrefixR[node]) - 1;
+    }
+    s += kPrefixV[node];
+  }
+  if (s > 35.0) return 1.0;
+  if (s < -35.0) return 0.0;
+  return 1.0 / (1.0 + std::exp(-s));
+}
 
 // ── N-gram 组句候选（2026-11-23 整句模式第②段，与插件版同构）─────────
 // 组句器 = llm_ngram.{h,cc}（万象 LTS `.gram` + 万象词库词级 beam，算法与
@@ -213,6 +295,11 @@ static bool g_in_confirm = false;  // 防重入（Select → Compose → Apply �
 //  0.60), 用户域 34k + wiki 池化 180k 网格, 偶半选→奇半验四半区一致, 见
 //  研究库 calibrate_model_05b; 旧 β=12/(1.05,0.45) 为 0.8B v3 六维值)
 static double g_freq_beta = 14.0;
+// CE 位置权重（唯一真源；2026-11-14 随默认模型 0.5B 重标定, 旧 1.05/0.45 为
+// 0.8B v3 值）。2026-11-25 从前缀门函数内提到文件作用域——模型门的 41 特征里
+// 的 CE 加权和也要用它，两处必须同值。
+static constexpr double kCeW[3] = {1.0, 1.10, 0.60};
+
 // debug_fusion 诊断 (2026-09-03 插件版先行、本文件移植): true = 逐块记录
 // 评分→词频融合→词长加成全过程写 rime_llm_debug.txt (与插件版同名同格式;
 // 差异: commit 行无码字段 — OnCommit 只收到上屏文本; reset 行按代次触发,
@@ -2743,7 +2830,6 @@ static bool score_batch(const std::vector<llama_token> &ctx_ids,
   auto ts_ce1_0 = std::chrono::high_resolution_clock::now();
   std::vector<double> ce_sum(n_cands, 0.0);
   // CE 位置权重 (kCeW[0/1/2]): 见文件头注释; 4+ token 只算前三项, 无外推
-  static constexpr double kCeW[3] = {1.0, 1.10, 0.60};  // 2026-11-14 随默认模型 0.5B 重标定 (旧 1.05/0.45 为 0.8B v3 值, 见文件头注释)
   for (int i = 0; i < n_cands; i++) {
     double c1 = ce_target(ctx_logits, cands[i][0], m0, lse0);
     ce_sum[i] = kCeW[0] * c1;
@@ -4144,6 +4230,13 @@ void LlmRerankTranslation::Collect() {
     // 已退役——`xiazai` 在 xia 确认「下」会把 2 字词拆成单字+单字）——组句
     // 句子字数 = 音节数，码数在简拼/双拼/混拼下不是通用单位。链式确认逐次
     // 重新判门（下一次刷新/Collect 在更短的码上重算，不沿用旧 pending）。
+    // **绝对置信度门（2026-11-25 研究定案）**：有效上文 0 字（新文档句首）
+    // → ngram 句分差 d≥g_prefix_d；有效上文 ≤1 字 → 不确认；≥2 字 →
+    // 窗口第 1 候选的首 token CE ≤ g_prefix_ce1；CE 未就绪 → 不确认。
+    // g_prefix_ce1=0 关闭新门（回到 2026-11-24 行为；环境变量 A/B）。
+    if (g_debug_fusion && !gen_texts.empty())
+      log_error("pfx: enter gen=%zu order=%zu", gen_texts.size(),
+                order.size());
     if (g_prefix_confirm && g_sentence_mode && !gen_texts.empty() &&
         !order.empty()) {
       // ① lead 概率质量（top-20 softmax，按 lead 分组）
@@ -4176,7 +4269,20 @@ void LlmRerankTranslation::Collect() {
             lead = &kv.first;
           }
         }
-        if (lead && tot > 0.0 && best / tot >= g_prefix_confirm_p) {
+        // 模型门取代 P≥0.95 硬门（2026-11-25 用户定案）：P 只作特征之一，
+        // 这里只留训练域下界 p≥0.5（cohort 只在该区间标定）。模型关闭时
+        // 仍用旧 P 阈值。ta 族黑名单同在此处拦掉（结构性同音歧义）。
+        const double p_gate = g_prefix_model_on ? 0.5 : g_prefix_confirm_p;
+        if (g_debug_fusion && lead && tot > 0.0) {
+          if (best / tot < p_gate)
+            log_error("pfx: p below gate lead='%.16s' p=%.3f pgate=%.2f",
+                      lead->c_str(), best / tot, p_gate);
+          else if (g_prefix_tablock_on && PrefixTaBlocked(*lead))
+            log_error("pfx: ta blocked lead='%.16s' p=%.3f",
+                      lead->c_str(), best / tot);
+        }
+        if (lead && tot > 0.0 && best / tot >= p_gate &&
+            !(g_prefix_tablock_on && PrefixTaBlocked(*lead))) {
           int le = le_of[*lead];
           size_t want_end = seg_start_ + (size_t)le;
           // ② 音节守卫：句子字数 = 音节数；**剩余必须 ≥2 音节**
@@ -4188,11 +4294,219 @@ void LlmRerankTranslation::Collect() {
           size_t st = utf8_len(txt_of[*lead]);
           size_t sr = st >= sl ? st - sl : 0;
           if (le >= 0 && want_end < seg_end_ && st >= sl && sr >= 2) {
+            // ②b 绝对置信度门（2026-11-25 研究定案）：窗口融合序第 1 的
+            // 首 token CE（原始正 CE）≤ g_prefix_ce1；空上文无 CE → ngram
+            // 句分差 d ≥ g_prefix_d；有效上文 ≤1 字不确认。
+            // 0 = 关闭（回到 2026-11-24 行为）。
+            bool conf_ok = true;
+            double ce1_v = NAN, d_v = NAN, model_p = NAN;
+            size_t eff_chars = 0;
+            if (g_prefix_ce1 > 0.0 || g_prefix_model_on) {
+              std::string eff_ctx = ctx_;
+              if (engine_ && engine_->context()) {
+                std::string conf = ConfirmedPrefixText(engine_->context());
+                if (!conf.empty()) eff_ctx += conf;
+              }
+              eff_chars = utf8_len(eff_ctx);
+              size_t i1 = (size_t)order[0];
+              if (eff_chars == 0) {
+                // 空上文：该 lead 的最高分句 vs 最佳不同 lead 句
+                double top_s = -1e308;
+                auto ti = txt_of.find(*lead);
+                if (ti != txt_of.end()) {
+                  auto gi = gen_info.find(ti->second);
+                  if (gi != gen_info.end()) top_s = gi->second.score;
+                }
+                double best_other = -1e308;
+                for (const auto &t : gen_texts) {
+                  auto it = gen_info.find(t);
+                  if (it != gen_info.end() &&
+                      it->second.lead != *lead &&
+                      it->second.score > best_other)
+                    best_other = it->second.score;
+                }
+                d_v = (best_other > -1e307) ? top_s - best_other : 1e9;
+                conf_ok = top_s > -1e307 && d_v >= g_prefix_d;
+              } else if (eff_chars < 2) {
+                conf_ok = false;
+              } else if (g_prefix_model_on) {
+                // ── 模型门（2026-11-25）：41 特征 → 分数 ≥ τ ──
+                if (!(has_score[i1] && i1 < ce3_of.size())) {
+                  conf_ok = false;    // CE 未就绪 → 不判
+                } else {
+                  auto ce_sum = [&](size_t ci, int *ntok) {
+                    double s = 0.0;
+                    int nt = 0;
+                    for (int k = 0; k < 3; k++) {
+                      double c = ce3_of[ci][(size_t)k];
+                      if (c == c && c > -1e8) { s += kCeW[k] * c; nt++; }
+                    }
+                    *ntok = nt;
+                    return s;
+                  };
+                  // 评分窗 CE 序（升 ce；同分保持 order 序 = 研究侧稳定排序）
+                  std::vector<std::pair<double, size_t>> ceord;
+                  for (size_t oi = 0; oi < order.size(); oi++) {
+                    size_t ci = (size_t)order[oi];
+                    if (!has_score[ci] || ci >= ce3_of.size()) continue;
+                    int nt = 0;
+                    double cs = ce_sum(ci, &nt);
+                    if (nt > 0) ceord.emplace_back(cs, ci);
+                  }
+                  std::stable_sort(ceord.begin(), ceord.end(),
+                                   [](const std::pair<double, size_t> &a,
+                                      const std::pair<double, size_t> &b) {
+                                     return a.first < b.first;
+                                   });
+                  int lead_nt = 0;
+                  double lead_ce = ce_sum(i1, &lead_nt);
+                  if (lead_nt == 0) {
+                    conf_ok = false;
+                  } else {
+                    const size_t kNone = (size_t)-1;
+                    size_t r2i = kNone;
+                    for (const auto &e : ceord)
+                      if (candidates_[e.second]->text() != *lead) {
+                        r2i = e.second;
+                        break;
+                      }
+                    double r2_ce = 0.0, r2_ce1 = -1.0, wm = 0.0;
+                    int r2_nt = 0;
+                    size_t r2_chars = 0;
+                    if (r2i != kNone) {
+                      int nt2 = 0;
+                      r2_ce = ce_sum(r2i, &nt2);
+                      r2_nt = nt2;
+                      double c1r2 = ce3_of[r2i][0];
+                      r2_ce1 = (c1r2 == c1r2) ? c1r2 : -1.0;
+                      r2_chars = utf8_len(candidates_[r2i]->text());
+                      wm = r2_ce - lead_ce;
+                    }
+                    // 组句侧
+                    double top_s = -1e308;
+                    std::string top_lead;
+                    if (!gen_texts.empty()) {
+                      auto gi = gen_info.find(gen_texts[0]);
+                      if (gi != gen_info.end()) {
+                        top_s = gi->second.score;
+                        top_lead = gi->second.lead;
+                      }
+                    }
+                    double best_other = -1e308;
+                    int cnt_lead = 0;
+                    for (const auto &t : gen_texts) {
+                      auto it = gen_info.find(t);
+                      if (it == gen_info.end()) continue;
+                      if (it->second.lead == *lead) cnt_lead++;
+                      if (!top_lead.empty() && it->second.lead != top_lead &&
+                          it->second.score > best_other)
+                        best_other = it->second.score;
+                    }
+                    double dv = (top_s > -1e307 && best_other > -1e307)
+                                    ? top_s - best_other : 30.0;
+                    if (dv > 40.0) dv = 40.0;
+                    double top_score = (top_s > -1e307) ? -top_s : 60.0;
+                    if (top_score > 60.0) top_score = 60.0;
+                    const double p = best / tot;
+                    double c1 = ce3_of[i1][0], c2 = ce3_of[i1][1],
+                           c3v = ce3_of[i1][2];
+                    const double ce1f = (c1 == c1) ? c1 : -1.0;
+                    const double ce2f = (c2 == c2) ? c2 : -1.0;
+                    const double ce3f = (c3v == c3v) ? c3v : -1.0;
+                    int n_single = 0, n_same_span = 0;
+                    const size_t lead_end_abs = seg_start_ + (size_t)le;
+                    for (const auto &cp : candidates_) {
+                      if (utf8_len(cp->text()) == 1) n_single++;
+                      if (cp->end() == lead_end_abs) n_same_span++;
+                    }
+                    double cf_min = 1e9, cf_sum = 0.0;
+                    int cf_n = 0;
+                    for (size_t b = 0; b < lead->size();) {
+                      unsigned char ch = (unsigned char)(*lead)[b];
+                      size_t cl = (ch < 0x80) ? 1
+                                 : (ch >= 0xF0) ? 4
+                                 : (ch >= 0xE0) ? 3 : 2;
+                      std::string one = lead->substr(b, cl);
+                      b += cl;
+                      double fv = PrefixCharFreq(one);
+                      cf_sum += fv;
+                      cf_n++;
+                      if (fv < cf_min) cf_min = fv;
+                    }
+                    const size_t lead_len = sl;
+                    const double ntok = (double)lead_nt;
+                    double x[kPrefixFeatN];
+                    int xi = 0;
+                    x[xi++] = p;
+                    x[xi++] = std::log((std::max)(p, 1e-6) /
+                                       (std::max)(1.0 - p, 1e-6));
+                    x[xi++] = dv;
+                    x[xi++] = top_score;
+                    x[xi++] = (double)mass.size();
+                    x[xi++] = (double)cnt_lead;
+                    x[xi++] = (double)gen_texts.size();
+                    x[xi++] = (double)st;
+                    x[xi++] = (double)lead_len;
+                    x[xi++] = (double)sr;
+                    x[xi++] = (double)le;
+                    x[xi++] = (double)lead_len / (std::max)((double)le, 1.0);
+                    x[xi++] = wm;
+                    x[xi++] = (double)ceord.size();
+                    x[xi++] = (double)candidates_.size();
+                    x[xi++] = (double)(seg_end_ - seg_start_);
+                    x[xi++] = (double)eff_chars;
+                    x[xi++] = ce1f;
+                    x[xi++] = ce2f;
+                    x[xi++] = ce3f;
+                    x[xi++] = lead_ce;
+                    x[xi++] = ntok;
+                    x[xi++] = (double)lead_len / (std::max)(ntok, 1.0);
+                    x[xi++] = lead_ce / (std::max)(ntok, 1.0);
+                    x[xi++] = lead_ce / (std::max)((double)lead_len, 1.0);
+                    x[xi++] = ntok > 1.0 ? 1.0 : 0.0;
+                    x[xi++] = r2_ce1;
+                    x[xi++] = r2_ce;
+                    x[xi++] = (double)r2_nt;
+                    x[xi++] = r2_ce / (std::max)((double)r2_nt, 1.0);
+                    x[xi++] = (double)(r2_nt - lead_nt);
+                    x[xi++] = ce1f / (std::max)((double)lead_len, 1.0);
+                    x[xi++] = (double)r2_chars;
+                    x[xi++] = r2_chars == 1 ? 1.0 : 0.0;
+                    x[xi++] = r2_ce1 - ce1f;
+                    x[xi++] = (double)n_single;
+                    x[xi++] = (double)n_same_span;
+                    x[xi++] = lead_len == 1 ? 1.0 : 0.0;
+                    x[xi++] = (double)n_single /
+                              (std::max)((double)candidates_.size(), 1.0);
+                    x[xi++] = cf_n ? cf_min : -13.0;
+                    x[xi++] = cf_n ? cf_sum / cf_n : -13.0;
+                    model_p = PrefixModelScore(x);
+                    conf_ok = model_p >= g_prefix_tau;
+                    if (getenv("RIME_LLM_PREFIX_DUMP")) {   // 特征对拍用
+                      std::string dump;
+                      char nb[64];
+                      for (int k = 0; k < kPrefixFeatN; k++) {
+                        snprintf(nb, sizeof nb, k ? "	%.9g" : "%.9g", x[k]);
+                        dump += nb;
+                      }
+                      snprintf(nb, sizeof nb, "	%.9g", model_p);
+                      dump += nb;
+                      log_error("pfxdump: %s", dump.c_str());
+                    }
+                  }
+                }
+              } else if (has_score[i1] && i1 < ce3_of.size()) {
+                ce1_v = ce3_of[i1][0];
+                conf_ok = (ce1_v == ce1_v) && ce1_v <= g_prefix_ce1;
+              } else {
+                conf_ok = false;   // CE 未就绪 → 不确认（比按层1 序确认安全）
+              }
+            }
             // ③ 窗口融合序第 1 ∧ span/文本一致（文本一致铁律）
             size_t i1 = (size_t)order[0];
             const auto &c1 = candidates_[i1];
             if (c1->text() == *lead && c1->start() == seg_start_ &&
-                c1->end() == want_end) {
+                c1->end() == want_end && conf_ok) {
               std::lock_guard<std::mutex> lk(g_pending_confirm_mu);
               g_pending_confirm.valid = true;
               g_pending_confirm.tries = 0;
@@ -4201,12 +4515,21 @@ void LlmRerankTranslation::Collect() {
               g_pending_confirm.text = c1->text();
               g_pending_confirm.end_pos = c1->end();
               if (g_debug_fusion)
-                log_error("pfx: pending='%s' end=%d p=%.3f syll=%zu+%zu",
+                log_error("pfx: pending='%s' end=%d p=%.3f syll=%zu+%zu "
+                          "ce1=%.2f d=%.1f ctx=%zu mp=%.4f tau=%.4f",
                           c1->text().c_str(), (int)c1->end(), best / tot, sl,
-                          sr);
+                          sr, ce1_v, d_v, eff_chars, model_p,
+                          g_prefix_model_on ? g_prefix_tau : 0.0);
             } else if (g_debug_fusion) {
-              log_error("pfx: rank1 '%s' != lead '%.16s' p=%.3f",
-                        c1->text().c_str(), lead->c_str(), best / tot);
+              if (c1->text() == *lead && c1->start() == seg_start_ &&
+                  c1->end() == want_end)
+                log_error("pfx: conf fail lead='%.16s' ce1=%.2f d=%.1f "
+                          "ctx=%zu mp=%.4f ce1_thr=%.1f tau=%.4f",
+                          lead->c_str(), ce1_v, d_v, eff_chars, model_p,
+                          g_prefix_ce1, g_prefix_tau);
+              else
+                log_error("pfx: rank1 '%s' != lead '%.16s' p=%.3f",
+                          c1->text().c_str(), lead->c_str(), best / tot);
             }
           } else if (g_debug_fusion) {
             log_error("pfx: guard lead='%.16s' syll=%zu+%zu need=2",
