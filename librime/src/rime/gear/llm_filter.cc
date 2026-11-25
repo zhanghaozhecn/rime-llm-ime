@@ -2561,6 +2561,21 @@ static size_t utf8_len(const std::string &s) {
   return n;
 }
 
+// 连续重复字母闸（2026-11-25，学万象 limit_repeated）：全拼里同一字母连续
+// ≥8 次一定是异常输入（连打/误触），会在引擎侧放大候选枚举。返回是否超限。
+static bool has_repeat_run(const std::string &s, size_t limit) {
+  size_t run = 1;
+  for (size_t i = 1; i < s.size(); i++) {
+    if (s[i] == s[i - 1]) {
+      if (++run >= limit)
+        return true;
+    } else {
+      run = 1;
+    }
+  }
+  return false;
+}
+
 // ============================================================
 // tokenize
 // ============================================================
@@ -3739,12 +3754,11 @@ void LlmRerankTranslation::Collect() {
   // 一次性完整翻译所有候选——朙月大词库的候选爆炸主要来自连续声母简拼
   // （全拼串的 completion 有限，简拼串海量），单码秒级 CPU
   // （enabled=false 对照实测 40 倍差）→ 每键卡死。
-  // 双重限制：16 上限 + **30ms 时间预算**（个数闸管收多少、预算闸管贵不
+  // 双重限制：上限 + **30ms 时间预算**（个数闸管收多少、预算闸管贵不
   // 贵；深枚举的单次 Peek 内部秒级、预算无法打断——必须在深枚举发起前
-  // 拦住）。上限取 16（2026-11-23 wiki 全拼实测：真实引擎候选序中正确候选
-  // 位置 p95=2 / p99=7 / p99.9=20，16 覆盖 99.82% 词型、99.92% 词频加权；
-  // 32 的边际覆盖仅 +0.16pp，性价比不足）。
-  constexpr size_t kMaxCollect = 16;
+  // 拦住）。2026-11-25：上限 16 → 64（覆盖档位配额需要更深的候选池；
+  // 实测同一码拉 1 条与 64 条耗时相同——开销在译文构造，不在逐个取候选）。
+  constexpr size_t kMaxCollect = 64;
   const auto collect_budget = std::chrono::milliseconds(30);
   const auto collect_start = std::chrono::steady_clock::now();
   for (size_t n = 0; n < kMaxCollect; n++) {
@@ -3910,9 +3924,37 @@ void LlmRerankTranslation::Collect() {
     {
       std::vector<bool> in_win(allc.size(), false);
       size_t taken = 0;
+      // 覆盖档位配额（2026-11-25 用户定案）：收集池按候选**词长**分两档
+      // （1 字 / ≥2 字），每档先各留 2 条，余量再按层1 序填满。依据（luna
+      // 混合窗 399 窗、万象词典、3-token CE、窗 6）：CE 错 48.9%→37.1%、
+      // 有正确 60.2%→72.7%；三档（再分 3 字+）零增益 → 只分两档。
+      // 码长 >16 不做配额（该档覆盖已 97%，瓶颈在 CE 判别力）。
+      const bool use_quota = input_.size() <= 16 && nk >= 6;
+      if (use_quota) {
+        size_t got1 = 0, got2 = 0;
+        for (size_t k = 0; k < idx.size() && taken < nk; k++) {
+          size_t c = idx[k];
+          if (!gen_show.empty() && allc[c]->text() == gen_show)
+            continue;
+          if (in_win[c])
+            continue;
+          size_t n = utf8_len(allc[c]->text());
+          if (n == 1 && got1 < 2) {
+            in_win[c] = true;
+            ++taken;
+            ++got1;
+          } else if (n >= 2 && got2 < 2) {
+            in_win[c] = true;
+            ++taken;
+            ++got2;
+          }
+        }
+      }
       for (size_t k = 0; k < idx.size() && taken < nk; k++) {
         size_t c = idx[k];
         if (!gen_show.empty() && allc[c]->text() == gen_show)
+          continue;
+        if (in_win[c])
           continue;
         in_win[c] = true;
         ++taken;
@@ -5520,6 +5562,19 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
 
   // context source: TSF caret text, or commit history fallback
   auto [ctx, src] = GetContextTextPair();
+  // 输入闸（2026-11-25，学万象 limit_repeated）：单段码 >30 字母或连续重复
+  // ≥8 → 不重排（不收集/不推理），按引擎原序透传。长码每键开销随码长超线性
+  // 增长（实测 41 字母整串 80ms，与万象剖析 P99 36ms 同级），LLM 收益集中
+  // 在短码；闸门命中直接返回原 translation（与插件版同构）。
+  if (code.size() > 30 || has_repeat_run(code, 8)) {
+    const char *why = code.size() > 30 ? "code_too_long" : "code_repeat";
+    std::string wid = new_event_id("W", g_user_tick);
+    write_w(wid, src, code, ctx, {}, {}, {}, g_user_tick, "skip", why, false,
+            "");
+    live_send(std::string("S|") + now_hms() + "|" + why + "|" +
+              live_esc(code) + "|" + src);
+    return translation;
+  }
   // 组合区已确认前缀追加到 ctx（2026-11-23，§11.8 协同）：已确认词是确定
   // token，LLM 上下文必须包含；P 在末尾、截断取末 max_ctx token 时不会被
   // 挤掉（仅 P 自身超长才会被截尾）。
