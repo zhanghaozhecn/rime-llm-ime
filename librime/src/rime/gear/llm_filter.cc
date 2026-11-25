@@ -4480,6 +4480,102 @@ void LlmRerankTranslation::Collect() {
                               (std::max)((double)candidates_.size(), 1.0);
                     x[xi++] = cf_n ? cf_min : -13.0;
                     x[xi++] = cf_n ? cf_sum / cf_n : -13.0;
+                    // ── CE 分布特征 ss12（2026-11-25，与研究侧 dist_feats 同构）──
+                    // S = 评分窗内有 CE ∧ end == lead_end_abs 的候选簇（lead 必收）；
+                    // 「簇内次优」= CE 升序第 2 个；质量 = softmax(−CE)（减常数不变）
+                    struct SsEnt {
+                      double ce, ce1;
+                      bool is_lead, has1;
+                      std::string txt;
+                    };
+                    std::vector<SsEnt> ss;
+                    for (const auto &e : ceord) {
+                      if (candidates_[e.second]->end() != lead_end_abs) continue;
+                      double v1 = ce3_of[e.second][0];
+                      bool h1 = (v1 == v1) && v1 >= 0.0;
+                      ss.push_back({e.first, h1 ? v1 : 0.0,
+                                    candidates_[e.second]->text() == *lead, h1,
+                                    candidates_[e.second]->text()});
+                    }
+                    bool lead_in_ss = false;
+                    for (const auto &s : ss) lead_in_ss = lead_in_ss || s.is_lead;
+                    if (!lead_in_ss)
+                      ss.push_back({lead_ce, ce1f >= 0.0 ? ce1f : 0.0, true,
+                                    ce1f >= 0.0, *lead});
+                    // 并列按文本打破（与 Python/插件同一规则，勿用迭代顺序）
+                    std::stable_sort(ss.begin(), ss.end(),
+                                     [](const SsEnt &a, const SsEnt &b) {
+                                       if (a.ce != b.ce) return a.ce < b.ce;
+                                       return a.txt < b.txt;
+                                     });
+                    double ss_n = (double)ss.size(), ss_rank_w = 0.0,
+                           ss_rank_1 = 0.0, ss_wgap = 0.0, ss_1gap = 0.0,
+                           ss_ent = 0.0, ss_pmass = 1.0, ss_range = 0.0,
+                           ss_top2 = 0.0, ss_best = 1.0, ss_near = 0.0,
+                           ss_gratio = 0.0;
+                    if (ceord.size() < 2) {
+                      ss_n = (double)ceord.size();  // 研究侧 len(win)<2 分支
+                    } else if (!ss.empty()) {
+                      ss_rank_1 = -1.0;
+                      size_t lead_pos = 0;
+                      double mn = ss[0].ce, mx = ss[0].ce;
+                      for (size_t t = 0; t < ss.size(); t++) {
+                        if (ss[t].is_lead) lead_pos = t;
+                        if (ss[t].ce < mn) mn = ss[t].ce;
+                        if (ss[t].ce > mx) mx = ss[t].ce;
+                        if (ss[t].ce <= lead_ce + 1.0) ss_near += 1.0;
+                      }
+                      double sumw = 0.0, leadw = 0.0;
+                      for (const auto &s : ss) {
+                        double w = std::exp(-(s.ce - mn));
+                        sumw += w;
+                        if (s.is_lead) leadw = w;
+                      }
+                      ss_rank_w = (double)lead_pos;
+                      ss_wgap = ss.size() > 1 ? ss[1].ce - lead_ce : 0.0;
+                      ss_top2 = ss.size() > 1 ? ss[1].ce - ss[0].ce : 0.0;
+                      ss_range = mx - mn;
+                      ss_pmass = leadw / (std::max)(sumw, 1e-300);
+                      ss_best = (lead_pos == 0) ? 1.0 : 0.0;
+                      ss_gratio = ss_wgap / (mx - mn + 1e-6);
+                      for (const auto &s : ss) {
+                        double pv = std::exp(-(s.ce - mn)) /
+                                    (std::max)(sumw, 1e-300);
+                        if (pv > 0.0) ss_ent -= pv * std::log(pv);
+                      }
+                      std::vector<size_t> cs;
+                      for (size_t t = 0; t < ss.size(); t++)
+                        if (ss[t].has1) cs.push_back(t);
+                      std::stable_sort(cs.begin(), cs.end(),
+                                       [&](size_t a, size_t b) {
+                                         if (ss[a].ce1 != ss[b].ce1)
+                                           return ss[a].ce1 < ss[b].ce1;
+                                         return ss[a].txt < ss[b].txt;
+                                       });
+                      size_t lead_c = kNone;
+                      for (size_t t = 0; t < cs.size(); t++)
+                        if (ss[cs[t]].is_lead) {
+                          lead_c = t;
+                          break;
+                        }
+                      if (lead_c != kNone) {
+                        ss_rank_1 = (double)lead_c;
+                        if (cs.size() > 1)
+                          ss_1gap = ss[cs[1]].ce1 - ss[cs[lead_c]].ce1;
+                      }
+                    }
+                    x[xi++] = ss_n;
+                    x[xi++] = ss_rank_w;
+                    x[xi++] = ss_rank_1;
+                    x[xi++] = ss_wgap;
+                    x[xi++] = ss_1gap;
+                    x[xi++] = ss_ent;
+                    x[xi++] = ss_pmass;
+                    x[xi++] = ss_range;
+                    x[xi++] = ss_top2;
+                    x[xi++] = ss_best;
+                    x[xi++] = ss_near;
+                    x[xi++] = ss_gratio;
                     model_p = PrefixModelScore(x);
                     conf_ok = model_p >= g_prefix_tau;
                     if (getenv("RIME_LLM_PREFIX_DUMP")) {   // 特征对拍用
