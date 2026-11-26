@@ -175,12 +175,18 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       }
       switch (LOWORD(wp)) {
         // —— 设置列（原 WeaselLLMSetup）——
+        // **必须与 Setup 的 WM_COMMAND switch 逐条同步**：本段是手写并集，
+        // 曾经漏过 IDC_TCS / IDC_NGRAM（2026-11-26 另一台机器实测：Studio 里
+        // 点「整句模式」勾选框会变勾，但锁定编码匹配、显示 N-gram 行、检测
+        // 万象资产全都不发生——独立 Setup.exe 正常）。gen 尾部有 case 集合自检。
+        case IDC_TCS: on_sent_toggle(); return 0;
+        case IDC_NGRAM: on_ngram_toggle(); return 0;
         case IDC_BROWSE: on_browse(); return 0;
         case IDC_BENCH: on_bench_threads(); return 0;
         case IDC_DOWNLOAD: on_download_model(); return 0;
         case IDC_SCHEMAREM: on_schema_remove(); return 0;
         case IDC_SAVE: save_schema_params(); return 0;
-        case IDC_CLOSE: DestroyWindow(h); return 0;
+        case IDC_CLOSE: close_with_confirm(h); return 0;
         // —— 调试列（原 WeaselLLMDebug）——
         case IDC_PAUSE:
           g_paused = !g_paused;
@@ -205,7 +211,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           update_current();
           return 0;
         case IDCANCEL:            // IsDialogMessage 把 ESC 映射为 IDCANCEL
-          DestroyWindow(h);
+          close_with_confirm(h);
           return 0;
       }
       // 合并流点击（2026-11-17）：推理行（◆）→ 详情切到该条；日志行不可点开——
@@ -304,6 +310,9 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
       }
       break;
+    case WM_CLOSE:
+      close_with_confirm(h);   // A5：下载中关窗先确认（X 按钮走这里；与 Setup 同口径）
+      return 0;
     case WM_DESTROY:
       KillTimer(h, DL_TIMER_ID);
       KillTimer(h, BENCH_TIMER_ID);
@@ -531,6 +540,19 @@ def main():
     if code_residual:
         sys.exit(f"FATAL: TIMER_DRAIN code residual: {code_residual}")
     print("  check TIMER_DRAIN: only in comments ✓")
+    # —— 设置列命令分发防漂移（2026-11-26 另一台机器实测：Studio 里点「整句模式」
+    #    勾选框变勾但处理器不触发——漏同步 IDC_TCS / IDC_NGRAM 两个 case）。
+    #    壳层 WM_COMMAND 是手写并集，新增/改名设置列命令时容易只改 Setup。
+    #    这里从 Setup 源码的 WM_COMMAND 段抓全部 case IDC_xxx，断言一个不少。
+    cmd_sec = "\n".join(slice_between(setup_lines, "    case WM_COMMAND:",
+                                      "    case WM_DRAWITEM:"))
+    setup_cases = set(re.findall(r"case\s+(IDC_[A-Z_]+)\s*:", cmd_sec))
+    if not setup_cases:
+        sys.exit("FATAL: Setup WM_COMMAND 段未解析到任何 case IDC_xxx")
+    missing = sorted(c for c in setup_cases if f"case {c}:" not in full)
+    if missing:
+        sys.exit(f"FATAL: Studio WM_COMMAND 漏 case（需与 Setup 同步）: {missing}")
+    print(f"  check WM_COMMAND: {len(setup_cases)} 个 case 全部落地 ✓")
     print("self-check passed")
 
 

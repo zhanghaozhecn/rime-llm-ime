@@ -3555,12 +3555,18 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       }
       switch (LOWORD(wp)) {
         // —— 设置列（原 WeaselLLMSetup）——
+        // **必须与 Setup 的 WM_COMMAND switch 逐条同步**：本段是手写并集，
+        // 曾经漏过 IDC_TCS / IDC_NGRAM（2026-11-26 另一台机器实测：Studio 里
+        // 点「整句模式」勾选框会变勾，但锁定编码匹配、显示 N-gram 行、检测
+        // 万象资产全都不发生——独立 Setup.exe 正常）。gen 尾部有 case 集合自检。
+        case IDC_TCS: on_sent_toggle(); return 0;
+        case IDC_NGRAM: on_ngram_toggle(); return 0;
         case IDC_BROWSE: on_browse(); return 0;
         case IDC_BENCH: on_bench_threads(); return 0;
         case IDC_DOWNLOAD: on_download_model(); return 0;
         case IDC_SCHEMAREM: on_schema_remove(); return 0;
         case IDC_SAVE: save_schema_params(); return 0;
-        case IDC_CLOSE: DestroyWindow(h); return 0;
+        case IDC_CLOSE: close_with_confirm(h); return 0;
         // —— 调试列（原 WeaselLLMDebug）——
         case IDC_PAUSE:
           g_paused = !g_paused;
@@ -3585,7 +3591,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           update_current();
           return 0;
         case IDCANCEL:            // IsDialogMessage 把 ESC 映射为 IDCANCEL
-          DestroyWindow(h);
+          close_with_confirm(h);
           return 0;
       }
       // 合并流点击（2026-11-17）：推理行（◆）→ 详情切到该条；日志行不可点开——
@@ -3684,6 +3690,9 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
       }
       break;
+    case WM_CLOSE:
+      close_with_confirm(h);   // A5：下载中关窗先确认（X 按钮走这里；与 Setup 同口径）
+      return 0;
     case WM_DESTROY:
       KillTimer(h, DL_TIMER_ID);
       KillTimer(h, BENCH_TIMER_ID);
