@@ -12,4 +12,15 @@ if not exist "%ISCC%" (
 )
 cd /d "%~dp0..\installer"
 "%ISCC%" setup.iss
+if errorlevel 1 exit /b %errorlevel%
+REM publish newest setup.exe to typing\04tools (old packages removed).
+REM local-only helper (scripts/ is gitignored); skipped when absent.
+if not exist "%~dp0copy_setup_to_tools.ps1" (
+  echo [04tools] copy_setup_to_tools.ps1 not found - skipped
+  exit /b 0
+)
+for %%I in (pwsh.exe) do set "PS=%%~$PATH:I"
+if not defined PS if exist "%ProgramFiles%\PowerShell\7\pwsh.exe" set "PS=%ProgramFiles%\PowerShell\7\pwsh.exe"
+if not defined PS set "PS=powershell.exe"
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0copy_setup_to_tools.ps1"
 exit /b %errorlevel%
