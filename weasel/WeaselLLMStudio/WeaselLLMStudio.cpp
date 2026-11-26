@@ -1536,7 +1536,7 @@ static const wchar_t* const TIP_NGRAM =
     L"+ llm_ngram\\dicts\\（六个词库）；缺失时自动关闭（60 秒后重试），不影响其它功能。";
 static const wchar_t* const TIP_DEBUG =
     L"诊断日志：开启后每次重排都往用户文件夹的 llm_rerank\\<方案> 子目录写\n"
-    L"rime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化；语料/账本/词码对\n"
+    L"rime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化；语料/账本/CE 偏置表\n"
     L"同目录，按方案隔离）。排障用，平时关闭。\n"
     L"实时调试窗口：插件版随『复制文件』装到 Rime 用户文件夹\n"
     L"llm_rerank\\viewer\\open_debug_window.bat；源码版走托盘「LLM 设置+调试」。";
@@ -2807,7 +2807,7 @@ struct Row {
   std::wstring ce1, ce2, ce3;  // CE 三分量（未乘权重）
   std::wstring fb, u1;         // 衰减词频分 β·log1p(eff) / 累计词频分 log p1
   std::wstring pf;             // v5: 旧修正分 λ（负分幅度, 0=未命中）
-  std::wstring sdelta;         // v6: 有符号词码对分数（+200/+100/-5/0）
+  std::wstring sdelta;         // v6: 有符号 CE 偏置（+200/+100/-5/0）
   std::wstring seg;            // v7: token 边界段显（cm/ak；空=显示原词）
   bool win0 = false;  // 尾窗透传（灰字）
 };
@@ -2947,7 +2947,7 @@ static std::wstring padl(const std::wstring &s, int w) {
   return std::wstring((size_t)(w - (int)s.size()), L' ') + s;
 }
 
-// 词码对修正值（显示端折叠用）：sdelta 为准，旧发送端无该字段时回退
+// CE 偏置值（显示端折叠用）：sdelta 为准，旧发送端无该字段时回退
 // v5 的 pf（-λ）。代码里 CE 与修正仍分离（发送端照发），仅显示端折叠。
 static bool corr_of(const Row &r, double &sd) {
   if (num_of(r.sdelta, sd)) return true;
@@ -2997,7 +2997,7 @@ static void measure_widths(const Inv &inv, ColW &w) {
   }
 }
 
-// CE 格：加权 CE 与三分量 + 词码对修正折叠（2026-11-21 用户定案 v7：
+// CE 格：加权 CE 与三分量 + CE 偏置折叠（2026-11-21 用户定案 v7：
 // 修正分专属列删除——对几乎所有候选恒为 0 的独立列无观察价值；命中时
 // 把修正值折进 CE 数值本身并在公式右侧追修正项，如
 //   -34.7 = -(14.0 + 1.1·10.1 + 0.6·7.6) - 5.0
@@ -3064,7 +3064,7 @@ static std::wstring u1_proc(const Row &r, int wl, int wu) {
   return lead + b;
 }
 
-// 总分格：融合分纯分值（三项过程各在自带格内，词码对修正折进 CE 格见
+// 总分格：融合分纯分值（三项过程各在自带格内，CE 偏置折进 CE 格见
 // ce_proc；尾窗透传行无融合分 → —）
 static std::wstring fused_proc(const Row &r, int wl) {
   double fu;

@@ -1515,7 +1515,7 @@ static const wchar_t* const TIP_NGRAM =
     L"+ llm_ngram\\dicts\\（六个词库）；缺失时自动关闭（60 秒后重试），不影响其它功能。";
 static const wchar_t* const TIP_DEBUG =
     L"诊断日志：开启后每次重排都往用户文件夹的 llm_rerank\\<方案> 子目录写\n"
-    L"rime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化；语料/账本/词码对\n"
+    L"rime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化；语料/账本/CE 偏置表\n"
     L"同目录，按方案隔离）。排障用，平时关闭。\n"
     L"实时调试窗口：插件版随『复制文件』装到 Rime 用户文件夹\n"
     L"llm_rerank\\viewer\\open_debug_window.bat；源码版走托盘「LLM 设置+调试」。";

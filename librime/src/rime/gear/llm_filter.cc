@@ -209,6 +209,12 @@ static bool g_prefix_tablock_on = []() {
   const char *e = getenv("RIME_LLM_PREFIX_TABLOCK");
   return !(e && *e && atof(e) == 0.0);
 }();
+// 整句词频归因 A/B（2026-11-26）：RIME_LLM_SENTENCE_ATTR=0 关闭——commit
+// 回退旧行为（整句键入账）。插件版同钩子 = _G.llm_sentence_attr=false。
+static bool g_sentence_attr_on = []() {
+  const char *e = getenv("RIME_LLM_SENTENCE_ATTR");
+  return !(e && *e && atof(e) == 0.0);
+}();
 
 // ta 族（先验可论证的结构性同音歧义；研究库 2026-11-25：40 触发 13 错，
 // 真实用户域 8/10 = 80%；禁用后整体 +0.07~0.08pp、user 域 +0.55pp）
@@ -283,6 +289,16 @@ struct PendingConfirm {
 static PendingConfirm g_pending_confirm;
 static std::mutex g_pending_confirm_mu;
 static bool g_in_confirm = false;  // 防重入（Select → Compose → Apply 递归）
+// [整句词频归因]（2026-11-26）显示句的组句词路径环形表（cap 16）——Apply
+// 注入时登记（text+code 双键，code = 该窗活动段切片 input_），OnCommit
+// 归因时按「段文本+段码」取回切词。engine thread only（Apply/OnCommit
+// 同线程，与 g_last_window 同契约）。
+struct NgPathRec {
+  std::string text;
+  std::string code;
+  std::vector<std::pair<std::string, int>> words;  // (词, 段码内偏移 end)
+};
+static std::vector<NgPathRec> g_ng_paths;
 // 用户词频对数融合 (2026-09-02): fused = score + β·log(1+eff), β **内置常数**
 // (2026-11-05 标定产物退出用户配置面——用户没有标定能力, 与 kFreqTau 同待遇;
 //  **2026-11-14 默认模型改 Qwen2.5-0.5B 后重标定** β=14 + kCeW (1.0,1.10,
@@ -1230,9 +1246,9 @@ static FILE *open_log_file(const char *filename) {
 }
 
 // ── 方案子目录（2026-11-22 用户定案：四件全分）───────────────────────
-// 目录 = <用户文件夹>\llm_rerank\<方案 ID>\：corpus/debug/账本/词码对
+// 目录 = <用户文件夹>\llm_rerank\<方案 ID>\：corpus/debug/账本/CE 偏置表
 // 四个文件全部按方案隔离（不同方案混写同一语料/日志会让分析无法按方案
-// 切分）。迁移规则："有状态资产"（账本/词码对）在该方案首次读写时从旧
+// 切分）。迁移规则："有状态资产"（账本/CE 偏置表）在该方案首次读写时从旧
 // 位置**复制**一份（旧文件保留不删）——每个方案各得一份快照，此后独立
 // 演进（键 = 词+码，码与方案绑定、天然不相交，历史条目跨方案共存无害）；
 // 日志（corpus/debug）不复制，该方案从空文件开始写（否则每方案各背一份
@@ -1273,7 +1289,7 @@ static bool llm_dir_ensure(const char *dir) {
 }
 
 // 解析 filename 的最终路径：<llm_rerank>\<方案>\filename。
-// migrate=true（账本/词码对）→ 该方案首用时从旧位置（llm_rerank 根 /
+// migrate=true（账本/CE 偏置表）→ 该方案首用时从旧位置（llm_rerank 根 /
 // 用户文件夹根）复制一份，旧文件保留；复制失败暂用旧位置，下次再试。
 // 返回 false = 拿不到用户目录（调用方自行回退）。
 static bool llm_file_path_ex(const char *filename, char *path, size_t n,
@@ -1330,12 +1346,12 @@ static bool llm_file_path(const char *filename, char *path, size_t n) {
   return llm_file_path_ex(filename, path, n, false, llm_schema_dir_name());
 }
 
-// 有状态资产（账本/词码对）：首用复制快照
+// 有状态资产（账本/CE 偏置表）：首用复制快照
 static bool llm_state_file_path(const char *filename, char *path, size_t n) {
   return llm_file_path_ex(filename, path, n, true, llm_schema_dir_name());
 }
 
-// 指定方案的账本/词码对路径（切方案时把**旧方案**内存账本落盘到旧目录）
+// 指定方案的账本/CE 偏置表路径（切方案时把**旧方案**内存账本落盘到旧目录）
 static bool llm_state_file_path_for(const std::string &sid,
                                     const char *filename, char *path,
                                     size_t n) {
@@ -1571,7 +1587,7 @@ static double user_unigram_term(const std::string &x, const std::string &code) {
   return log((double)(cum + 1));
 }
 
-// 累计 unigram 原始计数（调试窗口"累计频"列 / pairfix fade 门用）
+// 累计 unigram 原始计数（调试窗口"累计频"列 / CE 偏置 fade 门用）
 static long long user_uni_count(const std::string &x, const std::string &code) {
   std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
   user_stats_ensure_loaded();
@@ -1579,27 +1595,35 @@ static long long user_uni_count(const std::string &x, const std::string &code) {
   return it == g_user_stats.end() ? 0 : it->second.cum;
 }
 
-// ── 词码对扣分修正（2026-11-21 用户定案解耦：只承载负分 CE 偏差降噪）──
-// 表放用户目录 llm_pairfix.tsv，行 `词<TAB>码<TAB>-分数`（无第三列 =
-// 旧默认 -5）；`#` 注释；无文件 = 机制休眠；融合读一次（每窗一次，
-// 相对推理成本可忽略）——编辑文件即时生效。负分保留 fade：用户该词码对
-// 累计 >= kPairFixFadeUni 次 -> 预置让位。正分行读取端跳过（2026-11-17
-// 的 +200 固定首选/+100 固定次选语义废除——固定候选归拼读双拼
-// pin_candidates.tsv + pin_filter.lua 全局重排，与 LLM 重排解耦）。
+// ── CE 偏置（2026-11-26 改名；原「词码对（扣分）修正」）─────────────
+// 表放用户目录 `llm_rerank/<方案>/ce_bias.tsv`（属有状态资产；旧名
+// llm_pairfix.tsv 只读兜底一次），行 `词<TAB>码<TAB>分数`（无第三列 =
+// 默认 -5）；`#` 注释；无文件 = 机制休眠；融合读一次（每窗一次，相对推理
+// 成本可忽略）——编辑即时生效。
+// **只承载负分**（2026-11-26 用户定案：字词两种键都不支持正分；正分行
+// 读取端跳过）。fade：用户该 (词,码) 累计 >= kCeBiasFadeUni 次 -> 让位。
 // 旧 2026-11-13 pairfix 推导（wiki 拆半/用户域回放）保留在文件头历史注释：
 // 与@vkh 等污染对按字频抬分；负分只破 CE 险胜的近平局。
-static const double kPairFixPenaltyDefault = 5.0;
-static const long long kPairFixFadeUni = 3;
+//
+// 字-音节偏置（同属「CE 偏置」，已落地 T1）：单字候选按
+// min(0, log P(读音|字)) 修正（λ=1，只打折），与词键同表、按候选文本长度
+// 分流。生成器 = 研究库 `eval/tools/gen_ce_bias_share.py`。
+static const double kCeBiasPenaltyDefault = 5.0;
+static const long long kCeBiasFadeUni = 3;
 
-static bool pairfix_file(char *path, size_t n) {
+static bool ce_bias_file(char *path, size_t n) {
   // 有状态资产：该方案首次使用时从旧位置复制快照（2026-11-22 分目录）
+  if (llm_state_file_path("ce_bias.tsv", path, n) &&
+      GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+    return true;
+  // 旧名兜底（只读；改名后首次运行时用）
   return llm_state_file_path("llm_pairfix.tsv", path, n);
 }
 
-// 读参考表 → out[key 词\t码] = 有符号分数；返回 false = 文件缺失（休眠）
-static bool pairfix_table(std::map<std::string, double> *out) {
+// 读 CE 偏置表 → out[key 词\t码] = 负分；false = 文件缺失（休眠）
+static bool ce_bias_table(std::map<std::string, double> *out) {
   char path[MAX_PATH];
-  if (!pairfix_file(path, sizeof(path)))
+  if (!ce_bias_file(path, sizeof(path)))
     return false;
   FILE *f = fopen(path, "r");
   if (!f)
@@ -1616,16 +1640,16 @@ static bool pairfix_table(std::map<std::string, double> *out) {
       continue;
     *t1 = '\0';
     char *t2 = strchr(t1 + 1, '\t');
-    // 无第三列 = 旧默认扣 5；第三列负数 = 扣分。2026-11-21 解耦：正分
-    // （固定候选）行跳过——归 pin_candidates.tsv / pin_filter.lua。
-    double delta = -kPairFixPenaltyDefault;
+    // 无第三列 = 默认 -5；第三列负数 = 扣分。2026-11-26：正分行跳过
+    // （字词两种键都不支持正分）。
+    double delta = -kCeBiasPenaltyDefault;
     if (t2) {
       *t2 = '\0';
       char *end = nullptr;
       double v = strtod(t2 + 1, &end);
       if (end == t2 + 1)
         continue;  // 第三列非法：与插件版一致，跳过
-      if (v > 0)
+      if (v > 0.0)
         continue;
       delta = v;
     }
@@ -1636,16 +1660,20 @@ static bool pairfix_table(std::map<std::string, double> *out) {
   return true;
 }
 
-// 命中返回负分扣分修正（fade 门）；正分行读取端已跳过（解耦后无正分）
-static double pairfix_delta(const std::map<std::string, double> &tbl,
+static size_t utf8_len(const std::string &s);   // 定义见文件后段
+
+// 命中返回负分 CE 偏置；fade 让位（该 (词,码) 累计 ≥3 → 0）
+static double ce_bias_delta(const std::map<std::string, double> &tbl,
                             const std::string &w,
                             const std::string &code) {
-  auto it = tbl.find(w + "\t" + code);
-  if (it == tbl.end())
+  // 词键只作用于**多字**候选（单字走字-音节键；否则 1 音节窗里
+  // 「全码 == 音节码」会让同一行被两条路各加一次）
+  if (utf8_len(w) == 1)
     return 0.0;
-  if (it->second > 0.0)
-    return it->second;
-  if (user_uni_count(w, code) >= kPairFixFadeUni)
+  auto it = tbl.find(w + "\t" + code);
+  if (it == tbl.end() || it->second >= 0.0)
+    return 0.0;
+  if (user_uni_count(w, code) >= kCeBiasFadeUni)
     return 0.0;
   return it->second;
 }
@@ -1686,12 +1714,10 @@ static void user_stats_save() {
   user_stats_save_to(g_stats_schema);
 }
 
-static void user_stats_bump(const std::string &w, const std::string &code) {
-  // 仅计含中文的上屏（2026-11-20 用户定案：纯标点不入账——标点永不进
-  // 重排窗口，dee 纯浪费且常用标点（，。）持续 bump 永不达修剪线）；连
-  // tick 也不推，更同源 rime userdb "词条提交才推 tick"（旧口径 = 非
-  // ASCII 全入账，2026-09-03 一字词定案）。退款弹栈照常，无账目 →
-  // RF refund=0。cum 只对含中文词条递增（标定语义）。
+// 入账门检（2026-11-20 用户定案：仅计含中文的上屏——纯标点不入账，标点
+// 永不进重排窗口，dee 纯浪费且常用标点（，。）持续 bump 永不达修剪线）；
+// 门检失败连 tick 也不推，更同源 rime userdb "词条提交才推 tick"。
+static bool user_stats_bump_gates(const std::string &w) {
   bool has_non_ascii = false;
   for (unsigned char ch : w)
     if (ch >= 0x80) {
@@ -1699,25 +1725,41 @@ static void user_stats_bump(const std::string &w, const std::string &code) {
       break;
     }
   if (!has_non_ascii)
-    return;
-  if (!text_has_cjk_utf8(w))
+    return false;
+  return text_has_cjk_utf8(w);
+}
+
+// 显式 tick 版本（2026-11-26 整句词频归因）：一次 commit 事件推一个 tick、
+// N 个词共享同值——tick 是衰减年龄基准，每词 +1 会让一次 N 词长句把全局
+// 时间轴推快 N 倍，全体历史词条等效加速衰老。单词条路径 = bump（自动
+// ++g_user_tick）。
+static void user_stats_bump_at(const std::string &w, const std::string &code,
+                               long long tick) {
+  if (!user_stats_bump_gates(w))
     return;
   std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
   user_stats_ensure_loaded();
-  ++g_user_tick;
   UserStatEntry &e = g_user_stats[w + "\t" + code];
   // [回撤退款] bump 前快照进浅撤销栈（cap 4，回撤环总在近处）
-  e.hist.push_back({g_user_tick, e.dee, e.tick, e.cum});
+  e.hist.push_back({tick, e.dee, e.tick, e.cum});
   if (e.hist.size() > 4)
     e.hist.erase(e.hist.begin());
-  e.dee = 1 + e.dee * exp((double)(e.tick - g_user_tick) / kFreqTau);
-  e.tick = g_user_tick;
-  if (text_has_cjk_utf8(w))
-    ++e.cum;
+  e.dee = 1 + e.dee * exp((double)(e.tick - tick) / kFreqTau);
+  e.tick = tick;
+  ++e.cum;
   if (++g_user_stats_dirty >= 20) {
     user_stats_save();
     g_user_stats_dirty = 0;
   }
+}
+
+static void user_stats_bump(const std::string &w, const std::string &code) {
+  if (!user_stats_bump_gates(w))  // 门检在前：被拒提交不推 tick
+    return;
+  std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
+  user_stats_ensure_loaded();
+  ++g_user_tick;
+  user_stats_bump_at(w, code, g_user_tick);  // 递归锁同线程重入
 }
 
 // [回撤退款]（2026-11-20）: 提交被回撤（M backspace/delete/undo）→ 撤销
@@ -1783,23 +1825,29 @@ static LastWindow g_last_window;  // engine thread only (Apply/Collect/OnCommit)
 // [回撤退款]（2026-11-20）提交栈（cap 8）: OnCommit（引擎线程）压入，
 // reset hook（server IPC 线程）在 backspace/delete/undo 时弹出退款；
 // navigation/enter/focus 边界清栈——与语料 strict 弹栈口径逐字对齐。
+// words 非空 = 词级归因的组记录（2026-11-26）：一次提交 N 个词条目整组
+// 退款（弹栈粒度仍是「一次提交」）；word/code 保留组内首词供 RF 显示。
 struct CommitRec {
   std::string word;
   std::string code;
   long long tick = 0;
   std::string cid;
+  std::vector<std::pair<std::string, std::string>> words;  // (词, 码)
 };
 static std::mutex g_commit_mu;
 static std::vector<CommitRec> g_commit_stack;
 static void commit_stack_push(const std::string &word,
                               const std::string &code, long long tick,
-                              const std::string &cid) {
+                              const std::string &cid,
+                              std::vector<std::pair<std::string, std::string>>
+                                  words = {}) {
   std::lock_guard<std::mutex> lk(g_commit_mu);
   CommitRec rec;
   rec.word = word;
   rec.code = code;
   rec.tick = tick;
   rec.cid = cid;
+  rec.words = std::move(words);
   g_commit_stack.push_back(rec);
   if (g_commit_stack.size() > 8)
     g_commit_stack.erase(g_commit_stack.begin());
@@ -2081,11 +2129,20 @@ static int rank_of(const std::vector<std::string> &v, const std::string &w) {
   return -1;
 }
 
+// v8（2026-11-26 整句词频归因）：可选 path 尾字段 =「词:码/词:码/…」
+// （词级归因路径）；空 = 保持旧 11 字段形状。ref 匹配放宽为**后缀**——
+// 归因 C 行码 = 各段码拼接，尾段窗码是其尾部（单段 == 全等）。
 static std::string write_c(const std::string &word, const std::string &code,
-                           long long tick, bool cjk) {
+                           long long tick, bool cjk,
+                           const std::string &path = std::string()) {
   std::string ref;
   int re = -1, rw = -1, rf = -1;
-  if (!code.empty() && g_last_window.code == code) {
+  const std::string &wc = g_last_window.code;
+  bool wl_match = !code.empty() && !wc.empty() &&
+                  (wc == code ||
+                   (code.size() >= wc.size() &&
+                    code.compare(code.size() - wc.size(), wc.size(), wc) == 0));
+  if (wl_match) {
     ref = g_last_window.id;
     re = rank_of(g_last_window.engine, word);
     rw = rank_of(g_last_window.window, word);
@@ -2100,6 +2157,8 @@ static std::string write_c(const std::string &word, const std::string &code,
                      std::to_string(re) + "\t" + std::to_string(rw) + "\t" +
                      std::to_string(rf) + "\t" + std::to_string(tick) + "\t" +
                      (cjk ? "cjk=1" : "");
+  if (!path.empty())
+    line += "\t" + tsv_escape(path);
   corpus_write_raw(line);
   remember_event(id);
   return id;
@@ -2157,9 +2216,20 @@ static void commit_stack_refund_or_clear(const char *reason) {
     rec = g_commit_stack.back();
     g_commit_stack.pop_back();
   }
-  bool ok = user_stats_refund(rec.word, rec.code, rec.tick);
+  // 词级归因组记录（2026-11-26）：一次提交 N 个词条目整组退款；部分退款
+  // 也算 ok（各条目独立 hist 栈，逐条精确还原）。
+  bool ok = false;
+  if (!rec.words.empty()) {
+    for (const auto &w : rec.words)
+      ok = user_stats_refund(w.first, w.second, rec.tick) || ok;
+  } else {
+    ok = user_stats_refund(rec.word, rec.code, rec.tick);
+  }
   debug_write_raw(rec.cid + "|RF|refund=" + (ok ? "1" : "0") +
-                      "|tick=" + std::to_string(rec.tick),
+                      "|tick=" + std::to_string(rec.tick) +
+                      (rec.words.empty()
+                           ? ""
+                           : "|n=" + std::to_string(rec.words.size())),
                   false);
 }
 
@@ -2560,6 +2630,235 @@ static size_t utf8_len(const std::string &s) {
     if ((ch & 0xC0) != 0x80)
       n++;
   return n;
+}
+
+// ── 字-音节 CE 偏置行（T1 = log P(读音|字)，λ=1，2026-11-26 用户定案）──
+// **与 (词,码) 行同表**：`llm_rerank/<方案>/ce_bias.tsv`（2026-11-26
+// 用户定案：一个方案要么整句要么字词，同格式两种键共用一表；按候选文本
+// 长度分流——单字查本行、多字查 (词,码) 行，互不命中）。行
+// `字<TAB>码<TAB>分数`。
+// 码 = 该字的**读音码**（不是输入片段）：有 syll_chars 表时按上节解析——
+// span 本身即整读 → 用 span；双拼「音 + 形」→ 取命中的最长前缀（2 码）；
+// 前缀简拼 / 纠错（span 只是读音的前缀）→ **不叠**（读音不确定，整读分层
+// 已把它压到后面，2026-11-26 用户定案②）。无表 = 旧规则（span；3 码取前 2）。
+// 只对**单字候选 + 已算 CE** 生效；无文件 = 休眠。
+// **只打折不加分**：值取 min(0, log share)——码不带声调时同一 (字,码) 会
+// 汇总两个音节（如 `的 da` = de 99% + dí 1%），总和 >1 不该变成加分。
+// A/B：`RIME_LLM_CE_SHARE=0` 关。与插件版同构。
+static std::mutex g_ce_share_mu;
+static std::map<std::string, double> g_ce_share_tbl;
+static std::string g_ce_share_sid;
+static bool g_ce_share_ready = false;
+
+static bool ce_share_file(char *path, size_t n) {
+  // 统一表 = 与 (词,码) 键同一文件（复用同一解析，含旧名兜底）
+  return ce_bias_file(path, n);
+}
+
+// 按方案缓存（切方案自动重读）。返回 false = 无表/已关。
+static bool ce_share_table(const std::map<std::string, double> **out) {
+  static const char *env = getenv("RIME_LLM_CE_SHARE");
+  if (env && env[0] == '0' && env[1] == '\0')
+    return false;
+  std::lock_guard<std::mutex> lk(g_ce_share_mu);
+  const std::string sid = llm_schema_dir_name();
+  if (g_ce_share_ready && g_ce_share_sid == sid) {
+    if (g_ce_share_tbl.empty())
+      return false;
+    *out = &g_ce_share_tbl;
+    return true;
+  }
+  g_ce_share_tbl.clear();
+  g_ce_share_ready = true;
+  g_ce_share_sid = sid;
+  char path[MAX_PATH];
+  if (!ce_share_file(path, sizeof(path)))
+    return false;
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return false;
+  char line[512];
+  while (fgets(line, sizeof(line), f)) {
+    size_t len = strlen(line);
+    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len] = '\0';
+    if (!len || line[0] == '#')
+      continue;
+    char *t1 = strchr(line, '\t');
+    if (!t1)
+      continue;
+    *t1 = '\0';
+    char *t2 = strchr(t1 + 1, '\t');
+    if (!t2)
+      continue;
+    *t2 = '\0';
+    char *end = nullptr;
+    double v = strtod(t2 + 1, &end);
+    if (end == t2 + 1)
+      continue;
+    if (*line && *(t1 + 1))
+      g_ce_share_tbl[std::string(line) + "\t" + (t1 + 1)] = v;
+  }
+  fclose(f);
+  if (g_ce_share_tbl.empty())
+    return false;
+  *out = &g_ce_share_tbl;
+  return true;
+}
+
+// ── 音节 → 整读字串（syll_chars.tsv，2026-11-26 用户定案①）──
+// 表 = `音节<TAB>字字字…`（研究库 eval/tools/gen_syll_chars.py 按**引擎词库**
+// 生成，与引擎码空间严格一致；派生只读资产，**不迁移**、各方案独立生成）。
+// 两件事：
+//   ① 整读判定（显示序分层）：单字候选 span 那段码命中该音节且含该字 = 整读；
+//      否则 = 前缀简拼（完成匹配 / 简码 / 纠错）→ 显示序沉到整读之后。
+//   ② 双拼「2 码音 + 1~2 码形」偏置键解析：沿 span 从长到短取命中前缀
+//      （带成员校验；旧实现硬编码「3 码取前 2」，4 码静默失效）。
+// 表缺失 / `RIME_LLM_EXACT_TIER=0` → 退回旧行为（不分层；偏置按 span / 3 码
+// 取前 2）。按方案缓存（切方案自动重读）。与插件版同构。
+static std::mutex g_syll_mu;
+static std::map<std::string, std::string> g_syll_tbl;
+static std::string g_syll_sid;
+static bool g_syll_ready = false;
+
+static bool syll_chars_file(char *path, size_t n) {
+  if (!llm_file_path("syll_chars.tsv", path, n))
+    return false;
+  if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+    return true;
+  // 方案目录缺失 → llm_rerank 根兜底（与插件版路径顺序一致）
+  const RimeApi *api = rime_get_api();
+  if (!api || !api->get_user_data_dir)
+    return false;
+  const char *ud = api->get_user_data_dir();
+  if (!ud || !*ud)
+    return false;
+  char rootp[MAX_PATH];
+  snprintf(rootp, sizeof(rootp), "%s\\llm_rerank\\syll_chars.tsv", ud);
+  if (GetFileAttributesA(rootp) == INVALID_FILE_ATTRIBUTES)
+    return false;
+  snprintf(path, n, "%s", rootp);
+  return true;
+}
+
+// 整读表（按方案缓存）。false = 无表 / A/B 关闭 → 调用方走旧规则。
+static bool syll_chars_table(const std::map<std::string, std::string> **out) {
+  static const char *env = getenv("RIME_LLM_EXACT_TIER");
+  if (env && env[0] == '0' && env[1] == '\0')
+    return false;
+  std::lock_guard<std::mutex> lk(g_syll_mu);
+  const std::string sid = llm_schema_dir_name();
+  if (g_syll_ready && g_syll_sid == sid) {
+    if (g_syll_tbl.empty())
+      return false;
+    *out = &g_syll_tbl;
+    return true;
+  }
+  g_syll_tbl.clear();
+  g_syll_ready = true;
+  g_syll_sid = sid;
+  char path[MAX_PATH];
+  if (!syll_chars_file(path, sizeof(path)))
+    return false;
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return false;
+  char line[4096];   // 最长行 879 B（全拼 yi）
+  while (fgets(line, sizeof(line), f)) {
+    size_t len = strlen(line);
+    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len] = '\0';
+    if (!len || line[0] == '#')
+      continue;
+    char *t1 = strchr(line, '\t');
+    if (!t1)
+      continue;
+    *t1 = '\0';
+    if (!*line || !*(t1 + 1))
+      continue;
+    g_syll_tbl[line] = t1 + 1;
+  }
+  fclose(f);
+  if (g_syll_tbl.empty())
+    return false;
+  *out = &g_syll_tbl;
+  return true;
+}
+
+// 单字整读判定 + 偏置键解析。返回 exact（span 本身即整读）；key 空 = 前缀
+// 简拼 / 纠错（不叠偏置，显示序沉到整读之后）。
+static bool syll_judge(const std::map<std::string, std::string> &syl,
+                       const std::string &text, const std::string &span,
+                       std::string *key) {
+  auto it = syl.find(span);
+  if (it != syl.end() && it->second.find(text) != std::string::npos) {
+    *key = span;
+    return true;
+  }
+  if (span.size() > 2) {   // 双拼「音 + 形」：取命中的最长前缀
+    for (size_t k = span.size() - 1; k >= 2; k--) {
+      std::string pre = span.substr(0, k);
+      auto it2 = syl.find(pre);
+      if (it2 != syl.end() && it2->second.find(text) != std::string::npos) {
+        *key = pre;
+        return false;
+      }
+    }
+  }
+  key->clear();
+  return false;
+}
+
+// 单字候选是否为「不完整音节」（前缀简拼 / 纠错）：1 字档首选与自动前缀
+// 确认都要跳过它（2026-11-26 用户定案②）。无表 / 非单字 / span 异常 → false。
+static bool cand_is_prefix_only(const std::string &text, size_t start,
+                                size_t end, const std::string &code,
+                                size_t seg_start) {
+  if (utf8_len(text) != 1)
+    return false;
+  const std::map<std::string, std::string> *syl = nullptr;
+  if (!syll_chars_table(&syl))
+    return false;
+  const long long s0 = (long long)start - (long long)seg_start;
+  const long long e0 = (long long)end - (long long)seg_start;
+  if (s0 < 0 || e0 <= s0 || (size_t)e0 > code.size())
+    return false;
+  std::string key;
+  syll_judge(*syl, text, code.substr((size_t)s0, (size_t)(e0 - s0)), &key);
+  return key.empty();
+}
+
+// 单字候选的读音先验修正（不是单字 / 简码 / 未命中 → 0）
+static double ce_share_delta(const std::map<std::string, double> &tbl,
+                             const std::string &text, int start, int end,
+                             const std::string &code, int seg_start) {
+  if (utf8_len(text) != 1 || end - start < 1)
+    return 0.0;   // 全拼 1 字母音节是完整读音；双拼 1 码简码查不到键
+  // 候选 span 是整个 input 的绝对偏移；code 是活动段切片 → 先减段起点
+  const int s0 = start - seg_start;
+  const int e0 = end - seg_start;
+  if (s0 < 0 || e0 < 0 || s0 >= e0 || (size_t)e0 > code.size())
+    return 0.0;
+  const std::string span = code.substr((size_t)s0, (size_t)(e0 - s0));
+  if (span.empty())
+    return 0.0;
+  // 读音码解析（2026-11-26 用户定案②）：整读 → span；双拼音+形 → 前缀；
+  // 前缀简拼 / 纠错 → 不叠偏置。无表 = 旧规则。
+  std::string key;
+  const std::map<std::string, std::string> *syl = nullptr;
+  if (syll_chars_table(&syl)) {
+    syll_judge(*syl, text, span, &key);
+  } else {
+    key = span;
+    if (tbl.find(text + "\t" + key) == tbl.end() && span.size() == 3)
+      key = span.substr(0, 2);   // 双拼 3 码 = 2 码读音 + 形码
+  }
+  if (key.empty())
+    return 0.0;
+  auto it = tbl.find(text + "\t" + key);
+  if (it == tbl.end() || it->second > 0.0)
+    return 0.0;   // 只打折不加分（见函数头注）
+  return it->second;
 }
 
 // 连续重复字母闸（2026-11-25，学万象 limit_repeated）：全拼里同一字母连续
@@ -3430,6 +3729,8 @@ struct AsyncPending {
   std::string wctx;
   std::vector<std::string> engine_vec;
   std::vector<std::string> window_vec;   // 层1窗（提交序）
+  std::vector<double> share_vec;         // 字-音节偏置（对齐 window_vec；挂账
+                                         // 时已丢候选对象，必须提交时快照）
   long long tick = 0;
   std::string src;
   bool sent_on = false;        // 挂账来源（整句模式恒 true）
@@ -3437,18 +3738,18 @@ struct AsyncPending {
 static std::map<std::string, AsyncPending> g_async_pending;
 
 // 评分快照缓存（fp → AsyncRes）：同指纹重复 query（翻页/候选窗重建/收割
-// 回填）命中即融合，0 LLM。融合分每次现算（eff/pairfix 微秒级），缓存只存
+// 回填）命中即融合，0 LLM。融合分每次现算（eff/CE 偏置 微秒级），缓存只存
 // 原始评分快照——语义与同步版逐位一致。
 static std::map<std::string, AsyncRes> g_async_cache;
 
 // 挂账回填：补写 W ok + P 行。final = 窗内候选融合重排（文本域现算，与
-// 同步版融合公式逐位一致；eff/uni/pairfix 为微秒级内存查询；账本 tick 与
+// 同步版融合公式逐位一致；eff/uni/CE 偏置 为微秒级内存查询；账本 tick 与
 // 提交时刻的漂移 ≤1 词提交，v1 接受——D/L/C 明细行省略，W final 序已够
 // 评测）。
 static void async_write_pending(const AsyncPending &pend,
                                 const AsyncRes &snap) {
-  std::map<std::string, double> pf_tbl;
-  bool pf_on = pairfix_table(&pf_tbl);
+  std::map<std::string, double> cb_tbl;
+  bool cb_on = ce_bias_table(&cb_tbl);
   double min_valid = 0.0;
   bool have_min = false;
   for (size_t i = 0; i < pend.window_vec.size(); i++) {
@@ -3466,11 +3767,12 @@ static void async_write_pending(const AsyncPending &pend,
     const std::string &t = pend.window_vec[i];
     double s1 = g_freq_beta * std::log(1.0 + user_freq_eff(t, pend.code)) +
                 user_unigram_term(t, pend.code);
-    double pf = pf_on ? pairfix_delta(pf_tbl, t, pend.code) : 0.0;
+    double pf = cb_on ? ce_bias_delta(cb_tbl, t, pend.code) : 0.0;
+    double sd = i < pend.share_vec.size() ? pend.share_vec[i] : 0.0;
     if (s > -1e9)
-      fused[i] = s + s1 + pf;
+      fused[i] = s + s1 + pf + sd;
     else  // 无 CE 分（哨兵/缺失）：层1 分 + 窗内最低 LLM 分（压制窗底）
-          // ——不叠词码对修正（2026-11-24：pairfix 只修 CE 系统性偏差）
+          // ——不叠 CE 偏置（2026-11-24：只修 CE 系统性偏差）
       fused[i] = s1 + (have_min ? min_valid : 0.0);
   }
   std::stable_sort(ord.begin(), ord.end(), [&fused](size_t a, size_t b) {
@@ -3485,7 +3787,7 @@ static void async_write_pending(const AsyncPending &pend,
   // D 行（2026-11-22 整句分段开发补）：挂账回填此前只有 W ok + P 行，
   // CE 数值无日志——评测与调试都要逐候选 CE。字段语义与主路径一致：
   // ce=加权分（scores）、ce1-3=原始分量、eff/u1 回填时刻现算、full=1
-  //（挂账恒整句模式）、key=融合分、sdelta=词码对修正、cerank=提交序
+  //（挂账恒整句模式）、key=融合分、sdelta=CE 偏置、cerank=提交序
   //（层1）、finrank=回填后名次。
   for (size_t r = 0; r < ord.size(); r++) {
     size_t i = ord[r];
@@ -3496,8 +3798,10 @@ static void async_write_pending(const AsyncPending &pend,
     const std::string &t = pend.window_vec[i];
     double eff = user_freq_eff(t, pend.code);
     double u1 = user_unigram_term(t, pend.code);
-    double pf = (pf_on && ce > -1e9)
-                    ? pairfix_delta(pf_tbl, t, pend.code) : 0.0;
+    double pf = (cb_on && ce > -1e9)
+                    ? ce_bias_delta(cb_tbl, t, pend.code) : 0.0;
+    if (ce > -1e9 && i < pend.share_vec.size())
+      pf += pend.share_vec[i];   // 字-音节偏置并入 sdelta（显示端只认总和）
     debug_write_d(pend.wid, (int)r + 1, ce, c3[0], c3[1], c3[2], eff,
                   g_freq_beta * std::log(1.0 + eff), u1, 1, fused[i], pf,
                   (int)i + 1, (int)r + 1);
@@ -3745,9 +4049,11 @@ void LlmRerankTranslation::Collect() {
   std::vector<an<Candidate>> tail;      // 窗外候选（层1 序透传，FM+子词混排）
   std::vector<double> s1_head;   // 层1 分（对齐 candidates_; 无 CE 分回退用）
   std::vector<char> win_fm;      // 窗内候选 FM 标志（对齐 candidates_，整句模式）
-  // 词码对表：融合前读一次（2026-11-21 解耦后只含负分），本窗融合复用。
-  std::map<std::string, double> pf_tbl;
-  bool pf_on = false;
+  // CE 偏置表：融合前读一次（有符号，2026-11-26 起正负都照加），本窗融合复用。
+  std::map<std::string, double> cb_tbl;
+  bool cb_on = false;
+  // 字-音节 CE 偏置表（按方案缓存；无表 = nullptr）
+  const std::map<std::string, double> *share_tbl = nullptr;
 
   std::vector<an<Candidate>> allc;
   // 限量收集（2026-11-22 卡死修复，与插件版同构）：旧全量收集强制引擎
@@ -3841,6 +4147,17 @@ void LlmRerankTranslation::Collect() {
           seen_t[s.text] = 1;
           merged.push_back(an<Candidate>(new SimpleCandidate(
               "ngram_group", seg_start_, seg_end_, s.text)));
+          // [整句词频归因]（2026-11-26）：显示句词路径登记（cap 16 FIFO；
+          // 同窗重复查询会重复登记——OnCommit 从尾向头匹配即得最新）
+          NgPathRec rec;
+          rec.text = s.text;
+          rec.code = code_g;
+          rec.words.reserve(s.words.size());
+          for (const auto &w : s.words)
+            rec.words.emplace_back(w.word, w.code_end);
+          g_ng_paths.push_back(std::move(rec));
+          if (g_ng_paths.size() > 16)
+            g_ng_paths.erase(g_ng_paths.begin());
         }
         NgramGenInfo gi;
         if (!s.words.empty()) {
@@ -3888,7 +4205,7 @@ void LlmRerankTranslation::Collect() {
   std::string wskip;
   bool prep_hit = false;  // 上文 KV 预解码命中（调试 L 行"预解"列）
   // 无上文（2026-11-24 用户定案）：CE 不可算，但整句模式下前缀确认照常
-  // ——融合分按剩余项（β·log1p(eff) + log(uni+1) + 词码对修正）计算。
+  // ——融合分按剩余项（β·log1p(eff) + log(uni+1) + CE 偏置）计算。
   // Apply 已保证：只有整句模式 + 前缀确认 + 组句都开且 code≥4 码时才放行
   // 到这里的空 ctx；ctx 里已含组合区已确认前缀（上一条 phrase 就是"临时
   // 上文"，确认后 ctx 非空、自动回到完整 CE 融合）。函数级作用域（末尾
@@ -3901,9 +4218,10 @@ void LlmRerankTranslation::Collect() {
   async_harvest();
 
   if (allc.size() >= 2 && g_loaded.load()) {
-    // 词码对分数表：融合段共用一次读取（2026-11-21 解耦后只含负分，不参与
+    // CE 偏置表：融合段共用一次读取（有符号，不参与
     // 窗口准入）；无文件 = 休眠。
-    pf_on = pairfix_table(&pf_tbl);
+    cb_on = ce_bias_table(&cb_tbl);
+    ce_share_table(&share_tbl);   // 字-音节 CE 偏置（按方案缓存）
     std::vector<size_t> idx(allc.size());
     std::vector<double> s1(allc.size());
     for (size_t i = 0; i < allc.size(); i++) {
@@ -4024,7 +4342,7 @@ void LlmRerankTranslation::Collect() {
       std::vector<llama_token> ctx_probe = tokenize(ctx.c_str());
       if (freq_only) {
         // 无上文：CE 不可算 → 融合只剩词频剩余项（β·log1p(eff) +
-        // log(uni+1) + 词码对修正）。order 先置层1 序（identity），下方
+        // log(uni+1) + CE 偏置）。order 先置层1 序（identity），下方
         // 融合块按 fused 重排；W 记 flags=nofreq（status=ok）。
         order.resize(candidates_.size());
         for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;
@@ -4086,6 +4404,17 @@ void LlmRerankTranslation::Collect() {
               pend.wctx = wctx;
               pend.engine_vec = engine_vec;
               pend.window_vec = window_vec;
+              pend.share_vec.reserve(window_vec.size());
+              for (size_t wi = 0; wi < window_vec.size(); wi++) {
+                double sd = 0.0;
+                if (share_tbl && wi < candidates_.size())
+                  sd = ce_share_delta(*share_tbl,
+                                      candidates_[wi]->text(),
+                                      candidates_[wi]->start(),
+                                      candidates_[wi]->end(), input_,
+                                      seg_start_);
+                pend.share_vec.push_back(sd);
+              }
               pend.tick = g_user_tick;
               pend.src = src_;
               pend.sent_on = true;
@@ -4183,7 +4512,7 @@ void LlmRerankTranslation::Collect() {
     // (高频首选获自保护)。失败哨兵/缺分不参与融合, 保序排尾。
     // 应用于评分/缓存顺序之上、两码整句段之前 (与插件版一致);
     // 缓存只存分数序, 融合每次按当前衰减重放。稳定排序保同分原序 (CE 序)。
-    // 融合分叠加词码对扣分修正（负分=CE 系统性偏差降噪，保留 fade；
+    // 融合分叠加 CE 偏置（有符号：负=降噪 / 正=抬分，fade 一视同仁；
     // 2026-11-21 解耦后无正分——固定候选归 pin_filter.lua 全局重排）。
     // debug.txt 行尾 修正%+g，C 行尾追加 sdelta（与插件版一致）。
     std::vector<double> fused_of(candidates_.size(), -1e308);
@@ -4214,14 +4543,24 @@ void LlmRerankTranslation::Collect() {
           double s1v = i < s1_head.size() ? s1_head[i] : -1e308;
           t = s1v + (min_valid < 1e308 ? min_valid : 0.0);
         }
-        // 词码对分数修正（有符号；正分不受 fade，负分保留 fade）。
-        // **只对已算 CE 的候选生效**（2026-11-24 用户定案）：pairfix 修的是
+        // CE 偏置（有符号；正负都照加，fade 一视同仁）。
+        // **只对已算 CE 的候选生效**（2026-11-24 用户定案）：CE 偏置修的是
         // CE 的系统性偏差，无 CE 分（评分失败/无上文 freq_only）时无从修，
         // 加了反而凭空改词频序。
-        if (pf_on && has_score[i]) {
-          double d = pairfix_delta(pf_tbl, candidates_[i]->text(), input_);
+        if (cb_on && has_score[i]) {
+          double d = ce_bias_delta(cb_tbl, candidates_[i]->text(), input_);
           if (d != 0.0)
             t += d;
+        }
+        // 字-音节 CE 偏置（T1 = log P(读音|字)，λ=1）：单字候选按输入码
+        // 对应的读音占比打折；同样只在已算 CE 时生效。
+        if (share_tbl && has_score[i]) {
+          double sd = ce_share_delta(*share_tbl, candidates_[i]->text(),
+                                     candidates_[i]->start(),
+                                     candidates_[i]->end(), input_,
+                                     seg_start_);
+          if (sd != 0.0)
+            t += sd;
         }
         fused_of[i] = t;
         fused.emplace_back(t, i);
@@ -4619,21 +4958,45 @@ void LlmRerankTranslation::Collect() {
                 conf_ok = false;   // CE 未就绪 → 不确认（比按层1 序确认安全）
               }
             }
-            // ③ 同字数档首选（1 字档 / 多字档）∧ span/文本一致（文本一致铁律）
+            // ③ 同 span 首选 ∧ 文本一致（文本一致铁律）
             // 2026-11-26：整句显示序恢复「先长后短」，不能再用融合序第 1。
+            // 2026-11-26 用户定案③：按 span == [seg_start, seg_start+le) 取
+            // 第一个候选（取代「同字数档」）——确认只对 lead 覆盖的那段码
+            // 负责；旧「同字数」会跨切分比较（明朝 0..8 vs 明察 0..7），同
+            // span 上 1 字/多字也可并存（西安=xi+an vs 县=xian）→ 一并比。
+            // A/B：RIME_LLM_GATE_SPAN=0 → 回同字数档。
+            // 2026-11-26 用户定案②：**音节不完整的单字不参与**
+            // （打 `shen` 时 `生`=sheng 的前缀即使 CE 更好也不能占位）；
+            // 全是不完整音节字 → 不确认（宁可不确认不可错确认）。
+            static const char *env_gate_span = getenv("RIME_LLM_GATE_SPAN");
+            const bool span_pick = !(env_gate_span && env_gate_span[0] == '0' &&
+                                     env_gate_span[1] == '\0');
             size_t i1 = (size_t)order[0];
+            bool picked = false;
             {
               size_t lead_chars = utf8_len(*lead);
               for (int oi : order) {
-                size_t nc = utf8_len(candidates_[(size_t)oi]->text());
-                if ((nc == 1) == (lead_chars == 1)) {
-                  i1 = (size_t)oi;
-                  break;
-                }
+                const auto &cand = candidates_[(size_t)oi];
+                const bool hit =
+                    span_pick
+                        ? (cand->start() == seg_start_ &&
+                           cand->end() == want_end)
+                        : ((utf8_len(cand->text()) == 1) ==
+                           (lead_chars == 1));
+                if (!hit)
+                  continue;
+                if (lead_chars == 1 &&
+                    cand_is_prefix_only(cand->text(), cand->start(),
+                                        cand->end(), input_, seg_start_))
+                  continue;
+                i1 = (size_t)oi;
+                picked = true;
+                break;
               }
             }
             const auto &c1 = candidates_[i1];
-            if (c1->text() == *lead && c1->start() == seg_start_ &&
+            if (picked && c1->text() == *lead &&
+                c1->start() == seg_start_ &&
                 c1->end() == want_end && conf_ok) {
               std::lock_guard<std::mutex> lk(g_pending_confirm_mu);
               g_pending_confirm.valid = true;
@@ -4695,11 +5058,18 @@ void LlmRerankTranslation::Collect() {
         double u1 = has_terms
                         ? user_unigram_term(candidates_[i]->text(), input_)
                         : 0;
-        // 词码对修正只随 CE 分生效（无 CE 时融合里没有它，行尾也写 0）
-        double sdelta = (pf_on && has_score[i])
-                            ? pairfix_delta(pf_tbl,
-                                            candidates_[i]->text(), input_)
-                            : 0.0;
+        // CE 偏置只随 CE 分生效（无 CE 时融合里没有它，行尾也写 0）；
+        // 含 (词,码) 表 + 字-音节读音先验两项之和（显示端只认总修正）。
+        double sdelta = 0.0;
+        if (has_score[i]) {
+          if (cb_on)
+            sdelta += ce_bias_delta(cb_tbl, candidates_[i]->text(), input_);
+          if (share_tbl)
+            sdelta += ce_share_delta(*share_tbl, candidates_[i]->text(),
+                                     candidates_[i]->start(),
+                                     candidates_[i]->end(), input_,
+                                     seg_start_);
+        }
         double ce = has_score[i] ? score_of[i] : -1e308;
         double ce1 = -1e308, ce2 = -1e308, ce3v = -1e308;
         if (has_score[i] && i < (int)ce3_of.size()) {
@@ -4719,7 +5089,7 @@ void LlmRerankTranslation::Collect() {
     // kCeW 权重，查看器常显）：窗口候选按最终序（ce/fused/cerank 取自重排
     // 状态）+ 层1 尾窗透传（win=0，无 CE 分），上限 20 行。order 空时（评分
     // 整体失败）窗口按引擎序全 win=1 无分。v5（2026-11-14）行尾再追加修正
-    // 分 pf = 词码对预置降分修正的 λ（0 = 未命中）——总分已含 −λ, 查看器
+    // 分 pf = CE 偏置的负幅度（0 = 未命中/正分；旧查看器兼容）——总分已含 −λ, 查看器
     // 总分格据此补 −λ 标注恢复逐项验算（append-only, 旧查看器忽略）。
     // v7（2026-11-21）行尾再追加 seg = token 边界段显（"词"列：单 token 词
     // 原样、真实多 token 词段间 '/'、2 token 拼成的字合并整字——token 化
@@ -4760,7 +5130,12 @@ void LlmRerankTranslation::Collect() {
         double u1 = user_unigram_term(c->text(), input_);
         // v5: 旧 pf = 负分幅度（仅扣分，0=未命中），保留给旧查看器；
         // v6 (2026-11-17): 行尾追加有符号 sdelta（+200/+100/-5/0）。
-        double sdelta = pf_on ? pairfix_delta(pf_tbl, c->text(), input_) : 0.0;
+        double sdelta = 0.0;
+        if (cb_on)
+          sdelta += ce_bias_delta(cb_tbl, c->text(), input_);
+        if (share_tbl)
+          sdelta += ce_share_delta(*share_tbl, c->text(), c->start(), c->end(),
+                                   input_, seg_start_);
         double pf = sdelta < 0.0 ? -sdelta : 0.0;
         std::string ce1, ce2, ce3s;
         if (src_idx >= 0 &&
@@ -4845,12 +5220,41 @@ void LlmRerankTranslation::Collect() {
     if (g_sentence_mode) {
       // 2026-11-26 用户定案：整句模式恢复「先长后短」显示序（同字数保持
       // 融合序；融合/准入/前缀判定仍用融合序，不受显示序影响）。
+      // 2026-11-26 用户定案①：单字块内再按**整读层**分两段——整读在前、
+      // 前缀简拼/纠错在后（tier 只是排序键，不进融合分）。无表/关 → 逐位一致。
+      std::vector<char> tier1;   // 对齐 candidates_；1 = 前缀简拼 / 纠错
+      {
+        const std::map<std::string, std::string> *syl = nullptr;
+        if (syll_chars_table(&syl)) {
+          tier1.assign(candidates_.size(), 0);
+          for (size_t i = 0; i < candidates_.size(); i++) {
+            if (utf8_len(candidates_[i]->text()) != 1)
+              continue;
+            const long long s = (long long)candidates_[i]->start();
+            const long long e = (long long)candidates_[i]->end();
+            const long long s0 = s - (long long)seg_start_;
+            const long long e0 = e - (long long)seg_start_;
+            if (s0 < 0 || e0 <= s0 || (size_t)e0 > input_.size())
+              continue;
+            std::string key;
+            if (!syll_judge(*syl, candidates_[i]->text(),
+                            input_.substr((size_t)s0, (size_t)(e0 - s0)),
+                            &key))
+              tier1[i] = 1;
+          }
+        }
+      }
       std::vector<size_t> di(candidates_.size());
       for (size_t i = 0; i < di.size(); i++)
         di[i] = i;
       std::stable_sort(di.begin(), di.end(), [&](size_t a, size_t b) {
-        return utf8_len(candidates_[a]->text()) >
-               utf8_len(candidates_[b]->text());
+        const size_t la = utf8_len(candidates_[a]->text());
+        const size_t lb = utf8_len(candidates_[b]->text());
+        if (la != lb)
+          return la > lb;
+        if (la == 1 && !tier1.empty() && tier1[a] != tier1[b])
+          return tier1[a] < tier1[b];
+        return false;
       });
       for (size_t i : di)
         out.push_back(candidates_[i]);
@@ -4881,7 +5285,7 @@ static void on_context_changed(const char *text);  // defined below
 
 LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
   // 方案子目录（2026-11-22 四件全分）：先固定当前方案 ID——H 行/账本/
-  // 词码对/语料的路径解析都依赖它，必须早于本构造内的任何写入
+  // CE 偏置表/语料的路径解析都依赖它，必须早于本构造内的任何写入
   if (engine_ && engine_->schema())
     llm_set_schema_id(engine_->schema()->schema_id());
   // read LLM config from the scheme's llm_rerank section.
@@ -5072,6 +5476,125 @@ static void on_context_changed(const char *text) {
   request_prepare(text ? text : "");
 }
 
+// ═══ 整句词频归因（2026-11-26）═══
+// 整句模式一次 commit 上屏的是整个句子，把整句记成词条 = 键永不复现
+//（实测 luna_pinyin 账本 8.4% 条目 ≥6 字；多段提交键还错配为「整句文本⊕
+// 尾段码」——词频信号全丢）。改为按「组合区已确认段」逐词归因：普通段/
+// 确认词 = 单词条，组句段 = 组句词路径（g_ng_paths）按段码切片。
+// 校验全过才归因，否则回退旧行为——宁可不归因不错记。
+struct AttrSegRec {   // commit 瞬间的一个已确认段
+  std::string text;
+  std::string code;   // 该段覆盖的输入码切片（不可得 = 空）
+};
+
+static bool pure_lower_code(const std::string &c) {
+  return !c.empty() &&
+         c.find_first_not_of("abcdefghijklmnopqrstuvwxyz") == std::string::npos;
+}
+
+// commit 瞬间的已确认段条带。OnCommit 从 ConcreteEngine::OnCommit 发出、
+// 在 Context::Commit 的 Clear() 之前——composition 与 input 此刻可读
+// （与简码补录同窗口）；段坐标以同一瞬间的 input 为准，天然自洽。
+static std::vector<AttrSegRec> collect_attr_strip(Context *ctx) {
+  std::vector<AttrSegRec> out;
+  if (!ctx)
+    return out;
+  const std::string &input = ctx->input();
+  for (const Segment &seg : ctx->composition()) {
+    if (seg.status < Segment::kSelected)
+      continue;
+    auto cand = seg.GetSelectedCandidate();
+    if (!cand || cand->text().empty())
+      continue;
+    AttrSegRec s;
+    s.text = cand->text();
+    if (seg.start < seg.end && seg.end <= input.size())
+      s.code = input.substr(seg.start, seg.end - seg.start);
+    out.push_back(std::move(s));
+  }
+  return out;
+}
+
+struct AttrWordRec {
+  std::string w;
+  std::string code;
+};
+
+// 校验 + 归因。返回 false = 校验失败 → 调用方回退旧行为。校验：
+//   ① Σ段文本 == 提交文本（字节级）；
+//   ② 含中文段的段码为纯小写字母（标点/英文段跳过不记账）；
+//   ③ full_code 与 live 输入码一致或其后缀（live 纯小写非空时）；
+//   ④ 组句段词路径覆盖校验（偏移严格递增、末端 == 段码长）。
+static bool build_commit_attribution(
+    const std::string &commit_text, const std::vector<AttrSegRec> &strip,
+    const std::string &live_code, std::vector<AttrWordRec> *out,
+    std::string *full_code, std::string *path_field) {
+  if (strip.empty())
+    return false;
+  std::string concat, fc;
+  for (const auto &seg : strip) {
+    concat += seg.text;
+    if (text_has_cjk_utf8(seg.text)) {
+      if (!pure_lower_code(seg.code))
+        return false;
+      fc += seg.code;
+    }
+  }
+  if (concat != commit_text || fc.empty())
+    return false;
+  if (!live_code.empty() && pure_lower_code(live_code) && live_code != fc &&
+      (live_code.size() > fc.size() ||
+       fc.compare(fc.size() - live_code.size(), live_code.size(),
+                  live_code) != 0))
+    return false;
+  out->clear();
+  for (const auto &seg : strip) {
+    if (!text_has_cjk_utf8(seg.text))
+      continue;
+    const NgPathRec *path = nullptr;
+    for (size_t i = g_ng_paths.size(); i > 0; --i) {
+      const NgPathRec &r = g_ng_paths[i - 1];
+      if (r.text == seg.text && r.code == seg.code && !r.words.empty()) {
+        path = &r;
+        break;
+      }
+    }
+    if (path) {
+      int prev = 0;
+      bool okp = true;
+      std::vector<AttrWordRec> sliced;
+      for (const auto &w : path->words) {
+        if (w.second <= prev || w.second > (int)seg.code.size()) {
+          okp = false;
+          break;
+        }
+        sliced.push_back(
+            {w.first, seg.code.substr(prev, (size_t)w.second - prev)});
+        prev = w.second;
+      }
+      if (okp && prev == (int)seg.code.size()) {
+        for (auto &a : sliced)
+          if (text_has_cjk_utf8(a.w))
+            out->push_back(std::move(a));
+      } else {
+        out->push_back({seg.text, seg.code});  // 路径异常 → 单词条兜底
+      }
+    } else {
+      out->push_back({seg.text, seg.code});
+    }
+  }
+  if (out->empty())
+    return false;
+  *full_code = fc;
+  path_field->clear();
+  for (size_t i = 0; i < out->size(); ++i) {
+    if (i)
+      *path_field += "/";
+    *path_field += out->at(i).w + ":" + out->at(i).code;
+  }
+  return true;
+}
+
 void LlmFilter::OnCommit(const std::string &commit_text) {
   // 异步基建（2026-11-22）：先收割（上屏时本词评分多半已完成——立即落账，
   // 场景内最后一词也有 ok 行，语料断言/词码对 ref 不依赖"下一次 query"），
@@ -5116,21 +5639,64 @@ void LlmFilter::OnCommit(const std::string &commit_text) {
       code = live;
   }
   // 账本查询自带懒加载（2026-11-17 合并单账本），无需显式 ensure
-  double eff_before = has_cjk ? user_freq_eff(commit_text, code) : 0;
   int dirty_before = g_user_stats_dirty;
-  user_stats_bump(commit_text, code);
-  double eff_after = has_cjk ? user_freq_eff(commit_text, code) : 0;
-  long long tick_after = g_user_tick;
-  // 常开语料 C 事件（提交词/码/名次；ref 指向同码 W）
-  std::string cid = write_c(commit_text, code, tick_after, has_cjk);
-  commit_stack_push(commit_text, code, tick_after, cid);  // 回撤退款
-  if (g_debug_fusion && has_cjk) {
-    debug_write_e(cid, eff_before, eff_after, dirty_before);
-    // 实时调试 E 行（2026-11-10）：commit 落账（eff/tick 前后值）
-    live_send(std::string("E|") + now_hms() + "|" + live_esc(commit_text) +
-              "|" + live_num(eff_before) + "|" + live_num(eff_after) + "|" +
-              std::to_string(g_user_tick - 1) + "|" +
-              std::to_string((long long)g_user_tick));
+  // [整句词频归因]（2026-11-26）：校验通过 → 词级条目入账（组句段按组句
+  // 词路径切词、普通段/确认词单词条），N 词共享提交级 tick；整句键**不再**
+  // 入账。C 行 = 整句原样 + v8 path 尾字段（码 = 各段码拼接 = 完整提交码，
+  // 修掉旧「整句文本⊕尾段码」错配）。校验失败 → 回退旧行为（整句键入账）。
+  std::vector<AttrWordRec> attr_words;
+  std::string attr_full_code, attr_path;
+  bool attr_ok = false;
+  if (g_sentence_attr_on && has_cjk && engine_ && engine_->context()) {
+    Context *ctxc = engine_->context();
+    std::vector<AttrSegRec> strip = collect_attr_strip(ctxc);
+    attr_ok = build_commit_attribution(commit_text, strip, ctxc->input(),
+                                       &attr_words, &attr_full_code,
+                                       &attr_path);
+    if (attr_ok)
+      log_msg("attr: n=%d code='%s' path='%s'", (int)attr_words.size(),
+              attr_full_code.c_str(), attr_path.c_str());
+  }
+  if (attr_ok) {
+    ++g_user_tick;  // 提交级 tick：一次 commit 事件 +1，N 词共享
+    const long long tick1 = g_user_tick;
+    std::vector<std::pair<std::string, std::string>> word_pairs;
+    word_pairs.reserve(attr_words.size());
+    for (const auto &aw : attr_words)
+      word_pairs.emplace_back(aw.w, aw.code);
+    // 常开语料 C 事件（整句原样 + 归因路径；ref 后缀匹配尾段窗）
+    std::string cid = write_c(commit_text, attr_full_code, tick1, has_cjk,
+                              attr_path);
+    commit_stack_push(commit_text, attr_full_code, tick1, cid,
+                      std::move(word_pairs));  // 回撤退款（组记录）
+    for (const auto &aw : attr_words) {
+      double eb = user_freq_eff(aw.w, aw.code);
+      user_stats_bump_at(aw.w, aw.code, tick1);
+      double ea = user_freq_eff(aw.w, aw.code);
+      if (g_debug_fusion) {
+        debug_write_e(cid, eb, ea, dirty_before);
+        // 实时调试 E 行（2026-11-10）：commit 落账，词级归因逐词一行
+        live_send(std::string("E|") + now_hms() + "|" + live_esc(aw.w) +
+                  "|" + live_num(eb) + "|" + live_num(ea) + "|" +
+                  std::to_string(tick1 - 1) + "|" + std::to_string(tick1));
+      }
+    }
+  } else {
+    double eff_before = has_cjk ? user_freq_eff(commit_text, code) : 0;
+    user_stats_bump(commit_text, code);
+    double eff_after = has_cjk ? user_freq_eff(commit_text, code) : 0;
+    long long tick_after = g_user_tick;
+    // 常开语料 C 事件（提交词/码/名次；ref 指向同码 W）
+    std::string cid = write_c(commit_text, code, tick_after, has_cjk);
+    commit_stack_push(commit_text, code, tick_after, cid);  // 回撤退款
+    if (g_debug_fusion && has_cjk) {
+      debug_write_e(cid, eff_before, eff_after, dirty_before);
+      // 实时调试 E 行（2026-11-10）：commit 落账（eff/tick 前后值）
+      live_send(std::string("E|") + now_hms() + "|" + live_esc(commit_text) +
+                "|" + live_num(eff_before) + "|" + live_num(eff_after) + "|" +
+                std::to_string(g_user_tick - 1) + "|" +
+                std::to_string((long long)g_user_tick));
+    }
   }
   // bound the fallback buffer: LLM context is at most ~20 tokens
   // (1-2 chars/token = 40 chars), keep only the most recent 64 UTF-8
@@ -5616,7 +6182,7 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
   }
   if (ctx.empty()) {
     // 无上文（2026-11-24 用户定案）：CE 不可算，但整句模式下前缀确认仍要跑
-    // ——融合分按剩余项（β·log1p(eff) + log(uni+1) + 词码对修正）计算，
+    // ——融合分按剩余项（β·log1p(eff) + log(uni+1) + CE 偏置）计算，
     // 组句 lead 仍与窗口融合序第 1 比较（Collect 内 freq_only 分支）。
     // 组合区已确认前缀已在上面追加进 ctx：确认过 1 个 phrase 后 ctx 非空，
     // 下一键自动回到完整 CE 融合（"选一次 phrase 就有了临时上文"）。
