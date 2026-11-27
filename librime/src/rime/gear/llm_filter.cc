@@ -187,6 +187,18 @@ static double g_prefix_ce1 = []() {
   return (v >= 0.0 && v <= 1e6) ? v : 11.0;
 }();
 
+// 输入闸阈值（2026-11-25 设 30；2026-11-27 放宽 128，与组句检查点上限
+// 对齐）：增量组句后逐键成本不再随码长超线性（31–88 字母实测 1.3–3ms/键），
+// Collect 30ms 预算 / CE 预算窗也与码长无关。真机被闸码长实测 p50=39 /
+// p90=47 / max=54（整句模式打长句是常态）。连续重复 ≥8（code_repeat）
+// 独立保留。A/B：RIME_LLM_GATE_LEN=30 回旧行为。
+static int g_gate_len = []() {
+  const char *e = getenv("RIME_LLM_GATE_LEN");
+  if (!e || !*e) return 128;
+  int v = atoi(e);
+  return (v >= 4 && v <= 100000) ? v : 128;
+}();
+
 // ═══ 前缀确认门：LightGBM 模型（2026-11-25 用户定案落地）═══
 // 41 个可部署特征（顺序见研究库 eval/calib/export_prefix_gate.py）→
 // LightGBM 300 树 / 15 叶 → p̂ ≥ τ 才确认；取代 `P≥0.95 ∧ ce1≤11` 两道
@@ -6241,12 +6253,15 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
 
   // context source: TSF caret text, or commit history fallback
   auto [ctx, src] = GetContextTextPair();
-  // 输入闸（2026-11-25，学万象 limit_repeated）：单段码 >30 字母或连续重复
-  // ≥8 → 不重排（不收集/不推理），按引擎原序透传。长码每键开销随码长超线性
-  // 增长（实测 41 字母整串 80ms，与万象剖析 P99 36ms 同级），LLM 收益集中
-  // 在短码；闸门命中直接返回原 translation（与插件版同构）。
-  if (code.size() > 30 || has_repeat_run(code, 8)) {
-    const char *why = code.size() > 30 ? "code_too_long" : "code_repeat";
+  // 输入闸（2026-11-25 学万象 limit_repeated；2026-11-27 放宽 128，见
+  // g_gate_len 处注释）：单段码超阈值或连续重复 ≥8 → 不重排（不收集/
+  // 不推理），按引擎原序透传；闸门命中直接返回原 translation（与插件版
+  // 同构）。
+  if (code.size() > static_cast<size_t>(g_gate_len) ||
+      has_repeat_run(code, 8)) {
+    const char *why = code.size() > static_cast<size_t>(g_gate_len)
+                          ? "code_too_long"
+                          : "code_repeat";
     std::string wid = new_event_id("W", g_user_tick);
     write_w(wid, src, code, ctx, {}, {}, {}, g_user_tick, "skip", why, false,
             "");
