@@ -340,6 +340,12 @@ CPU（enabled=false 对照实测 40 倍差）→ server 消息线程占死 → T
 资产在用户目录 `llm_ngram\`（或 `RIME_LLM_NGRAM_PATH` / `RIME_LLM_NGRAM_DICT`），
 索引缓存 `llm_rerank\ngram_lex\<方案>.bin`（首次约 5 秒、之后 mmap 近 0 秒）。
 生产参数 14–16ms/句、wiki hit@5 73%/61%；topk 20 实测 4.0→4.1ms/窗。
+**增量组句（2026-11-27，与插件版同构）**：逐键续打跨键复用逐码位剪枝 beam
+（`GenerateCached`，位置 i 的剪枝结果只依赖码前缀 + 上文尾 + 参数），结果
+与全量**逐位一致**（插件侧 200 句 × 6,741 前缀步对拍 fail=0），逐键开销
+4–15ms → ~1.2–2ms 且不随码长超线性涨；有效性 = 纯前缀延伸 + 同上文尾 +
+同参数，不满足自动回落全量；A/B `RIME_LLM_NGRAM_INCR=0`。对拍工具在插件
+仓（`cpp/ngram_parity.lua` 的 `NGRAM_MODE=incr`）。
 生成结果先过**完整覆盖校验**（词序列须从码位 0 连续覆盖到码末）才允许注入。
 切片口径：`Collect` 收到的 `input_` 已经是活动段切片（`Apply` 按段边界截好），
 **不得再按 `seg_start_` 二次截取**——`Select` 之后段的 start/end 仍是原串坐标，

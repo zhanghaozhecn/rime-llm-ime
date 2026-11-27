@@ -503,8 +503,12 @@ static std::vector<rime_llm_ngram::Sentence> ngram_generate(
     std::lock_guard<std::mutex> lk(g_ngram_mu);
     eng = g_ngram_engine;
   }
+  // 增量组句（2026-11-27）：跨键复用逐码位剪枝 beam，结果与 Generate 逐位
+  // 一致，逐键 4–15ms → ~1–2ms（插件版 cpp/ngram.cpp 同构；A/B 用
+  // RIME_LLM_NGRAM_INCR=0 回全量）。有效性（纯前缀延伸/同上文尾/同参数）
+  // 不满足时内部自动回落全量。
   if (eng)
-    out = eng->Generate(code, ctx, p);
+    out = eng->GenerateCached(code, ctx, p);
   if (out.empty())  // 诊断（2026-11-23 晚）：空结果也要可见
     log_msg("ngram: generate empty code='%s' ctxlen=%zu eng=%d",
             code.c_str(), ctx.size(), eng ? 1 : 0);
@@ -5387,9 +5391,6 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
       p.has_debug_fusion = true;
       p.debug_fusion = b;
     }
-    log_error("pfx: ctor cfg has_debug=%d debug=%d has_en=%d en=%d",
-              (int)p.has_debug_fusion, (int)p.debug_fusion,
-              (int)p.has_enabled, (int)p.enabled);
     int v = 0;
     std::string sv;
     if (config->GetString("llm_rerank/code_pattern", &sv)) {
@@ -6240,8 +6241,6 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
 
   // context source: TSF caret text, or commit history fallback
   auto [ctx, src] = GetContextTextPair();
-  log_error("pfx: ctxq code='%.20s' src=%s len=%zu ctx='%.28s'",
-            code.c_str(), src.c_str(), ctx.size(), ctx.c_str());
   // 输入闸（2026-11-25，学万象 limit_repeated）：单段码 >30 字母或连续重复
   // ≥8 → 不重排（不收集/不推理），按引擎原序透传。长码每键开销随码长超线性
   // 增长（实测 41 字母整串 80ms，与万象剖析 P99 36ms 同级），LLM 收益集中
