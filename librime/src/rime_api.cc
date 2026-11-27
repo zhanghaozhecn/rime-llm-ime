@@ -117,3 +117,16 @@ int RimeLlmAsyncRevision(void) {
 
 // 待执行的前缀确认（2026-11-23 晚修）：实现见 rime_api_impl.h
 Bool RimeLlmPendingConfirm(void) { return RimeLlmPendingConfirmImpl(); }
+
+// 候选类标（2026-11-27，无头探针 --cls 用）：实现见 rime_api_impl.h
+Bool RimeGetCandidateCls(RimeSessionId session_id, int index,
+                         char* type_buf, size_t type_buf_size,
+                         int* start, int* end, int* comp) {
+  return RimeGetCandidateClsImpl(session_id, index, type_buf, type_buf_size,
+                                 start, end, comp);
+}
+
+// 前缀确认 exec（2026-11-27 方案 a）：实现见 rime_api_impl.h
+Bool RimeExecPendingConfirm(RimeSessionId session_id) {
+  return RimeExecPendingConfirmImpl(session_id);
+}

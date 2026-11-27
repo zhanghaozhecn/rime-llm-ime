@@ -269,6 +269,14 @@ BOOL RimeWithWeaselHandler::ProcessKeyEvent(KeyEvent keyEvent,
   if (m_disabled)
     return FALSE;
   RimeSessionId session_id = to_session_id(ipc_id);
+  // 前缀确认 exec（2026-11-27 用户定案方案 a）：打字期间 server 被逐键评分
+  // 占满，TSF 的 REFRESH 插不进两键之间的空档，pending 会悬到提交边界被清。
+  // 在 rime 收键前（input 仍是上一键原样）执行确认——语义 = 确认前缀、剩余
+  // 键继续。仅小写字母键放行（space/数字/回车等选重键不得劫持）；组合已变
+  // （换窗回写等）时引擎侧 input 校验自行拒绝。
+  if (keyEvent.keycode >= 0x61 && keyEvent.keycode <= 0x7a &&
+      RimeLlmPendingConfirm())
+    RimeExecPendingConfirm(session_id);
   Bool handled = rime_api->process_key(session_id, keyEvent.keycode,
                                        expand_ibus_modifier(keyEvent.mask));
   // vim_mode when keydown only

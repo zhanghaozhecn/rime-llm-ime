@@ -555,13 +555,16 @@ void WeaselTSF::_StopRefreshTimer() {
 }
 
 void WeaselTSF::_OnRefreshTimer() {
-  // 组合结束/中止后无可刷新对象：停表，下次按键由 _EnsureRefreshTimer 重挂
-  if (!_IsComposing() || !_pEditSessionContext) {
-    tsf_timer_log("tick SKIP composing=%d ctx=%p", (int)_IsComposing(),
-                  (void*)_pEditSessionContext.p);
-    _StopRefreshTimer();
+  // 2026-11-27（P0-2 真机实锤，取代 2026-11-23 的停表门）：CUAS 组合托管
+  // 模式下，提交后的下一个组合期 StartComposition 事件可能整段缺失——
+  // _IsComposing()（_pComposition）与 _status.composing 都恒 0，任何
+  // 停表门都会让定时器在打字中途死掉，挂起的前缀确认永远等不到 REFRESH
+  // （真机：pending 全部悬死、exec 0 次）。改为 **tick 里永不停表**：
+  // 真组合结束由 _FinalizeComposition 显式停表（唯一停表点）；组合缺席时
+  // server 侧 Refresh 门控（代次变 ∨ 有挂起）让每次 poll 只多一次轻量
+  // IPC，无重译负载（2026-11-24 的"刷新→重译"死循环已在 server 侧根治）。
+  if (!_pEditSessionContext)
     return;
-  }
   tsf_timer_log("tick send REFRESH");
   m_client.Refresh();
   // 响应体已由 Transact 读入线程缓冲，这里走常规编辑会话解析并更新界面

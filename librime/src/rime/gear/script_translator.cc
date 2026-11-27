@@ -37,13 +37,13 @@
 namespace rime {
 
 // ── [账本有序源]（2026-11-27）: LLM 层用户词频账本作为第三候选源 ──
-// 数据出口在 gear/llm_filter.cc（词级聚合：每词取规范码形 + 衰减 eff），
-// 跨文件 ad-hoc 声明先例 = context.cc:19 的 g_llm_pending_confirm_query。
-// 结构布局须与 llm_filter.cc 的定义逐字一致。
+// 数据出口在 gear/llm_filter.cc（**词级聚合**：全部码形按 cum 降序 + 跨码形
+// 衰减 eff），跨文件 ad-hoc 声明先例 = context.cc:19 的
+// g_llm_pending_confirm_query。结构布局须与 llm_filter.cc 的定义逐字一致。
 struct LedgerSrcEntry {
   string word;
-  string code;
-  double eff;
+  vector<string> codes;   // 该词的全部码形，按 cum 降序（最可信在前）
+  double eff;             // 跨码形聚合的当前衰减 eff
 };
 size_t g_llm_user_source_gen();
 void g_llm_user_source_entries(vector<LedgerSrcEntry>* out);
@@ -542,88 +542,102 @@ static an<UserDictEntryCollector> BuildLedgerSource(
   hash_map<int, DictEntryList> by_end;
   int recruited = 0;
   for (const auto& le : entries) {
-    // 规范码串 → 音节序列：带空格按空格切（userdb 键语义）；无空格 =
-    // 提交段码原样（"fuqi"）→ 用 syllabary DP 切分；切不开 = 简拼/双拼/
-    // 异形码 → 跳过（该词无规范读音，不入有序源）
-    vector<string> syls;
-    bool known = true;
-    if (le.code.find(' ') != string::npos) {
-      size_t b = 0;
-      while (b <= le.code.size()) {
-        size_t sp = le.code.find(' ', b);
-        string syl =
-            le.code.substr(b, sp == string::npos ? string::npos : sp - b);
-        if (syl2id.find(syl) == syl2id.end()) {
-          known = false;
-          break;
-        }
-        syls.push_back(syl);
-        if (sp == string::npos)
-          break;
-        b = sp + 1;
-      }
-    } else {
-      const size_t n = le.code.size();
-      vector<bool> reach(n + 1, false);
-      vector<int> cut(n + 1, -1);
-      reach[0] = true;
-      for (size_t j = 1; j <= n && known; ++j) {
-      for (size_t i = 0; i < j; ++i) {
-        if (!reach[i])
-          continue;
-        if (syl2id.count(le.code.substr(i, j - i))) {
-          reach[j] = true;
-          cut[j] = static_cast<int>(i);
-          break;
-        }
-      }
-      }
-      if (!reach[n]) {
-        known = false;
-      } else {
-        for (size_t j = n; j > 0;) {
-          int i = cut[j];
-          syls.push_back(le.code.substr(static_cast<size_t>(i), j - i));
-          j = static_cast<size_t>(i);
-        }
-        std::reverse(syls.begin(), syls.end());
-      }
-    }
-    if (!known || syls.empty())
-      continue;
-    // 沿音节图逐音节匹配；断点后仅补全尾段 id（predictive 用）
-    vector<SyllableId> path_ids;
-    vector<SyllableId> full_ids;
-    size_t pos = 0;
-    size_t matched = 0;
+    // 码形逐个尝试（2026-11-27 B2）：账本按**词**聚合，codes 按 cum 降序
+    // ——取第一个能切成音节、且能沿音节图匹配的码形。旧版只取 cum 最大的
+    // 那一个码形，切不开（简拼/双拼/异形码）则该词整条不入源，哪怕它有
+    // 合法全拼码形。权重用**跨码形聚合的 eff**（词级总词频）。
+    bool got = false;
+    vector<SyllableId> path_ids, full_ids;
+    size_t pos = 0, matched = 0;
     double quality_len = 0.0;
-    for (size_t i = 0; i < syls.size(); ++i) {
-      const SyllableId id = syl2id.at(syls[i]);
-      full_ids.push_back(id);
-      if (i != matched)
+    for (const auto& code : le.codes) {
+      // 规范码串 → 音节序列：带空格按空格切（userdb 键语义）；无空格 =
+      // 提交段码原样（"fuqi"）→ 用 syllabary DP 切分；切不开 = 简拼/双拼/
+      // 异形码 → 换下一个码形
+      vector<string> syls;
+      bool known = true;
+      if (code.find(' ') != string::npos) {
+        size_t b = 0;
+        while (b <= code.size()) {
+          size_t sp = code.find(' ', b);
+          string syl = code.substr(b, sp == string::npos ? string::npos : sp - b);
+          if (syl2id.find(syl) == syl2id.end()) {
+            known = false;
+            break;
+          }
+          syls.push_back(syl);
+          if (sp == string::npos)
+            break;
+          b = sp + 1;
+        }
+      } else {
+        const size_t n = code.size();
+        vector<bool> reach(n + 1, false);
+        vector<int> cut(n + 1, -1);
+        reach[0] = true;
+        for (size_t j = 1; j <= n && known; ++j) {
+          for (size_t i = 0; i < j; ++i) {
+            if (!reach[i])
+              continue;
+            if (syl2id.count(code.substr(i, j - i))) {
+              reach[j] = true;
+              cut[j] = static_cast<int>(i);
+              break;
+            }
+          }
+        }
+        if (!reach[n]) {
+          known = false;
+        } else {
+          for (size_t j = n; j > 0;) {
+            int i = cut[j];
+            syls.push_back(code.substr(static_cast<size_t>(i), j - i));
+            j = static_cast<size_t>(i);
+          }
+          std::reverse(syls.begin(), syls.end());
+        }
+      }
+      if (!known || syls.empty())
         continue;
-      auto iit = graph.indices.find(pos);
-      if (iit == graph.indices.end())
-        continue;   // 图耗尽 → matched 停在此
-      auto spit = iit->second.find(id);
-      if (spit == iit->second.end())
-        continue;
-      // 取首个拼写属性（缩写变体跳过，镜像 user_dictionary.cc:237-239）
-      const EdgeProperties* props =
-          spit->second.empty() ? nullptr : spit->second.front();
-      if (!props)
-        continue;
-      path_ids.push_back(id);
-      if (props->type == kNormalSpelling)
-        quality_len += static_cast<double>(props->end_pos - pos);
-      pos = props->end_pos;
-      ++matched;
+      // 沿音节图逐音节匹配；断点后仅补全尾段 id（predictive 用）
+      path_ids.clear();
+      full_ids.clear();
+      pos = 0;
+      matched = 0;
+      quality_len = 0.0;
+      for (size_t i = 0; i < syls.size(); ++i) {
+        const SyllableId id = syl2id.at(syls[i]);
+        full_ids.push_back(id);
+        if (i != matched)
+          continue;
+        auto iit = graph.indices.find(pos);
+        if (iit == graph.indices.end())
+          continue;   // 图耗尽 → matched 停在此
+        auto spit = iit->second.find(id);
+        if (spit == iit->second.end())
+          continue;
+        // 取首个拼写属性（缩写变体跳过，镜像 user_dictionary.cc:237-239）
+        const EdgeProperties* props =
+            spit->second.empty() ? nullptr : spit->second.front();
+        if (!props)
+          continue;
+        path_ids.push_back(id);
+        if (props->type == kNormalSpelling)
+          quality_len += static_cast<double>(props->end_pos - pos);
+        pos = props->end_pos;
+        ++matched;
+      }
+      const bool exact = matched == syls.size();
+      const bool predictive =
+          !exact && matched >= 2 && pos == consumed && matched < syls.size();
+      if (exact || predictive) {
+        got = true;
+        break;
+      }
     }
-    const bool exact = matched == syls.size();
-    const bool predictive =
-        !exact && matched >= 2 && pos == consumed && matched < syls.size();
-    if (!exact && !predictive)
+    if (!got)
       continue;
+    const bool exact = matched == full_ids.size();
     auto e = New<DictEntry>();
     e->text = le.word;
     e->weight = std::log(le.eff / (le.eff + 30.0));
@@ -872,25 +886,55 @@ iter_incremented:
   //   ① 严格更长（码长优先规则）
   //   ② 与 sys 同长且 user 不覆盖该长度（用户词频 > 系统词，镜像
   //      userdb>sys 同长优先；与 user 同长时 userdb 原生学习优先）
+  // 并且（2026-11-27 用户定案）**同 span 时首位不许联想压精确**：镜像
+  // user-vs-sys 的 kNumExactMatchOnTop=1——「长词联想之前须至少出一个严格
+  // 匹配的候选」。缺这条时账本里一次输入的新词（eff≈1 → log(eff/(eff+30))
+  // ≈−3.4）就可能以联想身份压掉同 span 的系统精确词。
+  // 只在「与 sys 同 span」这一支生效：ledger 严格更长时该 span 上没有别的
+  // 源可比，span 优先（先长后短）照旧——原生也是 span 绝对优先。
+  // B1（2026-11-27）：同 span 接管改为**权重比较**——账本词权重必须严格高于
+  // sys 组首（两者同为 log 概率域：账本 log(eff/(eff+30))、sys log(count/1e8)
+  // + credibility），否则让位给系统词、排队到该组之后再比。旧版无条件接管
+  // 会让只打过一次的词（eff=1）整组压过高频系统词。
   const bool ledger_live =
       ledger_ && ledger_iter_ != ledger_->rend() && ledger_code_length > 0;
-  if (ledger_live &&
+  const bool ledger_span_wins =
+      ledger_live &&
       (ledger_code_length > std::max(user_phrase_code_length, phrase_code_length) ||
        (ledger_code_length == phrase_code_length &&
-        ledger_code_length > user_phrase_code_length))) {
+        ledger_code_length > user_phrase_code_length));
+  const bool ledger_tie_with_sys =
+      ledger_code_length == phrase_code_length &&
+      ledger_code_length > user_phrase_code_length;
+  if (ledger_span_wins) {
     UserDictEntryIterator& liter = ledger_iter_->second;
     const auto& entry = liter.Peek();
-    DLOG(INFO) << "ledger phrase '" << entry->text
-               << "', code length: " << ledger_code_length;
-    candidate_source_ = kLedger;
-    candidate_ =
-        New<Phrase>(translator_->language(),
-                    entry->IsPredictiveMatch() ? "completion" : "ledger",
-                    start_, start_ + ledger_code_length, entry);
-    candidate_->set_quality(std::exp(entry->weight) +
-                            translator_->initial_quality() +
-                            (entry->quality_len / full_code_length));
-    return true;
+    bool ok_here = true;
+    if (ledger_tie_with_sys) {
+      // 精确优先（联想不许占首位）；同 span 还要比权重
+      if (entry->IsPredictiveMatch() && candidate_index_ == 0)
+        ok_here = false;
+      else {
+        double sys_w = -1e308;
+        if (phrase_iter_ != phrase_->rend())
+          sys_w = phrase_iter_->second.Peek()->weight;
+        if (!(entry->weight > sys_w))
+          ok_here = false;
+      }
+    }
+    if (ok_here) {
+      DLOG(INFO) << "ledger phrase '" << entry->text
+                 << "', code length: " << ledger_code_length;
+      candidate_source_ = kLedger;
+      candidate_ =
+          New<Phrase>(translator_->language(),
+                      entry->IsPredictiveMatch() ? "completion" : "ledger",
+                      start_, start_ + ledger_code_length, entry);
+      candidate_->set_quality(std::exp(entry->weight) +
+                              translator_->initial_quality() +
+                              (entry->quality_len / full_code_length));
+      return true;
+    }
   }
   if (user_phrase_code_length > 0 &&
       prefer_user_phrase(

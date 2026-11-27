@@ -562,6 +562,23 @@ RIME_API int RimeLlmAsyncRevision(void);
 //! 的确认要等下一个 LLM 结果落地才生效。
 RIME_API Bool RimeLlmPendingConfirm(void);
 
+//! 候选类标（2026-11-27，无头探针 --cls 用）：取当前组合候选列表第 index 条
+//! 的原生 type、span 与联想类。联想类判定与 llm_filter 的 cand_is_completion
+//! 同构：type=="completion" 成立；uniquified/shadow 经 GetGenuineCandidates
+//! 展开，有 genuine 且全部 completion 才成立。type 写入 type_buf（NUL 终止），
+//! start/end = 候选覆盖的输入字符区间，comp = 联想类 1/0。成功返回 True。
+RIME_API Bool RimeGetCandidateCls(RimeSessionId session_id, int index,
+                                  char* type_buf, size_t type_buf_size,
+                                  int* start, int* end, int* comp);
+
+//! 执行挂起的前缀确认（2026-11-27 方案 a，用户定案）：server 收到"续打键"
+//! （小写字母）但尚未交给 rime 时调用——此刻 input 仍是上一键的原样，满足
+//! 挂起确认的"input 未变"前提。打字期间 server 被逐键评分占满，TSF 的
+//! REFRESH 插不进两键之间的空档，pending 会悬到提交边界被清；本入口让
+//! 确认在续打键前落地（语义 = 确认前缀、剩余键继续）。组合已变（换窗回写）
+//! 时引擎侧 input 校验自行拒绝。返回 True = 确实执行了确认。
+RIME_API Bool RimeExecPendingConfirm(RimeSessionId session_id);
+
 //! API entry
 /*!
  *  Acquire the version controlled RimeApi structure.

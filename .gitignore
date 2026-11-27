@@ -54,6 +54,10 @@ scripts/*
 !scripts/pdb_syms.py
 !scripts/symresolve.c
 !scripts/rime_cand_probe.cpp
+!scripts/build_probe_cand.bat
+!scripts/gen_rime_lib_from_dll.bat
+!scripts/gen_rime_def.py
+!scripts/build_tsf_alt.bat
 !scripts/build_test_llm_context.bat
 !scripts/probe_wps_ctx.cpp
 !scripts/build_probe_wps_ctx.bat
@@ -71,6 +75,8 @@ scripts/*
 !scripts/probe_tab_active.ps1
 !scripts/probe_tab_active2.ps1
 !scripts/probe_tab_verdict.ps1
+weasel/lib64/*.exp
+weasel/output_tsffix/
 
 # bin/ = 本地构建产物与运行数据（全部不入库；WeaselServer 运行需 bin\data，
 # 从官方小狼毫安装目录拷入；发布载荷走 installer\source\）

@@ -1583,13 +1583,70 @@ static void user_stats_ensure_loaded() {
     g_user_tick = max_tick;
 }
 
+// ── 词级聚合回退（2026-11-27，源码版；与插件版 word_agg 同构）──
+// 层1/融合查询键 = (词, 候选 span 切片码)；账本存储键 = (词, 词自己的段码)。
+// 整句模式下两者不同构（整段码查询命中仅 0.2–1.4%，词级键 7–12%），精确键
+// miss 时回退**词级聚合**：Σ各码形 eff（各按自己的 tick 衰减）/ Σcum。
+// 索引随账本 gen 惰性重建（载入/bump/refund 都递增 g_ledger_src_gen）。
+// A/B：`RIME_LLM_FREQ_AGG=0` → 纯精确键（旧行为）。
+struct WordAggEntry {
+  long long cum = 0;
+  std::vector<std::pair<long long, double>> forms;  // (tick, dee)
+};
+static std::map<std::string, WordAggEntry> g_word_agg;
+static unsigned long long g_word_agg_gen = ~0ull;
+
+static bool freq_agg_enabled() {
+  static const bool on = getenv("RIME_LLM_FREQ_AGG") != nullptr
+                             ? std::string(getenv("RIME_LLM_FREQ_AGG")) != "0"
+                             : true;
+  return on;
+}
+
+// 需已持 g_ledger_mu
+static void word_agg_ensure() {
+  user_stats_ensure_loaded();
+  if (g_word_agg_gen == g_ledger_src_gen)
+    return;
+  g_word_agg.clear();
+  for (const auto &kv : g_user_stats) {
+    const size_t tab = kv.first.find('\t');
+    if (tab == string::npos)
+      continue;
+    auto &a = g_word_agg[kv.first.substr(0, tab)];
+    a.forms.emplace_back(kv.second.tick, kv.second.dee);
+    a.cum += kv.second.cum;
+  }
+  g_word_agg_gen = g_ledger_src_gen;
+}
+
+static double word_agg_eff(const std::string &w) {
+  auto it = g_word_agg.find(w);
+  if (it == g_word_agg.end())
+    return 0;
+  double s = 0;
+  for (const auto &f : it->second.forms)
+    if (f.second > 0)
+      s += f.second * exp((double)(f.first - g_user_tick) / kFreqTau);
+  return s;
+}
+
+static long long word_agg_cum(const std::string &w) {
+  auto it = g_word_agg.find(w);
+  return it == g_word_agg.end() ? 0 : it->second.cum;
+}
+
 // 衰减有效计数 (融合用): rime formula_d 查询式（词码对）
 static double user_freq_eff(const std::string &w, const std::string &code) {
   std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
   user_stats_ensure_loaded();
+  word_agg_ensure();
   auto it = g_user_stats.find(w + "\t" + code);
-  if (it == g_user_stats.end() || it->second.dee <= 0)
-    return 0;
+  if (it == g_user_stats.end() || it->second.dee <= 0) {
+    if (!freq_agg_enabled())
+      return 0;
+    return word_agg_eff(w);   // 词级聚合回退（跨码形/跨段长）
+  }
   return it->second.dee *
          exp((double)(it->second.tick - g_user_tick) / kFreqTau);
 }
@@ -1602,8 +1659,16 @@ static double user_freq_eff(const std::string &w, const std::string &code) {
 static double user_unigram_term(const std::string &x, const std::string &code) {
   std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
   user_stats_ensure_loaded();
+  word_agg_ensure();
   auto it = g_user_stats.find(x + "\t" + code);
-  long long cum = it == g_user_stats.end() ? 0 : it->second.cum;
+  long long cum;
+  if (it == g_user_stats.end()) {
+    if (!freq_agg_enabled())
+      return 0;
+    cum = word_agg_cum(x);   // 词级聚合回退（Σ 各码形累计）
+  } else {
+    cum = it->second.cum;
+  }
   return log((double)(cum + 1));
 }
 
@@ -1611,8 +1676,11 @@ static double user_unigram_term(const std::string &x, const std::string &code) {
 static long long user_uni_count(const std::string &x, const std::string &code) {
   std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);  // 回撤退款跨线程
   user_stats_ensure_loaded();
+  word_agg_ensure();
   auto it = g_user_stats.find(x + "\t" + code);
-  return it == g_user_stats.end() ? 0 : it->second.cum;
+  if (it != g_user_stats.end())
+    return it->second.cum;
+  return freq_agg_enabled() ? word_agg_cum(x) : 0;
 }
 
 // ── CE 偏置（2026-11-26 改名；原「词码对（扣分）修正」）─────────────
@@ -1809,14 +1877,15 @@ static bool user_stats_refund(const std::string &w, const std::string &code,
 }
 
 // ── 账本有序源（2026-11-27）: script_translator 第三候选源的数据出口 ──
-// 每词聚合取规范码形（cum 最大、并列取 dee 高）+ 当前衰减 eff（eff < 0.5
-// 的冷词不入源）。**不做音节切分**（本文件无词典表）——原始码串交消费侧
-// （script_translator 经词典 syllabary 切分，切不开 = 简拼/双拼码 → 跳过
-// 该词或该词其它码形）。结构布局须与 script_translator.cc 顶部的声明逐字
-// 一致（ad-hoc 跨文件先例 = g_llm_pending_confirm_query, context.cc:19）。
+// 词级聚合（2026-11-27 B2）：返回该词的**全部码形**（按 cum 降序，仅供消费
+// 侧逐个试切音节）+ **跨码形聚合**的当前衰减 eff（词级总词频；eff < 0.5 的
+// 冷词不入源）。**不做音节切分**（本文件无词典表）——原始码串交消费侧
+// （script_translator 经词典 syllabary 切分，切不开就换下一个码形）。
+// 结构布局须与 script_translator.cc 顶部的声明逐字一致（ad-hoc 跨文件先例
+// = g_llm_pending_confirm_query, context.cc:19）。
 struct LedgerSrcEntry {
   string word;
-  string code;
+  vector<string> codes;
   double eff;
 };
 
@@ -1831,10 +1900,14 @@ void g_llm_user_source_entries(vector<LedgerSrcEntry> *out) {
     return;
   std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);
   user_stats_ensure_loaded();
-  // 每词规范码形：cum 最大（并列取 dee 高）；空码条目不可音节化，跳过
-  map<string, const UserStatEntry *> best;
-  map<string, string> best_code;
-  map<string, long long> best_cum;
+  // 每词：收集全部非空码形（cum 降序、并列取 dee 高）+ 跨码形聚合 eff
+  struct CodeForm {
+    string code;
+    long long cum;
+    double dee;
+    long long tick;
+  };
+  map<string, vector<CodeForm>> forms;
   for (const auto &kv : g_user_stats) {
     const size_t tab = kv.first.find('\t');
     if (tab == string::npos)
@@ -1842,25 +1915,35 @@ void g_llm_user_source_entries(vector<LedgerSrcEntry> *out) {
     const string w = kv.first.substr(0, tab);
     const string c = kv.first.substr(tab + 1);
     if (c.empty())
-      continue;
+      continue;   // 空码条目（捕获失败提交）不可音节化
     const UserStatEntry &e = kv.second;
-    auto it = best.find(w);
-    if (it == best.end() || e.cum > best_cum[w] ||
-        (e.cum == best_cum[w] && e.dee > it->second->dee)) {
-      best[w] = &e;
-      best_code[w] = c;   // 拷贝（循环局部 c 出作用域即亡，不可存指针）
-      best_cum[w] = e.cum;
-    }
+    forms[w].push_back(CodeForm{c, e.cum, e.dee, e.tick});
   }
   out->clear();
   const double now = static_cast<double>(g_user_tick);
-  for (const auto &kv : best) {
-    const UserStatEntry *e = kv.second;
-    const double eff = e->dee * exp((static_cast<double>(e->tick) - now) /
-                                    kFreqTau);
+  for (auto &kv : forms) {
+    auto &v = kv.second;
+    std::stable_sort(v.begin(), v.end(),
+                     [](const CodeForm &a, const CodeForm &b) {
+                       if (a.cum != b.cum)
+                         return a.cum > b.cum;
+                       return a.dee > b.dee;
+                     });
+    // 跨码形聚合 eff：每条目各自按自己的 tick 衰减后求和（各码形是不同
+    // 提交事件的独立证据，词频总和 = 该词的真实使用量）
+    double eff = 0.0;
+    LedgerSrcEntry le;
+    le.word = kv.first;
+    le.codes.reserve(v.size());
+    for (const auto &f : v) {
+      le.codes.push_back(f.code);
+      if (f.dee > 0)
+        eff += f.dee * exp((f.tick - now) / kFreqTau);
+    }
     if (eff < 0.5)
       continue;
-    out->push_back(LedgerSrcEntry{kv.first, best_code[kv.first], eff});
+    le.eff = eff;
+    out->push_back(std::move(le));
   }
   // 热词优先：消费侧有总封顶（64），按 eff 降序保证截断取的是最热词
   // 而非词表字母序前缀（UTF-8 序会把常用汉字词排到尾部被截掉）
@@ -2100,10 +2183,21 @@ static bool check_header_locked(const char *path, const char *magic,
   FILE *f = fopen(path, "rb");
   if (f) {
     char line[512] = {0};
-    bool ok = fgets(line, sizeof(line), f) &&
-              strncmp(line, magic, strlen(magic)) == 0;
+    bool has_line = fgets(line, sizeof(line), f) != nullptr;
     fclose(f);
-    return ok;
+    if (has_line)
+      return strncmp(line, magic, strlen(magic)) == 0;
+    // 空文件（外部清空/轮转竞态的产物）：无数据可丢，"wb" 重写头救活——
+    // 此前 fgets 返回 NULL 直接判坏 → 写入器对空文件全静默（2026-11-27
+    // 深夜真机实锤，fix-history 七）；非空无头文件仍按坏文件拒绝（无法
+    // 安全补头）。
+    f = fopen(path, "wb");
+    if (!f)
+      return false;
+    fputs(header_line, f);
+    fputc('\n', f);
+    fclose(f);
+    return true;
   }
   f = fopen(path, "ab");
   if (!f)
@@ -2261,7 +2355,8 @@ static std::string write_w(const std::string &id, const std::string &src,
                            const std::vector<std::string> &final_list,
                            long long tick, const std::string &status,
                            const std::string &skip, bool prep,
-                           const std::string &flags) {
+                           const std::string &flags,
+                           const std::string &comp = std::string()) {
   std::string line = "W\t" + id + "\t" + now_stamp() + "\t" +
                      tsv_escape(src) + "\t" + tsv_escape(code) + "\t" +
                      tsv_escape(ctx_tail(ctx, 120)) + "\t" +
@@ -2269,7 +2364,12 @@ static std::string write_w(const std::string &id, const std::string &src,
                      "\t" + join_strs(final_list, 20) + "\t" +
                      std::to_string(tick) + "\t" + status + "\t" +
                      tsv_escape(skip) + "\t" + (prep ? "1" : "0") + "\t" +
-                     tsv_escape(flags);
+                     tsv_escape(flags) + "\t" +
+                     // v9（2026-11-27）：联想类标 =「窗内位次;最终序位次」
+                     // （1 基、≤20、逗号分隔；空 = 无联想候选）。供离线统计
+                     // 联想词的位置/选重率（字数启发式不可靠：余额=yu+e 与
+                     // 月=yue 同 span、组句字数≠音节数）。
+                     "comp=" + comp;
   corpus_write_raw(line);
   remember_event(id);
   g_last_window.id = id;
@@ -2985,6 +3085,64 @@ static bool cand_is_prefix_only(const std::string &text, size_t start,
   std::string key;
   syll_judge(*syl, text, code.substr((size_t)s0, (size_t)(e0 - s0)), &key);
   return key.empty();
+}
+
+// 候选是否为**联想/补全**（2026-11-27 用户定案）：原生 script_translator 对
+// 词级补全候选设 type="completion"（词条码比已输入长，如 fudandaxue →
+// 复旦大学站）；精确匹配 = phrase/user_phrase/ledger；组句 = ngram_group。
+// 简化器/唯一化器会包 ShadowCandidate——简化保留原 type，唯一化改成
+// "uniquified"，故用 GetGenuineCandidate 剥到真身再判。
+// 用途：显示序「同 span 精确在前、联想在后」+ 前缀确认不把联想词当同 span
+// 首选占位。
+static bool cand_is_completion(const an<Candidate> &c) {
+  if (!c)
+    return false;
+  if (c->type() == "completion")
+    return true;
+  if (c->type() == "uniquified" || c->type() == "shadow") {
+    // 合并候选里**只要有一条是精确匹配**，这段文本就有精确路径可走
+    // （同文本可能来自 userdb 精确 + 词库联想）→ 按精确对待。
+    bool any = false, all_comp = true;
+    for (auto &g : Candidate::GetGenuineCandidates(c)) {
+      if (!g)
+        continue;
+      any = true;
+      if (g->type() != "completion")
+        all_comp = false;
+    }
+    return any && all_comp;
+  }
+  return false;
+}
+
+// 联想候选在列表中的 1 基位次（≤limit，逗号分隔；W 行 v9 类标用）。
+static std::string comp_positions(const std::vector<an<Candidate>> &v,
+                                  size_t limit = 20) {
+  std::string s;
+  for (size_t i = 0; i < v.size() && i < limit; i++) {
+    if (!cand_is_completion(v[i]))
+      continue;
+    if (!s.empty())
+      s += ",";
+    s += std::to_string(i + 1);
+  }
+  return s;
+}
+
+// 候选自身 span 切片码（2026-11-27 两级回退第一步）：查询键与账本存储键
+// (词, 词自己的段码) 同构——整句模式用整段码查询命中仅 0.2–1.4%（词级键
+// 7–12%）。字词模式段=单词 → 与旧行为等价；组句候选 span=整段 → no-op。
+// span 缺失/越界 → 回落整段 input。
+static std::string cand_query_code(const an<Candidate> &c,
+                                   const std::string &input,
+                                   size_t seg_start) {
+  if (!c)
+    return input;
+  const long long s = (long long)c->start() - (long long)seg_start;
+  const long long e = (long long)c->end() - (long long)seg_start;
+  if (s < 0 || e <= s || (size_t)e > input.size())
+    return input;
+  return input.substr((size_t)s, (size_t)(e - s));
 }
 
 // 单字候选的读音先验修正（不是单字 / 简码 / 未命中 → 0）
@@ -3888,6 +4046,8 @@ struct AsyncPending {
   std::string wctx;
   std::vector<std::string> engine_vec;
   std::vector<std::string> window_vec;   // 层1窗（提交序）
+  std::vector<std::string> qcode_vec;    // span 切片查询码（对齐 window_vec，
+                                         // 2026-11-27 两级回退；空 = 回落 code）
   std::vector<double> share_vec;         // 字-音节偏置（对齐 window_vec；挂账
                                          // 时已丢候选对象，必须提交时快照）
   long long tick = 0;
@@ -3924,8 +4084,13 @@ static void async_write_pending(const AsyncPending &pend,
     ord[i] = i;
     double s = i < snap.scores.size() ? snap.scores[i] : -1e10;
     const std::string &t = pend.window_vec[i];
-    double s1 = g_freq_beta * std::log(1.0 + user_freq_eff(t, pend.code)) +
-                user_unigram_term(t, pend.code);
+    // span 切片查询码（2026-11-27 两级回退）：挂账时快照的 qcode_vec；
+    // 缺失（旧挂账）→ 回落整段 pend.code
+    const std::string &qc = (i < pend.qcode_vec.size() && !pend.qcode_vec[i].empty())
+                                ? pend.qcode_vec[i]
+                                : pend.code;
+    double s1 = g_freq_beta * std::log(1.0 + user_freq_eff(t, qc)) +
+                user_unigram_term(t, qc);
     double pf = cb_on ? ce_bias_delta(cb_tbl, t, pend.code) : 0.0;
     double sd = i < pend.share_vec.size() ? pend.share_vec[i] : 0.0;
     if (s > -1e9)
@@ -3955,8 +4120,12 @@ static void async_write_pending(const AsyncPending &pend,
                   ? snap.ce3[i]
                   : std::array<double, 3>{NAN, NAN, NAN};
     const std::string &t = pend.window_vec[i];
-    double eff = user_freq_eff(t, pend.code);
-    double u1 = user_unigram_term(t, pend.code);
+    const std::string &qc2 =
+        (i < pend.qcode_vec.size() && !pend.qcode_vec[i].empty())
+            ? pend.qcode_vec[i]
+            : pend.code;
+    double eff = user_freq_eff(t, qc2);
+    double u1 = user_unigram_term(t, qc2);
     double pf = (cb_on && ce > -1e9)
                     ? ce_bias_delta(cb_tbl, t, pend.code) : 0.0;
     if (ce > -1e9 && i < pend.share_vec.size())
@@ -4387,9 +4556,13 @@ void LlmRerankTranslation::Collect() {
     std::vector<double> s1(allc.size());
     for (size_t i = 0; i < allc.size(); i++) {
       idx[i] = i;
-      // 词码对记账（2026-11-13）: eff/uni 查询键 = (候选, 当前窗码 input_)
-      s1[i] = g_freq_beta * std::log(1.0 + user_freq_eff(allc[i]->text(), input_)) +
-              user_unigram_term(allc[i]->text(), input_);
+      // 词码对记账（2026-11-13）: eff/uni 查询键 = (候选, span 切片码)
+      // ——2026-11-27 两级回退第一步：键与账本存储键 (词, 词段码) 同构
+      // （整句模式旧键整段码命中 0.2–1.4%）；miss 由 user_freq_eff /
+      // user_unigram_term 内部走词级聚合回退（A/B RIME_LLM_FREQ_AGG=0）。
+      const std::string qc = cand_query_code(allc[i], input_, seg_start_);
+      s1[i] = g_freq_beta * std::log(1.0 + user_freq_eff(allc[i]->text(), qc)) +
+              user_unigram_term(allc[i]->text(), qc);
     }
     std::stable_sort(idx.begin(), idx.end(),
                      [&s1](size_t a, size_t b) { return s1[a] > s1[b]; });
@@ -4565,6 +4738,12 @@ void LlmRerankTranslation::Collect() {
               pend.wctx = wctx;
               pend.engine_vec = engine_vec;
               pend.window_vec = window_vec;
+              pend.qcode_vec.reserve(window_vec.size());
+              for (size_t wi = 0; wi < window_vec.size(); wi++)
+                pend.qcode_vec.push_back(
+                    wi < candidates_.size()
+                        ? cand_query_code(candidates_[wi], input_, seg_start_)
+                        : input_);
               pend.share_vec.reserve(window_vec.size());
               for (size_t wi = 0; wi < window_vec.size(); wi++) {
                 double sd = 0.0;
@@ -4696,10 +4875,12 @@ void LlmRerankTranslation::Collect() {
       for (int i : order) {
         double t;
         if (has_score[i]) {
+          const std::string qc =
+              cand_query_code(candidates_[i], input_, seg_start_);
           t = score_of[i] +
               g_freq_beta * std::log(1.0 + user_freq_eff(
-                                  candidates_[i]->text(), input_)) +
-              user_unigram_term(candidates_[i]->text(), input_);
+                                  candidates_[i]->text(), qc)) +
+              user_unigram_term(candidates_[i]->text(), qc);
         } else {
           double s1v = i < s1_head.size() ? s1_head[i] : -1e308;
           t = s1v + (min_valid < 1e308 ? min_valid : 0.0);
@@ -5134,6 +5315,10 @@ void LlmRerankTranslation::Collect() {
                                      env_gate_span[1] == '\0');
             size_t i1 = (size_t)order[0];
             bool picked = false;
+            // 诊断计数（2026-11-27，P0-2 真机实测用）：同 span 首位被联想
+            // 占住（skip）／跳过后确认仍成立（skipok）。只在 debug_fusion
+            // 时落 pfx 行，无行为影响；标定完成后可与金丝雀行一并移除。
+            bool comp_skipped = false, span_seen = false;
             {
               size_t lead_chars = utf8_len(*lead);
               for (int oi : order) {
@@ -5146,6 +5331,16 @@ void LlmRerankTranslation::Collect() {
                            (lead_chars == 1));
                 if (!hit)
                   continue;
+                // 联想/补全不占「同 span 首选」这一格（2026-11-27 用户定案）：
+                // 它的词条码比输入长、只是猜测；占位会让同 span 的精确词
+                // 永远等不到确认机会。A/B（同字数档）路径保持旧行为。
+                if (span_pick) {
+                  if (!span_seen && cand_is_completion(cand))
+                    comp_skipped = true;
+                  span_seen = true;
+                  if (cand_is_completion(cand))
+                    continue;
+                }
                 if (lead_chars == 1 &&
                     cand_is_prefix_only(cand->text(), cand->start(),
                                         cand->end(), input_, seg_start_))
@@ -5156,6 +5351,13 @@ void LlmRerankTranslation::Collect() {
               }
             }
             const auto &c1 = candidates_[i1];
+            if (g_debug_fusion && comp_skipped)
+              log_error("pfx: spancompletion %s",
+                        (picked && c1->text() == *lead &&
+                         c1->start() == seg_start_ && c1->end() == want_end &&
+                         conf_ok)
+                            ? "skipok"
+                            : "skip");
             if (picked && c1->text() == *lead &&
                 c1->start() == seg_start_ &&
                 c1->end() == want_end && conf_ok) {
@@ -5212,12 +5414,14 @@ void LlmRerankTranslation::Collect() {
         // 无上文（freq_only）时融合不含 CE、只含词频剩余项 → 也要显示真实
         // eff/fb/u1（2026-11-24：旧代码 !has_score 一律写 0，验算对不上）
         const bool has_terms = has_score[i] || freq_only;
+        const std::string qc =
+            cand_query_code(candidates_[i], input_, seg_start_);
         double eff = has_terms
-                         ? user_freq_eff(candidates_[i]->text(), input_)
+                         ? user_freq_eff(candidates_[i]->text(), qc)
                          : 0;
         double fb = has_terms ? g_freq_beta * std::log1p(eff) : 0;
         double u1 = has_terms
-                        ? user_unigram_term(candidates_[i]->text(), input_)
+                        ? user_unigram_term(candidates_[i]->text(), qc)
                         : 0;
         // CE 偏置只随 CE 分生效（无 CE 时融合里没有它，行尾也写 0）；
         // 含 (词,码) 表 + 字-音节读音先验两项之和（显示端只认总修正）。
@@ -5286,9 +5490,10 @@ void LlmRerankTranslation::Collect() {
         if (emitted >= 20)
           return;
         emitted++;
-        double eff = user_freq_eff(c->text(), input_);
+        const std::string qc = cand_query_code(c, input_, seg_start_);
+        double eff = user_freq_eff(c->text(), qc);
         double fb = g_freq_beta * std::log1p(eff);
-        double u1 = user_unigram_term(c->text(), input_);
+        double u1 = user_unigram_term(c->text(), qc);
         // v5: 旧 pf = 负分幅度（仅扣分，0=未命中），保留给旧查看器；
         // v6 (2026-11-17): 行尾追加有符号 sdelta（+200/+100/-5/0）。
         double sdelta = 0.0;
@@ -5363,6 +5568,7 @@ void LlmRerankTranslation::Collect() {
   // 组句 ngram 序首选 1 条置顶（句子不参与 CE 重排）→ 窗口融合序（等长词与
   // 子词统一概率序）→ 窗外层1 序。三块输出（FM 窗 / FM 窗外 / PM 块）与
   // "匹配在前、部分在后"不变量随之退役（用户 2026-11-24 定案）。
+  std::string wcomp;   // v9 联想类标（窗内;最终序），W 行尾字段
   {
     an<Candidate> best_gen;
     if (g_sentence_mode && !gen_texts.empty()) {
@@ -5378,62 +5584,94 @@ void LlmRerankTranslation::Collect() {
     out.reserve(candidates_.size() + tail.size() + 1);
     if (best_gen)
       out.push_back(best_gen);
+    // v9 类标（2026-11-27）：联想候选在**窗内（融合序）/ 最终序**中的 1 基
+    // 位次。此刻 candidates_ 仍是窗口融合序 → 先采一份；排序后再采最终序。
+    const std::string comp_w = comp_positions(candidates_);
     if (g_sentence_mode) {
-      // 2026-11-26 用户定案：整句模式恢复「先长后短」显示序（同字数保持
-      // 融合序；融合/准入/前缀判定仍用融合序，不受显示序影响）。
-      // 2026-11-26 用户定案①：单字块内再按**整读层**分两段——整读在前、
-      // 前缀简拼/纠错在后（tier 只是排序键，不进融合分）。无表/关 → 逐位一致。
-      std::vector<char> tier1;   // 对齐 candidates_；1 = 前缀简拼 / 纠错
+      // 显示序（2026-11-27 用户定案）：按**原生类型优先级**分层——
+      //   ① span（候选覆盖到的输入字符数 = end() - seg_start_）降序 = 前长后短；
+      //   ② 同 span 内**精确在前、联想/补全在后**（镜像原生 userdb predictive
+      //      rotate：长词联想之前须先出严格匹配）；
+      //   ③ 同层内保持既有次序：窗内 = 融合序、窗外 = 层1 序；1 字再分整读层
+      //      （2026-11-26 定案①，tier 不进融合分）。
+      // 旧版用「字数」代理 span：联想词字数 = 覆盖音节数 + 1 → 被字数序顶到
+      // 窗口首位（fudandaxue 出「复旦大学站」压「复旦大学」：语料 27.5% vs
+      // 原生引擎 4.5%）；尾块原为纯层1 序（51% 的联想词掉到 #3 之后）。
+      // 现在窗口与尾块用同一个键（窗内排前 = 同层内 CE 优先），尾块也有先长
+      // 后短。字词模式（非整句）不走此块，行为不变。
+      std::vector<an<Candidate>> seq;
+      seq.reserve(candidates_.size() + tail.size());
+      for (auto &c : candidates_)
+        seq.push_back(c);
+      for (auto &c : tail)
+        seq.push_back(c);
+      // 单字块内再按整读层分两段（对齐 seq）
+      std::vector<char> tier1(seq.size(), 0);   // 1 = 前缀简拼 / 纠错
       {
         const std::map<std::string, std::string> *syl = nullptr;
         if (syll_chars_table(&syl)) {
-          tier1.assign(candidates_.size(), 0);
-          for (size_t i = 0; i < candidates_.size(); i++) {
-            if (utf8_len(candidates_[i]->text()) != 1)
+          for (size_t i = 0; i < seq.size(); i++) {
+            if (utf8_len(seq[i]->text()) != 1)
               continue;
-            const long long s = (long long)candidates_[i]->start();
-            const long long e = (long long)candidates_[i]->end();
+            const long long s = (long long)seq[i]->start();
+            const long long e = (long long)seq[i]->end();
             const long long s0 = s - (long long)seg_start_;
             const long long e0 = e - (long long)seg_start_;
             if (s0 < 0 || e0 <= s0 || (size_t)e0 > input_.size())
               continue;
             std::string key;
-            if (!syll_judge(*syl, candidates_[i]->text(),
+            if (!syll_judge(*syl, seq[i]->text(),
                             input_.substr((size_t)s0, (size_t)(e0 - s0)),
                             &key))
               tier1[i] = 1;
           }
         }
       }
-      std::vector<size_t> di(candidates_.size());
+      std::vector<long long> span(seq.size(), 0);
+      std::vector<char> comp(seq.size(), 0);
+      for (size_t i = 0; i < seq.size(); i++) {
+        comp[i] = cand_is_completion(seq[i]) ? 1 : 0;
+        const long long s = (long long)seq[i]->start();
+        const long long e = (long long)seq[i]->end();
+        const long long sp = e - (long long)seg_start_;
+        // span 不可用（无 start/_end 的候选）→ 退回字数
+        span[i] = (s >= (long long)seg_start_ && e > s &&
+                   (size_t)e <= input_.size() + 1)
+                      ? sp
+                      : (long long)utf8_len(seq[i]->text());
+      }
+      std::vector<size_t> di(seq.size());
       for (size_t i = 0; i < di.size(); i++)
         di[i] = i;
       std::stable_sort(di.begin(), di.end(), [&](size_t a, size_t b) {
-        const size_t la = utf8_len(candidates_[a]->text());
-        const size_t lb = utf8_len(candidates_[b]->text());
-        if (la != lb)
-          return la > lb;
-        if (la == 1 && !tier1.empty() && tier1[a] != tier1[b])
+        if (span[a] != span[b])
+          return span[a] > span[b];
+        if (comp[a] != comp[b])
+          return comp[a] < comp[b];
+        const bool oa = utf8_len(seq[a]->text()) == 1;
+        const bool ob = utf8_len(seq[b]->text()) == 1;
+        if (oa && ob && tier1[a] != tier1[b])
           return tier1[a] < tier1[b];
         return false;
       });
       for (size_t i : di)
-        out.push_back(candidates_[i]);
+        out.push_back(seq[i]);
     } else {
       for (auto &c : candidates_)
         out.push_back(c);
+      for (auto &c : tail)
+        out.push_back(c);
     }
-    for (auto &c : tail)
-      out.push_back(c);
     candidates_.swap(out);
     if (g_sentence_mode && !gen_texts.empty())
       log_msg("ngram: display gen_kept=%d total=%d", best_gen ? 1 : 0,
               (int)candidates_.size());
+    wcomp = comp_w + ";" + comp_positions(candidates_);
   }
   if (!w_written) {
     write_w(wid, src_, input_, wctx, engine_vec, window_vec,
             texts_of(candidates_, 20), g_user_tick, wstatus, wskip, prep_hit,
-            freq_only ? "nofreq" : "");
+            freq_only ? "nofreq" : "", wcomp);
     w_written = true;
   }
 }
@@ -6191,6 +6429,14 @@ static bool RunPendingConfirm(Context *ctx) {
               (int)n);
   clear_pending();
   return false;
+}
+
+// 方案 a（2026-11-27 用户定案）：server 收到续打键、尚未交给 rime 时调用
+// （RimeExecPendingConfirmImpl 经此落地）——此刻 input 未变、组合已沉降，
+// exec 的语义 = 确认前缀、剩余键继续。与刷新路径共用 RunPendingConfirm
+// 全部守卫（input 校验 / seg 校验 / 8 次重试上限 / g_in_confirm）。
+bool g_llm_pending_confirm_exec(Context *ctx) {
+  return RunPendingConfirm(ctx);
 }
 
 // 前缀软确认执行（2026-11-23）：在 PushInput 触发的 update_notifier 里做。

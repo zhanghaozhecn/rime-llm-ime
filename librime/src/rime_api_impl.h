@@ -421,6 +421,49 @@ RIME_DEPRECATED void RimeCandidateListEnd(RimeCandidateListIterator* iterator) {
   memset(iterator, 0, sizeof(RimeCandidateListIterator));
 }
 
+// 候选类标（2026-11-27，无头探针 --cls 用）：联想类判定与 llm_filter 的
+// cand_is_completion 同构——type=="completion" 直接成立；uniquified/shadow
+// 包皮经 GetGenuineCandidates 展开，有 genuine 且全部 completion 才成立
+// （同 span 不同切分本就同级，拿不到 genuine 一律视为精确）。
+static Bool RimeGetCandidateClsImpl(RimeSessionId session_id, int index,
+                                    char* type_buf, size_t type_buf_size,
+                                    int* start, int* end, int* comp) {
+  an<Session> session(Service::instance().GetSession(session_id));
+  if (!session)
+    return False;
+  Context* ctx = session->context();
+  if (!ctx || !ctx->HasMenu())
+    return False;
+  auto cand = ctx->composition().back().menu->GetCandidateAt((size_t)index);
+  if (!cand)
+    return False;
+  if (start)
+    *start = cand->start();
+  if (end)
+    *end = cand->end();
+  if (comp) {
+    const std::string& t = cand->type();
+    bool is_comp = (t == "completion");
+    if (!is_comp && (t == "uniquified" || t == "shadow")) {
+      bool any = false, all_comp = true;
+      for (auto& g : Candidate::GetGenuineCandidates(cand)) {
+        if (!g)
+          continue;
+        any = true;
+        if (g->type() != "completion")
+          all_comp = false;
+      }
+      is_comp = any && all_comp;
+    }
+    *comp = is_comp ? 1 : 0;
+  }
+  if (type_buf && type_buf_size > 0) {
+    strncpy(type_buf, cand->type().c_str(), type_buf_size - 1);
+    type_buf[type_buf_size - 1] = '\0';
+  }
+  return True;
+}
+
 // runtime options
 
 RIME_DEPRECATED void RimeSetOption(RimeSessionId session_id,
@@ -1148,6 +1191,7 @@ namespace rime {
 std::atomic<int>* g_llm_async_revision_slot();
 std::atomic<int>* g_llm_refresh_depth_slot();
 bool g_llm_pending_confirm_query();
+bool g_llm_pending_confirm_exec(Context* ctx);
 }
 
 static int RimeLlmAsyncRevisionImpl() {
@@ -1159,6 +1203,18 @@ static int RimeLlmAsyncRevisionImpl() {
 // 放行一次重译——否则挂起的确认要等下一个 LLM 结果落地才生效。
 static Bool RimeLlmPendingConfirmImpl() {
   return rime::g_llm_pending_confirm_query() ? True : False;
+}
+
+// 前缀确认 exec（2026-11-27 方案 a）：server 收到续打键、未交给 rime 时
+// 调用；引擎侧守卫见 llm_filter.cc 的 g_llm_pending_confirm_exec。
+static Bool RimeExecPendingConfirmImpl(RimeSessionId session_id) {
+  an<Session> session(Service::instance().GetSession(session_id));
+  if (!session)
+    return False;
+  Context* ctx = session->context();
+  if (!ctx)
+    return False;
+  return rime::g_llm_pending_confirm_exec(ctx) ? True : False;
 }
 
 static Bool RimeChangePage(RimeSessionId session_id, Bool backward) {
