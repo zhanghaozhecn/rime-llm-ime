@@ -2035,12 +2035,11 @@ static void corpus_write_raw(const std::string &line) {
   char path[MAX_PATH];
   if (!log_file_path(kCorpusFile, path, sizeof(path)))
     return;
-  if (g_corpus_checked_path != path) {
-    g_corpus_checked_path = path;
-    g_corpus_ok = check_header_locked(
-        path, kCorpusMagic,
-        (std::string(kCorpusMagic) + now_stamp() + "\tsource").c_str());
-  }
+  // 头校验每次写入都做 (2026-11-27): 同 debug_write_raw 的轮转/外部挪动
+  // 后无头文件问题——校验失败/文件缺失即补写头, 不再按路径缓存一次。
+  g_corpus_ok = check_header_locked(
+      path, kCorpusMagic,
+      (std::string(kCorpusMagic) + now_stamp() + "\tsource").c_str());
   if (!g_corpus_ok)
     return;
   FILE *f = fopen(path, "ab");
@@ -2051,22 +2050,98 @@ static void corpus_write_raw(const std::string &line) {
   fclose(f);
 }
 
+// ── debug 每键批量缓冲（2026-11-27）────────────────────────────────
+// debug_fusion=true 的逐行写（整句 ~41 行 D/键，每行 头校验×2 + 轮转检查
+// + 追加 ≈ 4-5 次文件开合）实测 +288ms/键，被文件系统过滤放大 → 宿主键
+// 队列积压（曾伪装成「space 落刷新窗被吞」，见 fix-history 2026-11-27）。
+// 改为事件内缓冲、Collect 事件尾一次落盘（一次头校验 + 一次轮转 + 一次
+// 追加）。guard 外调用点（提交 E 行 / 其它线程 log_error）保持逐行即时
+// 写。缓冲上限 256KB、首行超龄 50ms 兜底（事件异常中断也不丢行、不无限
+// 迟到）。缓冲受 g_log_mu 保护（与即时路径同锁，跨线程 log_error 安全）。
+static std::string g_dbg_batch;
+static std::chrono::steady_clock::time_point g_dbg_batch_t0{};
+static int g_dbg_batch_depth = 0;  // 仅引擎线程置位（Collect 同线程）
+
+// 批量落盘（调用方持 g_log_mu）。路径在 flush 时解析——Collect 事件内
+// 方案不会切换，缓冲行与落盘路径天然一致。
+static void debug_batch_flush_locked() {
+  if (g_dbg_batch.empty())
+    return;
+  std::string out;
+  out.swap(g_dbg_batch);
+  char path[MAX_PATH];
+  if (!log_file_path(kDebugFile, path, sizeof(path)))
+    return;
+  g_debug_ok = check_header_locked(
+      path, kDebugMagic,
+      (std::string(kDebugMagic) + now_stamp() + "|source").c_str());
+  if (!g_debug_ok)
+    return;
+  rotate_if_large(path, kDebugRotateBytes);
+  g_debug_ok = check_header_locked(
+      path, kDebugMagic,
+      (std::string(kDebugMagic) + now_stamp() + "|source").c_str());
+  if (!g_debug_ok)
+    return;
+  FILE *f = fopen(path, "ab");
+  if (!f)
+    return;
+  fwrite(out.data(), 1, out.size(), f);  // out 自带行尾换行
+  fclose(f);
+}
+
+// 事件缓冲 guard（RAII）：Collect 事件段使用，最外层关闭时批量落盘；
+// 最外层打开时先落掉上一事件异常中断的残留。
+struct DbgBatchGuard {
+  DbgBatchGuard() {
+    std::lock_guard<std::mutex> lk(g_log_mu);
+    if (++g_dbg_batch_depth == 1)
+      debug_batch_flush_locked();
+  }
+  ~DbgBatchGuard() {
+    std::lock_guard<std::mutex> lk(g_log_mu);
+    if (--g_dbg_batch_depth == 0)
+      debug_batch_flush_locked();
+  }
+};
+
 static void debug_write_raw(const std::string &line, bool force) {
   if (!force && !g_debug_fusion)
     return;
   std::lock_guard<std::mutex> lk(g_log_mu);
+  if (g_dbg_batch_depth > 0) {
+    // 事件缓冲路径：追加大缓冲；上限 256KB 或首行 >50ms 旧 → 先落盘
+    const bool stale =
+        !g_dbg_batch.empty() &&
+        std::chrono::steady_clock::now() - g_dbg_batch_t0 >
+            std::chrono::milliseconds(50);
+    if ((int)g_dbg_batch.size() >= (256 << 10) || stale)
+      debug_batch_flush_locked();
+    if (g_dbg_batch.empty())
+      g_dbg_batch_t0 = std::chrono::steady_clock::now();
+    g_dbg_batch += line;
+    g_dbg_batch.push_back('\n');
+    return;
+  }
   char path[MAX_PATH];
   if (!log_file_path(kDebugFile, path, sizeof(path)))
     return;
-  if (g_debug_checked_path != path) {
-    g_debug_checked_path = path;
-    g_debug_ok = check_header_locked(
-        path, kDebugMagic,
-        (std::string(kDebugMagic) + now_stamp() + "|source").c_str());
-  }
+  // 头校验每次写入都做 (2026-11-27 修, 原按路径缓存一次): rotate 把
+  // .txt 挪去 .old 后, 新 .txt 由 fopen("ab") 创建时**不带文件头** →
+  // 下一进程的校验读到数据行 → g_debug_ok 恒 false → 所有 debug 写入
+  // (含 force 行) 跨进程静默死亡 (2026-11-27 07:02 轮转后实锤: 三轮
+  // 真机测试的 pfx 日志全部丢失)。校验失败/文件缺失会补写头。
+  g_debug_ok = check_header_locked(
+      path, kDebugMagic,
+      (std::string(kDebugMagic) + now_stamp() + "|source").c_str());
   if (!g_debug_ok)
     return;
   rotate_if_large(path, kDebugRotateBytes);
+  g_debug_ok = check_header_locked(
+      path, kDebugMagic,
+      (std::string(kDebugMagic) + now_stamp() + "|source").c_str());
+  if (!g_debug_ok)
+    return;
   FILE *f = fopen(path, "ab");
   if (!f)
     return;
@@ -4079,6 +4154,8 @@ void LlmRerankTranslation::Collect() {
   // engine_top 用引擎原序（组句注入前捕获；语料 W 的 engine_top 字段口径不变）
   std::vector<std::string> engine_vec = texts_of(allc, 10);
 
+  DbgBatchGuard dbg_batch_guard;  // 事件内 debug 批量缓冲，Collect 尾一次落盘
+
   // ═══ N-gram 组句候选前置注入（2026-11-23 第②段，与插件版同构）═══
   // 生成 top-20 整句候选放在候选流最前（同文本去重），后续层1/准入/3-token
   // 评分/前缀判定沿用既有逻辑：span == 活动段 → FM。组句**不参与 CE**
@@ -5310,6 +5387,9 @@ LlmFilter::LlmFilter(const Ticket &ticket) : Filter(ticket) {
       p.has_debug_fusion = true;
       p.debug_fusion = b;
     }
+    log_error("pfx: ctor cfg has_debug=%d debug=%d has_en=%d en=%d",
+              (int)p.has_debug_fusion, (int)p.debug_fusion,
+              (int)p.has_enabled, (int)p.enabled);
     int v = 0;
     std::string sv;
     if (config->GetString("llm_rerank/code_pattern", &sv)) {
@@ -6160,6 +6240,8 @@ an<Translation> LlmFilter::Apply(an<Translation> translation,
 
   // context source: TSF caret text, or commit history fallback
   auto [ctx, src] = GetContextTextPair();
+  log_error("pfx: ctxq code='%.20s' src=%s len=%zu ctx='%.28s'",
+            code.c_str(), src.c_str(), ctx.size(), ctx.c_str());
   // 输入闸（2026-11-25，学万象 limit_repeated）：单段码 >30 字母或连续重复
   // ≥8 → 不重排（不收集/不推理），按引擎原序透传。长码每键开销随码长超线性
   // 增长（实测 41 字母整串 80ms，与万象剖析 P99 36ms 同级），LLM 收益集中
