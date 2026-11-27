@@ -1223,6 +1223,9 @@ static int  g_user_stats_dirty = 0;
 // 账本统一互斥（recursive：bump→ensure_loaded/save 嵌套加锁）。
 static std::recursive_mutex g_ledger_mu;
 static constexpr double kFreqTau = 400.0;  // rime formula_d 时间常数 (v3 2026-11-06 六维联合标定; 旧 800 出自 2026-11-02)
+// [账本有序源]（2026-11-27）代次计数：bump/refund/重载各 +1，
+// script_translator 第三候选源比对后惰性重建音节键索引。
+static unsigned long long g_ledger_src_gen = 0;
 
 // 日志轮转（2026-09-04）：超过 limit 改名 .old（单文件轮转）防无限增长；
 // 改名失败（被占等罕见）则继续追加，不丢日志。
@@ -1523,6 +1526,7 @@ static void user_stats_ensure_loaded() {
   }
   g_user_stats_loaded = true;
   g_stats_schema = sid;
+  ++g_ledger_src_gen;   // 账本（重）载 → 有序源索引失效
   char path[MAX_PATH];
   if (!user_ledger_file(path, sizeof(path)))
     return;
@@ -1763,6 +1767,7 @@ static void user_stats_bump_at(const std::string &w, const std::string &code,
   e.dee = 1 + e.dee * exp((double)(e.tick - tick) / kFreqTau);
   e.tick = tick;
   ++e.cum;
+  ++g_ledger_src_gen;   // 有序源索引失效
   if (++g_user_stats_dirty >= 20) {
     user_stats_save();
     g_user_stats_dirty = 0;
@@ -1797,9 +1802,72 @@ static bool user_stats_refund(const std::string &w, const std::string &code,
   it->second.dee = s.dee;
   it->second.tick = s.t;
   it->second.cum = s.cum;
+  ++g_ledger_src_gen;   // 有序源索引失效
   user_stats_save();
   g_user_stats_dirty = 0;
   return true;
+}
+
+// ── 账本有序源（2026-11-27）: script_translator 第三候选源的数据出口 ──
+// 每词聚合取规范码形（cum 最大、并列取 dee 高）+ 当前衰减 eff（eff < 0.5
+// 的冷词不入源）。**不做音节切分**（本文件无词典表）——原始码串交消费侧
+// （script_translator 经词典 syllabary 切分，切不开 = 简拼/双拼码 → 跳过
+// 该词或该词其它码形）。结构布局须与 script_translator.cc 顶部的声明逐字
+// 一致（ad-hoc 跨文件先例 = g_llm_pending_confirm_query, context.cc:19）。
+struct LedgerSrcEntry {
+  string word;
+  string code;
+  double eff;
+};
+
+size_t g_llm_user_source_gen() {
+  std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);
+  user_stats_ensure_loaded();
+  return g_ledger_src_gen;
+}
+
+void g_llm_user_source_entries(vector<LedgerSrcEntry> *out) {
+  if (!out)
+    return;
+  std::lock_guard<std::recursive_mutex> lk(g_ledger_mu);
+  user_stats_ensure_loaded();
+  // 每词规范码形：cum 最大（并列取 dee 高）；空码条目不可音节化，跳过
+  map<string, const UserStatEntry *> best;
+  map<string, string> best_code;
+  map<string, long long> best_cum;
+  for (const auto &kv : g_user_stats) {
+    const size_t tab = kv.first.find('\t');
+    if (tab == string::npos)
+      continue;
+    const string w = kv.first.substr(0, tab);
+    const string c = kv.first.substr(tab + 1);
+    if (c.empty())
+      continue;
+    const UserStatEntry &e = kv.second;
+    auto it = best.find(w);
+    if (it == best.end() || e.cum > best_cum[w] ||
+        (e.cum == best_cum[w] && e.dee > it->second->dee)) {
+      best[w] = &e;
+      best_code[w] = c;   // 拷贝（循环局部 c 出作用域即亡，不可存指针）
+      best_cum[w] = e.cum;
+    }
+  }
+  out->clear();
+  const double now = static_cast<double>(g_user_tick);
+  for (const auto &kv : best) {
+    const UserStatEntry *e = kv.second;
+    const double eff = e->dee * exp((static_cast<double>(e->tick) - now) /
+                                    kFreqTau);
+    if (eff < 0.5)
+      continue;
+    out->push_back(LedgerSrcEntry{kv.first, best_code[kv.first], eff});
+  }
+  // 热词优先：消费侧有总封顶（64），按 eff 降序保证截断取的是最热词
+  // 而非词表字母序前缀（UTF-8 序会把常用汉字词排到尾部被截掉）
+  std::stable_sort(out->begin(), out->end(),
+                   [](const LedgerSrcEntry &a, const LedgerSrcEntry &b) {
+                     return a.eff > b.eff;
+                   });
 }
 
 // 最近一次候选窗的输入码（词码对记账 OnCommit 用; engine thread 写读）

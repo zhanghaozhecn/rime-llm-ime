@@ -329,6 +329,24 @@ p50=39/p90=47/max=54），被闸段只剩引擎原序。128 = 真机被闸 max 5
 开窗前后耗时均 58ms（组句不是长串成本主因），且前缀截断使长句候选劣化（末词
 被迫在窗口边界结束）→ **默认不启用**，参数保留给阶段三前缀整句/词串。
 
+**账本有序源（2026-11-27，script_translator 第三候选源）**：LLM 用户词频
+账本的热词（eff≥0.5，每词取 cum 最大码形，eff 降序封顶 64）作为与静态词典/
+userdb 并列的**有序源**参与候选归并——引擎原序直接带上用户调频（含 LLM
+未加载的裸引擎场景）。规范码经 **syllabary DP 切分**后沿音节图匹配：全拼
+精确 + **简拼经 abbreviation 边继承全拼词频**（userdb 同款键语义；无头探针
+实测 `fq`→夫妻、`ks`→卡死、`yy`→验源 全部 pos=0）。权重 `log(eff/(eff+30))`
+（log 概率域）；归并规则 = 码长优先，ledger 仅在严格更长或与 sys 同长且
+user 不覆盖该长度时接管（user-vs-sys 既有语义原样保留）；每 end_pos ≤8 条、
+总 ≤64；ledger 候选照常进提交流水线（userdb 同步学习）。数据出口
+`g_llm_user_source_gen/entries`（llm_filter.cc 账本，gen 惰性重建）。A/B：
+`RIME_LLM_USER_SOURCE=0`。无头验证：`bin\rime_cand_probe.exe <dll> <shared>
+<user> luna_pinyin`（stdin `码>目标词`——**必须显式传真实 shared/user 目录**，
+传 `-` 会拿 cwd 相对目录导致全空）。**与插件版的分工**：插件跑在官方 rime.dll
+上，无法插候选源——层1 词频只能作用于**已收集池**（64 上限 + 30ms 预算，再
+CE 预算准入），故用两级查询键（span 切片 + 词级聚合）弥补；源码版直接改引擎
+序（无收集池上限，简拼继承免费），查询键保持旧语义（见
+`..\rime-llm-rerank\README.md` 层1 词频键两级回退一节）。
+
 ### N-gram 组句候选 + 无按键刷新（2026-11-23 第②段；2026-11-24 phrase-only 定案）
 
 `llm_rerank/ngram_group` 打开后，`llm_ngram.cc`（万象 LTS `.gram` + 万象
