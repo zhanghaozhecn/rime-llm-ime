@@ -182,8 +182,11 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   void _OnContextTextReady(const std::wstring& text, bool immediate = false,
                            bool from_edit_reset = false);
   // 上文采集去抖 (CEF 类应用文档更新极频繁, 限流 SetContextText 避免
-  // IPC + Server 端 prepare 风暴): 非空 100ms 合并, 相同不重发, 空文本
-  // 一律 800ms (WPS 提交后 transient 空高发, 详见 _OnContextTextReady)
+  // IPC + Server 端 prepare 风暴): 非空 100ms 合并, 相同不重发; 空文本
+  // 分类 (2026-11-27 用户定案「去抖不合适, 打字高手连续输入不能断上文」):
+  // 组合期丢弃 / 编辑键重采集接受 / 其余距上次非空 <3s = CUAS 幻影丢弃
+  // (幻影空读曾把服务端上文清成 freq_only, 确认门特征全 NaN——详见
+  // _OnContextTextReady) / ≥3s 长闲真空接受 (800ms 原规则)
   std::mutex m_ctx_debounce_mutex;
   std::condition_variable m_ctx_cv;  // 新 pending 唤醒等待中的 flush 线程 (空等待被真文本打断)
   std::string m_ctx_pending;        // 待发送的最新文本 (UTF-8)
@@ -193,6 +196,7 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   bool m_ctx_pending_immediate = false;  // pending 由提交路径产生 (非空 0ms 发送)
   bool m_ctx_from_edit_reset = false;  // pending 由编辑键重采集产生 (空 50ms 而非 800ms)
   uint64_t m_ctx_seq = 0;  // pending 更新计数 (等待谓词: 有新内容则唤醒重算)
+  ULONGLONG m_ctx_last_nonempty_tick = 0;  // 最近一次非空采集 (幻影空读定性用)
   // focus:switch reset 1s 合并节流 (新版 WPS 内部 DocumentMgr 频繁 A↔B
   // 切换, 每次全清上下文+fallback → 风暴期词无重排; 见 ThreadMgrEventSink)
   ULONGLONG m_last_focus_reset_tick = 0;

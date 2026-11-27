@@ -453,6 +453,10 @@ void WeaselTSF::_OnContextReset() {  // Server 端上下文已清空 (RimeResetC
   // 下次采集即使文本相同也会重发, 否则去抖跳过 -> Server 上下文永远空
   std::lock_guard<std::mutex> lock(m_ctx_debounce_mutex);
   m_ctx_last_sent.clear();
+  // 同步清幻影窗口基准 (2026-11-27): 重置 = 用户操作 (点击/编辑键/切窗)
+  // → 其后的空读是真实的「光标前无文本」, 必须放行 (否则点击到文档开头
+  // 后旧上文滞留服务端, 2026-08-13 场景回归)
+  m_ctx_last_nonempty_tick = 0;
 }
 
 // 编辑键 reset 后 120ms 的主动重采集 (2026-09-14): 导航键纯光标移动不
@@ -567,6 +571,42 @@ void WeaselTSF::_OnRefreshTimer() {
 
 void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate,
                                     bool from_edit_reset) {
+  // 空读/组合期背景读分类 (2026-11-27, 用户定案「TSF 去抖不合适」):
+  // 组合信号 = _status.composing (服务端回包的组合状态; 非 TSF 感知应用
+  // 下 _IsComposing() 恒 false——CUAS 无 ITfComposition, 组合托管在服务
+  // 端)。组合期的背景采集读两类都有害:
+  //   非空读 = 「已提交文本 + 组合前缀」(CUAS store 内联了组合串)——
+  //   非尾部文本, 送达即触发服务端「光标被移走 → 清历史」→ 上文死
+  //   (真机实测: 每键 100-130ms 后 ctx 清空, 确认链 0 触发);
+  //   空读 = CUAS 幻影 (光标钳在文档起点 eq=1, 文档明文并未消失)。
+  //   一律丢弃。
+  // 分类:
+  //   immediate (提交路径) / from_edit_reset (编辑键重采集) = 用户操作
+  //   后的真实重采集 → 照常处理;
+  //   组合期背景读 → 丢弃;
+  //   非组合期空读: 距上次非空采集 <3s = 幻影 → 丢弃 (同毫秒幻影实测:
+  //   age=0, 前一次采集刚读到 16 字); ≥3s 长闲真空 → 接受 (800ms 原则)。
+  // 已知取舍: 应用内切换空文档 (无焦点变化无编辑键) 的首词可能沿用旧
+  // 上文 ≤ 数秒 (2026-08-13 场景回归但被 3s 窗口 bounded)——换来连续
+  // 快打的上文存活。
+  if (!text.empty())
+    m_ctx_last_nonempty_tick = GetTickCount64();
+  const bool composing = _status.composing || _IsComposing();
+  const bool user_path = immediate || from_edit_reset;
+  if (!user_path && composing) {
+    TSFDbgLog(L"CtxDropComp len=%zu", (size_t)text.size());
+    return;
+  }
+  if (text.empty()) {
+    ULONGLONG age = GetTickCount64() - m_ctx_last_nonempty_tick;
+    if (age < 3000 && !from_edit_reset) {
+      TSFDbgLog(L"CtxEmptyDrop phantom age=%llu imm=%d", age,
+                (int)(immediate ? 1 : 0));
+      return;
+    }
+    TSFDbgLog(L"CtxEmptyAccept age=%llu edit=%d", age,
+              (int)(from_edit_reset ? 1 : 0));
+  }
   m_textBeforeCaret = text;
   // 发送移出 TSF 文档锁 (EditSession 回调必须快速返回, 禁同步阻塞 IPC):
   // 独立线程执行管道 Transact (PipeChannel 线程安全, thread_local 管道句柄)。
@@ -608,8 +648,16 @@ void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate,
       for (;;) {
         std::string send;
         {
-          std::unique_lock<std::mutex> lock(m_ctx_debounce_mutex);
-          send = m_ctx_pending;
+        std::unique_lock<std::mutex> lock(m_ctx_debounce_mutex);
+        send = m_ctx_pending;
+        // 组合期空文本扣发 (2026-11-27): 与 _OnContextTextReady 的入队丢弃
+        // 配对——已在队列里的空, 组合开始后不再送达; 150ms 轮询直到组合
+        // 结束。组合结束由提交路径立即送真文本 (seq 唤醒) → 重读 pending
+        // 发那个; 若组合结束仍是空 (真真空) → 落回下方 800ms 原规则。
+        if (send.empty() && (_status.composing || _IsComposing())) {
+          m_ctx_cv.wait_for(lock, std::chrono::milliseconds(150));
+          continue;
+        }
           // 简化去抖 (2026-08-18 八轮架构简化): 非空 immediate 0ms /
           // 普通 100ms 合并 (自入队起算, 期间更新不重置计时保证进度);
           // 空一律 800ms (immediate 不绕过 — 提交后瞬间是 transient 空
@@ -637,6 +685,8 @@ void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate,
         // 文本 → 光标移到开头仍用旧上文重排 (2026-08-13 实测)。
         // SetContextText 空 body 服务端转 set_context_text("");
         // 去重靠服务端 t==g_context_text (不清 fallback, 2026-08-13 撤回)。
+        TSFDbgLog(L"CtxSend len=%zu composing=%d", send.size(),
+                  (int)(_IsComposing() ? 1 : 0));
         m_client.SetContextText(send);
         {
           std::lock_guard<std::mutex> lock(m_ctx_debounce_mutex);
