@@ -519,6 +519,19 @@ static const hash_map<string, SyllableId>& LedgerSyllabaryMap(
   return syl2id;
 }
 
+// B1（2026-11-27）：账本权重标度 K（log(eff/(eff+K)) 的 K）。默认 30 =
+// 「eff=1 的新词 ≈ −3.4」的原始定标；RIME_LLM_LEDGER_K 环境变量供标定扫描
+// （探针 A/B），0/非法回落默认。读一次静态缓存（仿 RIME_LLM_USER_SOURCE）。
+static double ledger_weight_k() {
+  static double k = 0.0;
+  if (k <= 0.0) {
+    const char *e = std::getenv("RIME_LLM_LEDGER_K");
+    double v = e ? std::atof(e) : 0.0;
+    k = v > 0.0 ? v : 30.0;
+  }
+  return k;
+}
+
 static an<UserDictEntryCollector> BuildLedgerSource(
     ScriptTranslator* translator, const SyllableGraph& graph,
     size_t consumed) {
@@ -640,7 +653,10 @@ static an<UserDictEntryCollector> BuildLedgerSource(
     const bool exact = matched == full_ids.size();
     auto e = New<DictEntry>();
     e->text = le.word;
-    e->weight = std::log(le.eff / (le.eff + 30.0));
+    // B1 标定钩子（2026-11-27）：K 默认 30，可用 RIME_LLM_LEDGER_K 覆盖做
+    // 权重标度扫描（选重率数据重估）；0/非法值回落默认。权重语义 =
+    // log(eff/(eff+K)) ∈ log 概率域，与 sys 侧 log(count/1e8)+credibility 可比。
+    e->weight = std::log(le.eff / (le.eff + ledger_weight_k()));
     e->quality_len = quality_len;
     e->commit_count = 0;
     if (exact) {

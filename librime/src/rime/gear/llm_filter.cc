@@ -17,6 +17,7 @@
 #include <rime/gear/llm_filter.h>
 #include <rime/gear/prefix_gate_model.h>   // 2026-11-25 前缀确认门模型（生成）
 #include <rime/gear/llm_ngram.h>
+#include <rime/dict/reverse_lookup_dictionary.h>  // A5 反查表（2026-11-27）
 #include <rime/candidate.h>
 #include <rime/config.h>
 #include <rime/context.h>
@@ -2533,14 +2534,14 @@ static void debug_write_p(const std::string &id, double total, bool prep) {
 static void debug_write_d(const std::string &id, int final_rank, double ce,
                           double ce1, double ce2, double ce3, double eff,
                           double fb, double u1, int full, double key,
-                          double sdelta, int cerank, int finrank) {
+                          double sdelta, int cerank, int finrank, double q) {
   char b[512];
   snprintf(b, sizeof(b),
            "%s|D|%d|ce=%s|ce1=%s|ce2=%s|ce3=%s|eff=%.3f|fb=%.3f|u1=%.3f"
-           "|full=%d|key=%s|sdelta=%g|cerank=%d|finrank=%d",
+           "|full=%d|key=%s|sdelta=%g|cerank=%d|finrank=%d|q=%.2f",
            id.c_str(), final_rank, dbg_num(ce).c_str(), dbg_num(ce1).c_str(),
            dbg_num(ce2).c_str(), dbg_num(ce3).c_str(), eff, fb, u1, full,
-           dbg_num(key).c_str(), sdelta, cerank, finrank);
+           dbg_num(key).c_str(), sdelta, cerank, finrank, q);
   debug_write_raw(b, false);
 }
 
@@ -3127,6 +3128,154 @@ static std::string comp_positions(const std::vector<an<Candidate>> &v,
     s += std::to_string(i + 1);
   }
   return s;
+}
+
+// ══ A5 匹配可信度进融合分（2026-11-27，两版同构）═══
+// 纠错/补全/简拼的 credibility 惩罚（calculus.cc kAbbreviationPenalty/
+// kCorrectionPenalty、syllabifier.cc kCompletionPenalty）只进引擎权重，
+// 融合不读候选 quality → 多字纠错候选可被 CE/词频顶到首位。这里用
+// <方案>.reverse.bin（文本→完整码）+ 候选 span 切片码重放引擎的匹配分类，
+// 把同类惩罚按 δ 补进融合分：
+//   completion 类型 → kPenCompletion（音节补全）
+//   全部音节 = 整读或首字母简拼 → kPenAbbrev × 简拼音节数（DP 最小代价对齐）
+//   其余（纠错/模糊音/不可达）→ kPenCorrection × 纠错音节数
+// **只对多字候选生效**：单字纠错已由 T1 字-音节偏置打折，叠加会双罚。
+// 与「整读分层」不重复——分层只做单字块显示档位，不进分。反查表缺失/
+// 反查 miss → 0（不猜）。δ 默认 1 = 与引擎同强度；A/B RIME_LLM_CRED_DELTA。
+static constexpr double kPenAbbrev = -0.6931471805599453;    // log(0.5)
+static constexpr double kPenCompletion = -2.995732273553991; // log(0.05)
+static constexpr double kPenCorrection = -4.605170185988091; // log(0.01)
+
+// A5 δ：可信度惩罚强度，0 = 关（A/B 钩子）。读一次静态缓存。
+static double cred_delta() {
+  static double d = -1.0;
+  if (d < 0.0) {
+    const char *e = std::getenv("RIME_LLM_CRED_DELTA");
+    double v = e ? std::atof(e) : 1.0;
+    d = v >= 0.0 ? v : 1.0;
+  }
+  return d;
+}
+
+// 反查表（<方案>.reverse.bin，部署产物在用户目录 build\ 子目录；根目录一份
+// 兜底布局差异）按方案缓存。缺表/打开失败 → 惩罚恒 0；失败按 128 次调用
+// 节流重试（部署竞态下首开失败不至于永久失效）。
+static ReverseDb *cred_rev_db(const std::string &sid) {
+  static std::mutex mu;
+  static std::map<std::string, an<ReverseDb>> cache;
+  static std::map<std::string, int> fail;
+  if (sid.empty())
+    return nullptr;
+  std::lock_guard<std::mutex> lk(mu);
+  auto it = cache.find(sid);
+  if (it != cache.end())
+    return it->second.get();
+  auto fit = fail.find(sid);
+  if (fit != fail.end()) {
+    if (++fit->second < 128)
+      return nullptr;
+    fail.erase(fit);
+  }
+  try {
+    path p = Service::instance().deployer().user_data_dir / "build" /
+             (sid + ".reverse.bin");
+    auto db = New<ReverseDb>(p);
+    if (!db || !db->Load()) {
+      p = Service::instance().deployer().user_data_dir / (sid + ".reverse.bin");
+      db = New<ReverseDb>(p);
+      if (!db || !db->Load())
+        db = nullptr;
+    }
+    if (db) {
+      cache[sid] = db;
+      return db.get();
+    }
+  } catch (...) {
+  }
+  fail[sid] = 0;
+  return nullptr;
+}
+
+// span 码 vs 反查码逐音节 DP 对齐：每音节消费 ≥1 码，代价 = 整读 0 /
+// 首字母简拼 kPenAbbrev / 其余 kPenCorrection，取最小代价对齐；
+// 不可达 = 全纠错近似（匹配无法按音节解释）。
+static double cred_align_penalty(const std::string &code,
+                                 const std::string &reading) {
+  std::vector<std::string> syls;
+  {
+    std::string cur;
+    for (char ch : reading) {
+      if (ch == ' ' || ch == '\t') {
+        if (!cur.empty()) {
+          syls.push_back(cur);
+          cur.clear();
+        }
+      } else {
+        cur.push_back(ch);
+      }
+    }
+    if (!cur.empty())
+      syls.push_back(cur);
+  }
+  const int n = (int)syls.size(), m = (int)code.size();
+  if (n <= 0 || m <= 0)
+    return 0.0;
+  const double INF = 1e308;
+  std::vector<std::vector<double>> dp(n + 1, std::vector<double>(m + 1, INF));
+  dp[0][0] = 0.0;
+  for (int k = 0; k < n; k++) {
+    const std::string &syl = syls[(size_t)k];
+    for (int p = 0; p <= m; p++) {
+      if (dp[(size_t)k][(size_t)p] >= INF)
+        continue;
+      for (int l = 1; p + l <= m; l++) {
+        double cost;
+        if (l == (int)syl.size() && !code.compare((size_t)p, (size_t)l, syl))
+          cost = 0.0;
+        else if (l == 1 && code[(size_t)p] == syl[0])
+          cost = kPenAbbrev;
+        else
+          cost = kPenCorrection;
+        double nx = dp[(size_t)k][(size_t)p] + cost;
+        if (nx < dp[(size_t)k + 1][(size_t)(p + l)])
+          dp[(size_t)k + 1][(size_t)(p + l)] = nx;
+      }
+    }
+  }
+  return dp[(size_t)n][(size_t)m] >= INF ? kPenCorrection * n
+                                         : dp[(size_t)n][(size_t)m];
+}
+
+// 候选匹配可信度惩罚（≤0，δ 由调用方乘）。span_code = 候选 span 切片码。
+static double cand_cred_penalty(const an<Candidate> &c,
+                                const std::string &span_code,
+                                const std::string &sid) {
+  if (!c || span_code.empty())
+    return 0.0;
+  if (cand_is_completion(c))
+    return kPenCompletion;
+  std::string type = c->type();
+  an<Candidate> g = c;
+  if (type == "uniquified" || type == "shadow") {
+    auto gs = Candidate::GetGenuineCandidates(c);
+    if (gs.empty() || !gs.front())
+      return 0.0;
+    g = gs.front();
+    type = g->type();
+  }
+  // 只对 script/table 源的精确路径分类；组句/标点/其它类型不猜
+  if (type != "phrase" && type != "table" && type != "user_phrase" &&
+      type != "ledger")
+    return 0.0;
+  if (utf8_len(g->text()) < 2)
+    return 0.0;   // 单字纠错 = T1 字-音节偏置管辖，不双罚
+  ReverseDb *db = cred_rev_db(sid);
+  if (!db)
+    return 0.0;
+  std::string reading;
+  if (!db->Lookup(g->text(), &reading) || reading.empty())
+    return 0.0;
+  return cred_align_penalty(span_code, reading);
 }
 
 // 候选自身 span 切片码（2026-11-27 两级回退第一步）：查询键与账本存储键
@@ -4132,7 +4281,8 @@ static void async_write_pending(const AsyncPending &pend,
       pf += pend.share_vec[i];   // 字-音节偏置并入 sdelta（显示端只认总和）
     debug_write_d(pend.wid, (int)r + 1, ce, c3[0], c3[1], c3[2], eff,
                   g_freq_beta * std::log(1.0 + eff), u1, 1, fused[i], pf,
-                  (int)i + 1, (int)r + 1);
+                  (int)i + 1, (int)r + 1,
+                  0.0);  // q=0：回填路径只有文本快照，无候选 type/span 可分类
   }
 }
 
@@ -4856,6 +5006,7 @@ void LlmRerankTranslation::Collect() {
     // 2026-11-21 解耦后无正分——固定候选归 pin_filter.lua 全局重排）。
     // debug.txt 行尾 修正%+g，C 行尾追加 sdelta（与插件版一致）。
     std::vector<double> fused_of(candidates_.size(), -1e308);
+    std::vector<double> pen_of(candidates_.size(), 0.0);  // A5 惩罚（debug q 列）
     if (order.size() > 1) {
       // 无 CE 分候选的融合（2026-11-13 用户定案，取代"回退后两项和"）:
       // CE 取窗内已算 CE 的**最低分**（score = −CE 负值域，最低分 = 最差
@@ -4870,6 +5021,11 @@ void LlmRerankTranslation::Collect() {
       for (int i : order)
         if (has_score[i] && score_of[i] < min_valid)
           min_valid = score_of[i];
+      // A5（2026-11-27）：匹配可信度惩罚 δ 强度与方案反查表一次性备好
+      const double cred_dlt = cred_delta();
+      const std::string cred_sid = (engine_ && engine_->schema())
+                                       ? engine_->schema()->schema_id()
+                                       : std::string();
       std::vector<std::pair<double, int>> fused;  // (total, idx)
       fused.reserve(order.size());
       for (int i : order) {
@@ -4881,6 +5037,11 @@ void LlmRerankTranslation::Collect() {
               g_freq_beta * std::log(1.0 + user_freq_eff(
                                   candidates_[i]->text(), qc)) +
               user_unigram_term(candidates_[i]->text(), qc);
+          // A5 匹配可信度惩罚（≤0；多字、有 CE 生效——单字 = T1 管辖不双罚，
+          // 无 CE 分支不叠，与 CE 偏置同门）
+          if (cred_dlt > 0.0)
+            pen_of[(size_t)i] = cand_cred_penalty(candidates_[i], qc, cred_sid);
+          t += cred_dlt * pen_of[(size_t)i];
         } else {
           double s1v = i < s1_head.size() ? s1_head[i] : -1e308;
           t = s1v + (min_valid < 1e308 ? min_valid : 0.0);
@@ -5445,7 +5606,8 @@ void LlmRerankTranslation::Collect() {
         int full = (g_sentence_mode && i < (int)win_fm.size() &&
                     win_fm[(size_t)i]) ? 1 : 0;
         debug_write_d(wid, (int)k + 1, ce, ce1, ce2, ce3v, eff, fb, u1, full,
-                      fused_of[i], sdelta, ce_rank[i], (int)k + 1);
+                      fused_of[i], sdelta, ce_rank[i], (int)k + 1,
+                      i < (int)pen_of.size() ? pen_of[(size_t)i] : 0.0);
       }
     }
     // 实时调试 C 行（2026-11-10；2026-11-11 协议 v3：同时发"原始计数"与
