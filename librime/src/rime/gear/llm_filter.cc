@@ -3388,16 +3388,28 @@ static std::vector<llama_token> tokenize(const char *text) {
 // RIME_LLM_CTX_ANCHOR=0。
 static const llama_vocab *g_anchor_vocab = nullptr;  // 锚 token 随词表代缓存
 static int g_anchor_tok = -1;
-static std::vector<llama_token> ctx_ids_for_ce(std::vector<llama_token> ids) {
+static std::vector<llama_token> ctx_ids_for_ce(std::vector<llama_token> ids,
+                                               bool *anchored = nullptr) {
   static const bool kOn = !(getenv("RIME_LLM_CTX_ANCHOR") &&
                             getenv("RIME_LLM_CTX_ANCHOR")[0] == '0');
-  if (!kOn || ids.size() > 1) return ids;
+  // 仅恰 1 token（==1）垫锚；空上文（=0）不垫（评分路径 ctx 恒非空，
+  // 此守卫纯对齐研究侧 sim_rerank 口径）。*anchored = 本窗实际垫锚
+  //（W 行 flags=anchor 语料标记用，2026-11-28）。
+  if (!kOn || ids.size() != 1) {
+    if (anchored) *anchored = false;
+    return ids;
+  }
   if (g_anchor_vocab != g_vocab) {
     auto t = tokenize("。");
     g_anchor_tok = t.empty() ? -1 : (int)t[0];
     g_anchor_vocab = g_vocab;
   }
-  if (g_anchor_tok >= 0) ids.insert(ids.begin(), g_anchor_tok);
+  if (g_anchor_tok >= 0) {
+    ids.insert(ids.begin(), g_anchor_tok);
+    if (anchored) *anchored = true;
+  } else if (anchored) {
+    *anchored = false;
+  }
   return ids;
 }
 
@@ -4174,6 +4186,7 @@ struct AsyncRes {
   std::vector<double> pm_scores;
   std::string ctx_used;           // 推理用上文尾部（协议 v4，调试灰显）
   bool prep_hit = false;
+  bool ctx_anchored = false;      // 本窗评分垫了「。」锚（W flags=anchor）
   double ev_ms = 0;
 };
 static AsyncRes g_async_result;
@@ -4310,7 +4323,7 @@ static void async_write_pending(const AsyncPending &pend,
   for (size_t k : ord) final_list.push_back(pend.window_vec[k]);
   write_w(pend.wid, pend.src, pend.code, pend.wctx, pend.engine_vec,
           pend.window_vec, final_list, pend.tick, "ok", "",
-          snap.prep_hit, "async");
+          snap.prep_hit, snap.ctx_anchored ? "async,anchor" : "async");
   debug_write_p(pend.wid, snap.ev_ms, snap.prep_hit);
   // D 行（2026-11-22 整句分段开发补）：挂账回填此前只有 W ok + P 行，
   // CE 数值无日志——评测与调试都要逐候选 CE。字段语义与主路径一致：
@@ -4415,7 +4428,9 @@ static void async_worker_loop() {
       g_async_cv.notify_all();
       continue;
     }
-    ctx_ids = ctx_ids_for_ce(std::move(ctx_ids));  // 1 token 裸单词上文垫「。」锚
+    bool ctx_anchored = false;
+    ctx_ids = ctx_ids_for_ce(std::move(ctx_ids), &ctx_anchored);  // 1 token 裸单词上文垫「。」锚
+    res.ctx_anchored = ctx_anchored;  // W flags=anchor（语料口径标记）
     bool done = false;
     try {
       done = score_batch(ctx_ids, cand_ids, res.scores, &res.ce3,
@@ -4740,6 +4755,9 @@ void LlmRerankTranslation::Collect() {
   std::string wstatus = "ok";
   std::string wskip;
   bool prep_hit = false;  // 上文 KV 预解码命中（调试 L 行"预解"列）
+  // 本窗 CE 评分垫了「。」锚（函数级作用域：评分块快照在此置位，末尾
+  // W flags 写 anchor 要用，2026-11-28）
+  bool w_ctx_anchored = false;
   // 无上文（2026-11-24 用户定案）：CE 不可算，但整句模式下前缀确认照常
   // ——融合分按剩余项（β·log1p(eff) + log(uni+1) + CE 偏置）计算。
   // Apply 已保证：只有整句模式 + 前缀确认 + 组句都开且 code≥4 码时才放行
@@ -4993,6 +5011,7 @@ void LlmRerankTranslation::Collect() {
           ev_ms = snap.ev_ms;
           prep_hit = snap.prep_hit;
           ctx_used = snap.ctx_used;
+          w_ctx_anchored = snap.ctx_anchored;
           // 2026-11-24：按**文本**映射（指纹顺序无关，候选序会随融合变化）
           std::map<std::string, size_t> sidx;
           for (size_t k = 0; k < snap.cand_texts.size(); k++)
@@ -5887,9 +5906,14 @@ void LlmRerankTranslation::Collect() {
     wcomp = comp_w + ";" + comp_positions(candidates_);
   }
   if (!w_written) {
+    // W flags（2026-11-28 加锚标记）：nofreq（无 CE）/ anchor（本窗 CE
+    // 评分上文恰 1 token 被垫「。」锚）；多值逗号分隔（挂账回填路径为
+    // "async,anchor"）——研究侧按 flags 直接判口径，不再靠 ts 分界推断。
+    const char *wflags = freq_only ? "nofreq"
+                         : (w_ctx_anchored ? "anchor" : "");
     write_w(wid, src_, input_, wctx, engine_vec, window_vec,
             texts_of(candidates_, 20), g_user_tick, wstatus, wskip, prep_hit,
-            freq_only ? "nofreq" : "", wcomp);
+            wflags, wcomp);
     w_written = true;
   }
 }
