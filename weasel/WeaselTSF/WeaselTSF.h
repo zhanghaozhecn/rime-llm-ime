@@ -290,4 +290,7 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   BOOL _async_edit = false;
   BOOL _committed = false;
   BOOL _isToOpenClose = false;
+  // 无按键刷新 tick 上下文（2026-11-28 空闲闪烁修复）：tick 的编辑会话
+  // 只读刷新 UI，无 commit 时不得裁决组合生死（见 EditSession.cpp）
+  bool m_tick_refresh = false;
 };

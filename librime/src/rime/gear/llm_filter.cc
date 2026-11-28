@@ -3377,6 +3377,30 @@ static std::vector<llama_token> tokenize(const char *text) {
   return toks;
 }
 
+// CE 上文锚（2026-11-28，两版同构）：Qwen3-0.6B 在裸单词（1 token）上文时
+// 预测退化为先验序——wiki 分条首句大样本配对实测（2994 句，0.6B）：bare n=1
+// top1 命中 0.0%、句号锚后 6.71%，ΔCE −6.10 nats（win/lose 2808/186，
+// z=47.9）；「英雄」后事迹 14.3 败于「世纪」8.4 即此。垫「。」把输入还原成
+// 训练分布内的句中形态（attention sink/文档边界文献支持）。n=2 专项验证
+// （3000 新句配对）：句号锚 ΔCE −0.0096、z=−0.15 = 零效应（n=2 bare 已健康
+// top1 12.5%），endoftext/im_end 锚在 n=2 显著为负（z=−5.0/−16.7）——故规则
+// 收窄为**仅 n=1 垫锚**。0.5B 同效；0.8B 不需要但无害。A/B：
+// RIME_LLM_CTX_ANCHOR=0。
+static const llama_vocab *g_anchor_vocab = nullptr;  // 锚 token 随词表代缓存
+static int g_anchor_tok = -1;
+static std::vector<llama_token> ctx_ids_for_ce(std::vector<llama_token> ids) {
+  static const bool kOn = !(getenv("RIME_LLM_CTX_ANCHOR") &&
+                            getenv("RIME_LLM_CTX_ANCHOR")[0] == '0');
+  if (!kOn || ids.size() > 1) return ids;
+  if (g_anchor_vocab != g_vocab) {
+    auto t = tokenize("。");
+    g_anchor_tok = t.empty() ? -1 : (int)t[0];
+    g_anchor_vocab = g_vocab;
+  }
+  if (g_anchor_tok >= 0) ids.insert(ids.begin(), g_anchor_tok);
+  return ids;
+}
+
 // 推理用上文尾部文本（2026-11-12 调试窗口协议 v4，灰显用）：截尾保留的
 // ids 逐 token 拼 piece —— 字节级 BPE 的各 token piece 恰好等于原文中
 // 连续字节段，拼接 = 精确尾部（真实 token 边界，非字符数估算）。
@@ -4391,6 +4415,7 @@ static void async_worker_loop() {
       g_async_cv.notify_all();
       continue;
     }
+    ctx_ids = ctx_ids_for_ce(std::move(ctx_ids));  // 1 token 裸单词上文垫「。」锚
     bool done = false;
     try {
       done = score_batch(ctx_ids, cand_ids, res.scores, &res.ce3,
@@ -6029,6 +6054,7 @@ static void request_prepare(const std::string &raw_ctx) {
       return;
     if ((int)ctx_ids.size() > g_max_ctx_tokens)
       ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - g_max_ctx_tokens);
+    ctx_ids = ctx_ids_for_ce(std::move(ctx_ids));  // 与 score 同口径（仅 n=1 垫锚）
 
     // bump request seq so any older in-flight prepare skips itself
     int seq = ++g_prep_seq;

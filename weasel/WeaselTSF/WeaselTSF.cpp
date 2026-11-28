@@ -569,7 +569,13 @@ void WeaselTSF::_OnRefreshTimer() {
   m_client.Refresh();
   // 响应体已由 Transact 读入线程缓冲，这里走常规编辑会话解析并更新界面
   //（与翻页/高亮同款配对：请求 → _UpdateComposition）
+  // 2026-11-28 空闲闪烁修复：标记 tick 上下文——该编辑会话只读刷新 UI，
+  // 无 commit 时不得裁决组合生死（DoEditSession 检查此标志；二分实验实锤
+  // tick 回包偶发 composing=0/commit → _EndComposition 错杀活组合 = 真机
+  // 「候选窗闪烁后自动消失」）
+  m_tick_refresh = true;
   _UpdateComposition(_pEditSessionContext);
+  m_tick_refresh = false;
 }
 
 void WeaselTSF::_OnContextTextReady(const std::wstring& text, bool immediate,
